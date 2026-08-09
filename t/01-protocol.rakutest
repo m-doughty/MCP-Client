@@ -1,0 +1,307 @@
+use Test;
+use lib 'lib';
+use JSON::Fast;
+use MCP::Server::Protocol;
+use MCP::Client::Exceptions;
+use MCP::Client::Protocol;
+
+plan 14;
+
+subtest 'Typed failures' => {
+	plan 12;
+
+	ok X::MCP::Client::Timeout.new(seconds => 5) ~~ X::MCP::Client,
+		'Timeout is an X::MCP::Client';
+	ok X::MCP::Client::ServerGone.new ~~ X::MCP::Client,
+		'ServerGone is an X::MCP::Client';
+	ok X::MCP::Client::Protocol.new(detail => 'x') ~~ X::MCP::Client,
+		'Protocol is an X::MCP::Client';
+	ok X::MCP::Client::UnsupportedVersion.new ~~ X::MCP::Client,
+		'UnsupportedVersion is an X::MCP::Client';
+	ok X::MCP::Client::Cancelled.new ~~ X::MCP::Client,
+		'Cancelled is an X::MCP::Client';
+	ok X::MCP::Client::InputLoopExceeded.new(rounds => 8) ~~ X::MCP::Client,
+		'InputLoopExceeded is an X::MCP::Client';
+	ok X::MCP::Client::TransportClosed.new ~~ X::MCP::Client,
+		'TransportClosed is an X::MCP::Client';
+	ok X::MCP::Client::SpawnFailed.new(command => 'nope') ~~ X::MCP::Client,
+		'SpawnFailed is an X::MCP::Client';
+
+	like X::MCP::Client::Timeout.new(seconds => 5, method => 'tools/call', id => 3).message,
+		/'5s'.*"tools/call".*'id 3'/, 'Timeout message names the budget, method and id';
+	like X::MCP::Client::ServerGone.new(exit-code => 2, stderr-tail => 'no such module').message,
+		/'2'.*'no such module'/, 'ServerGone message carries the exit code and stderr tail';
+	like X::MCP::Client::UnsupportedVersion.new(
+		requested => '1999-01-01', supported => ['2026-07-28'],
+	).message, /'1999-01-01'.*'2026-07-28'/, 'UnsupportedVersion message names both sides';
+	is X::MCP::Client.new.message, 'MCP client error', 'Base class is throwable with a default message';
+};
+
+subtest 'build-request: modern era stamps _meta' => {
+	plan 9;
+
+	my %msg = build-request(
+		1, 'tools/call', { name => 'echo', arguments => { text => 'hi' } },
+		era => 'modern',
+	);
+
+	is %msg<jsonrpc>, '2.0', 'jsonrpc';
+	is %msg<id>, 1, 'id';
+	is %msg<method>, 'tools/call', 'method';
+	is %msg<params><name>, 'echo', 'caller params survive';
+	is-deeply %msg<params><arguments>, { text => 'hi' }, 'nested caller params survive';
+	is %msg<params><_meta>{META-PROTOCOL-VERSION}, MODERN-PROTOCOL-VERSION,
+		'protocol version is stamped';
+	nok %msg<params><_meta>{META-CLIENT-INFO}:exists, 'no clientInfo when none supplied';
+	nok %msg<params><_meta>{META-CLIENT-CAPABILITIES}:exists,
+		'no clientCapabilities when none supplied';
+	nok %msg<params><_meta>{META-LOG-LEVEL}:exists, 'no logLevel when none supplied';
+};
+
+subtest 'build-request: modern era optional _meta fields' => {
+	plan 6;
+
+	my %msg = build-request(
+		'req-1', 'tools/list', {},
+		era                 => 'modern',
+		client-info         => { name => 'test-agent', version => '0.1' },
+		client-capabilities => { elicitation => {} },
+		log-level           => 'info',
+	);
+
+	is %msg<id>, 'req-1', 'a string id is passed through';
+	is-deeply %msg<params><_meta>{META-CLIENT-INFO},
+		{ name => 'test-agent', version => '0.1' }, 'clientInfo stamped';
+	is-deeply %msg<params><_meta>{META-CLIENT-CAPABILITIES},
+		{ elicitation => {} }, 'clientCapabilities stamped';
+	is %msg<params><_meta>{META-LOG-LEVEL}, 'info', 'logLevel stamped';
+
+	# The asymmetry here is the spec's, not ours: 2026-07-28 makes
+	# clientCapabilities required on every request and clientInfo optional, and
+	# {} is precisely how a client with no optional features declares itself.
+	my %empty = build-request(
+		2, 'tools/list', {}, era => 'modern', client-info => {}, client-capabilities => {},
+	);
+	nok %empty<params><_meta>{META-CLIENT-INFO}:exists,
+		'an explicitly empty clientInfo is not stamped';
+	is-deeply %empty<params><_meta>{META-CLIENT-CAPABILITIES}, {},
+		'an explicitly empty clientCapabilities is stamped, because the key is required';
+};
+
+subtest 'build-request: legacy era stamps nothing' => {
+	plan 5;
+
+	my %msg = build-request(
+		1, 'tools/call', { name => 'echo' },
+		era                 => 'legacy',
+		client-info         => { name => 'test-agent' },
+		client-capabilities => { elicitation => {} },
+		log-level           => 'info',
+	);
+
+	is %msg<method>, 'tools/call', 'method';
+	is %msg<params><name>, 'echo', 'caller params survive';
+	nok %msg<params><_meta>:exists, 'no _meta block at all';
+	is %msg<params>.keys.elems, 1, 'nothing else was added to params';
+
+	my %bare = build-request(2, 'ping', era => 'legacy');
+	nok %bare<params>:exists, 'params omitted entirely when there are none';
+};
+
+subtest 'build-request: caller _meta is preserved' => {
+	plan 3;
+
+	my %msg = build-request(
+		1, 'tools/call', { name => 'slow', _meta => { progressToken => 'abc' } },
+		era => 'modern',
+	);
+	is %msg<params><_meta><progressToken>, 'abc', 'caller _meta key survives';
+	is %msg<params><_meta>{META-PROTOCOL-VERSION}, MODERN-PROTOCOL-VERSION,
+		'protocol version added alongside it';
+
+	my %clash = build-request(
+		1, 'tools/call', { _meta => { (META-PROTOCOL-VERSION) => 'bogus' } },
+		era => 'modern',
+	);
+	is %clash<params><_meta>{META-PROTOCOL-VERSION}, MODERN-PROTOCOL-VERSION,
+		'the protocol key wins over a caller-supplied one';
+};
+
+subtest 'build-request: rejects impossible combinations' => {
+	plan 5;
+
+	throws-like { build-request(1, 'ping', era => 'modern', protocol-version => LEGACY-PROTOCOL-VERSION) },
+		X::MCP::Client::UnsupportedVersion,
+		'the legacy version cannot be stamped into a modern request';
+
+	throws-like { build-request(1, 'ping', era => 'modern', log-level => 'chatty') },
+		X::MCP::Client::Protocol,
+		'an RFC 5424 level outside the register is refused';
+
+	lives-ok { build-request(1, 'ping', era => 'legacy', protocol-version => LEGACY-PROTOCOL-VERSION) },
+		'the legacy version is fine on a legacy request (it is ignored)';
+
+	lives-ok { build-request(1, 'ping', era => 'modern', log-level => 'emergency') },
+		'every RFC 5424 level is accepted';
+
+	dies-ok { build-request(1, 'ping', era => 'sideways') }, 'an unknown era is refused';
+};
+
+subtest 'build-request: the server classifies our requests as we intended' => {
+	plan 12;
+
+	# The oracle is MCP::Server::Protocol's own detect-era: whatever it says is
+	# what a real server would do with the message.
+	for <tools/call tools/list resources/read prompts/get ping logging/setLevel> -> $method {
+		is detect-era(build-request(1, $method, { a => 1 }, era => 'modern')), 'modern',
+			"modern $method is detected as modern";
+		is detect-era(build-request(1, $method, { a => 1 }, era => 'legacy')), 'legacy',
+			"legacy $method is detected as legacy";
+	}
+};
+
+subtest 'parse-inbound: responses' => {
+	plan 12;
+
+	my %ok = parse-inbound('{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}');
+	is %ok<kind>, 'response', 'a result is a response';
+	is %ok<id>, 1, 'id';
+	is-deeply %ok<result>, { tools => [] }, 'result passed through';
+	nok %ok<error>:exists, 'no error key';
+
+	my %err = parse-inbound('{"jsonrpc":"2.0","id":"a","error":{"code":-32601,"message":"nope","data":{"x":1}}}');
+	is %err<kind>, 'response', 'an error is also a response';
+	is %err<id>, 'a', 'string id';
+	is %err<error><code>, -32601, 'error code';
+	is-deeply %err<error><data>, { x => 1 }, 'error data passed through verbatim';
+
+	is parse-inbound('{"jsonrpc":"2.0","id":0,"result":{}}')<id>, 0,
+		'id 0 is an id, not an absence';
+	ok parse-inbound('{"jsonrpc":"2.0","id":1,"result":null}')<kind> eq 'response',
+		'a null result is still a response';
+
+	# The whole reason this sub exists: the server-side parser rejects every
+	# response ever sent to a client, because a response has no method.
+	my %server-view = parse-message('{"jsonrpc":"2.0","id":1,"result":{}}');
+	ok %server-view<error>:exists, "MCP::Server::Protocol's parse-message rejects id-only messages";
+	is parse-inbound('{"jsonrpc":"2.0","id":1,"result":{}}')<kind>, 'response',
+		'parse-inbound accepts them';
+};
+
+subtest 'parse-inbound: notifications and server-initiated requests' => {
+	plan 9;
+
+	my %note = parse-inbound('{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info"}}');
+	is %note<kind>, 'notification', 'no id means a notification';
+	is %note<method>, 'notifications/message', 'method';
+	is %note<params><level>, 'info', 'params';
+
+	my %bare = parse-inbound('{"jsonrpc":"2.0","method":"notifications/initialized"}');
+	is %bare<kind>, 'notification', 'params are optional';
+	is-deeply %bare<params>, {}, 'missing params become an empty hash';
+
+	is parse-inbound('{"jsonrpc":"2.0","id":null,"method":"notifications/x"}')<kind>,
+		'notification', 'a null id is read as a notification, not rejected';
+
+	my %req = parse-inbound('{"jsonrpc":"2.0","id":7,"method":"elicitation/create","params":{"message":"key?"}}');
+	is %req<kind>, 'request', 'method plus id is a request';
+	is %req<id>, 7, 'id';
+	is %req<params><message>, 'key?', 'params';
+};
+
+subtest 'parse-inbound: nothing survivable is fatal' => {
+	plan 11;
+
+	for (
+		'not json at all'                              => 'malformed JSON',
+		'{"jsonrpc":"2.0"'                             => 'truncated JSON',
+		'[1,2,3]'                                      => 'a JSON array',
+		'"just a string"'                              => 'a bare JSON string',
+		''                                             => 'an empty line',
+		'   '                                          => 'a whitespace-only line',
+		'{"id":1,"result":{}}'                         => 'a missing jsonrpc version',
+		'{"jsonrpc":"1.0","id":1,"result":{}}'         => 'a wrong jsonrpc version',
+		'{"jsonrpc":"2.0","id":1}'                     => 'neither result nor error',
+		'{"jsonrpc":"2.0"}'                            => 'neither method nor id',
+		'{"jsonrpc":"2.0","id":1,"error":"boom"}'      => 'a non-object error',
+	) -> $case {
+		my %in = parse-inbound($case.key);
+		is %in<kind>, 'invalid', "{$case.value} is invalid, not fatal";
+	}
+};
+
+subtest 'parse-inbound: invalid results explain themselves' => {
+	plan 4;
+
+	my %in = parse-inbound('Listening on stdio...');
+	is %in<raw>, 'Listening on stdio...', 'the raw line comes back for logging';
+	ok %in<reason>.contains('JSON'), 'the reason names the problem';
+	nok %in<message>:exists, 'no decoded message when it was not JSON';
+
+	my %half = parse-inbound('{"jsonrpc":"2.0","id":1}');
+	is-deeply %half<message>, { jsonrpc => '2.0', id => 1 },
+		'the decoded object comes back when there was one';
+};
+
+subtest 'normalize-result' => {
+	plan 6;
+
+	is normalize-result({ tools => [] })<resultType>, RESULT-TYPE-COMPLETE,
+		'a legacy result (no resultType) is complete';
+	is normalize-result({ tools => [] })<tools>.elems, 0, 'the rest of the result survives';
+	is normalize-result({ resultType => RESULT-TYPE-INPUT-REQUIRED, requestState => 's' })<resultType>,
+		RESULT-TYPE-INPUT-REQUIRED, 'an existing resultType is left alone';
+	is normalize-result({ resultType => '' })<resultType>, RESULT-TYPE-COMPLETE,
+		'an empty resultType is treated as absent';
+	is normalize-result(Any)<resultType>, RESULT-TYPE-COMPLETE,
+		'a null result becomes an empty complete result';
+	is normalize-result('surprise')<resultType>, RESULT-TYPE-COMPLETE,
+		'so does a result that is not an object at all';
+};
+
+subtest 'decline-input-response' => {
+	plan 8;
+
+	# An inputResponses entry is a bare client result keyed by the server's own
+	# inputRequests key -- there is no id member and no error member in the
+	# 2026-07-28 InputResponses schema, so what comes back here is the result
+	# body alone, or nothing at all.
+	my $elicit = decline-input-response({ method => 'elicitation/create' });
+	is-deeply $elicit, { action => 'decline' }, 'elicitation declines with an ElicitResult';
+
+	my $roots = decline-input-response({ method => 'roots/list' });
+	is-deeply $roots, { roots => [] }, 'roots declines with an empty ListRootsResult';
+
+	my $sample = decline-input-response({ method => 'sampling/createMessage' });
+	nok $sample.defined,
+		'sampling has no declinable result shape, so the key is omitted entirely';
+
+	my $unknown = decline-input-response({ method => 'divination/entrails' });
+	nok $unknown.defined, 'an unrecognised input kind is omitted too';
+
+	my $junk = decline-input-response('nonsense');
+	nok $junk.defined, 'a non-object input request is omitted, not fatal';
+
+	# An id, if a server sends one alongside, is not part of the answer: the
+	# request is identified by its key in the map, not by a JSON-RPC id.
+	my $with-id = decline-input-response({ id => 'r1', method => 'elicitation/create' });
+	is-deeply $with-id, { action => 'decline' }, 'a stray id does not leak into the response';
+
+	ok decline-input-response({ method => 'elicitation/create' }) ~~ Hash,
+		'a declinable kind returns a Hash';
+	ok decline-input-response({}) ~~ Hash,
+		'an undeclinable kind returns an (undefined) Hash, so the type is uniform';
+};
+
+subtest 'is-modern-error' => {
+	plan 8;
+
+	ok is-modern-error({ code => HEADER_MISMATCH }), '-32020 is modern';
+	ok is-modern-error({ code => MISSING_REQUIRED_CLIENT_CAPABILITY }), '-32021 is modern';
+	ok is-modern-error({ code => UNSUPPORTED_PROTOCOL_VERSION }), '-32022 is modern';
+	nok is-modern-error({ code => METHOD_NOT_FOUND }), '-32601 says nothing about the era';
+	nok is-modern-error({ code => INTERNAL_ERROR }), '-32603 says nothing about the era';
+	nok is-modern-error({ message => 'no code at all' }), 'an error without a code is not modern';
+	nok is-modern-error({ code => 'not a number' }), 'a non-numeric code is not modern';
+	nok is-modern-error(Any), 'a missing error object is not modern';
+};

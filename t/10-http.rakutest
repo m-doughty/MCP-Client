@@ -1,0 +1,416 @@
+use Test;
+use lib 'lib';
+use JSON::Fast;
+use Cro::HTTP::Client;
+
+use MCP::Server;
+use MCP::Server::HTTP;
+use MCP::Server::Protocol;
+
+use MCP::Client;
+use MCP::Client::Exceptions;
+use MCP::Client::Protocol;
+
+plan 12;
+
+# A real MCP::Server::HTTP, in this process, on a real socket. The server's own
+# request validation is the point: it rejects any request whose headers disagree
+# with its body, so every 200 in this file is the server saying the client built
+# its headers correctly. The one control test (below) sends a deliberately wrong
+# header to prove that gate is live rather than vacuous.
+#
+# MCP::Client::Transport::HTTP is never `use`d here: MCP::Client loads it on
+# demand, and going through connect-http is what proves that seam still fits.
+
+constant TIMEOUT = 30;
+
+#| Await $promise, giving up (loudly) rather than blocking forever.
+sub timed($promise, Str:D $what) {
+	await Promise.anyof($promise, Promise.in(TIMEOUT));
+	die "Timed out after {TIMEOUT}s waiting for $what" if $promise.status === Planned;
+	$promise;
+}
+
+# === The server under test ===
+
+my $server = MCP::Server.new(:name<http-client-test>, :version<0.4.2>);
+
+$server.tool: 'greet', :description('Greet somebody'),
+	:params({ name => { type => 'string', description => 'who to greet', required => True } }),
+	:handler(-> :%args { "Hi, {%args<name> // 'you'}" });
+
+# Two log lines before it answers, which is what makes the server upgrade the
+# response to an event stream.
+$server.tool: 'chatty', :description('Thinks out loud'), :handler(-> :%args {
+	$server.log('info', 'thinking');
+	$server.log('info', 'still thinking');
+	'chattered';
+});
+
+# Speaks at once so the client knows the request is in flight, then lingers,
+# polling the cancellation flag the way a well-behaved handler does.
+$server.tool: 'slow', :description('Takes its time'), :handler(-> :%args {
+	$server.log('info', 'slow started');
+	for ^40 {
+		last if $*MCP-REQUEST-CONTEXT.cancelled;
+		sleep 0.05;
+	}
+	'eventually';
+});
+
+$server.tool: 'execute_sql', :description('Runs a query in a region'),
+	:params({ region => { type => 'string' }, query => { type => 'string' } }),
+	:handler(-> :%args { "ran '{%args<query> // ''}' in {%args<region> // ''}" });
+
+# A non-ASCII URI cannot travel in a header as-is, so reading it exercises the
+# =?base64?...?= sentinel on Mcp-Name end to end.
+constant CAFE-URI = 'mem://café';
+$server.resource: CAFE-URI, :name<cafe>, :description('A café'),
+	:handler(-> :%args { 'espresso' });
+
+$server.prompt: 'summarise', :description('Summarise something'),
+	:arguments([{ name => 'topic', required => True },]),
+	:handler(-> :%args { "Please summarise {%args<topic> // 'it'}." });
+
+# === Booting ===
+
+#| Start the endpoint on a random high port, retrying in case something else
+#| already owns the one we picked. Cro cannot report the port an OS-assigned
+#| :port(0) landed on, so the port is chosen here and a real request is the only
+#| honest proof that the listener is ours.
+sub boot(--> List) {
+	my $last-error = 'no attempt made';
+
+	for ^5 {
+		my $port = (20000 .. 40000).pick;
+		my $http = MCP::Server::HTTP.new(:$server, :$port);
+
+		my Bool $listening = True;
+		{
+			CATCH {
+				default {
+					$last-error = .message.lines.head;
+					$listening = False;
+				}
+			}
+			$http.start;
+		}
+
+		if $listening {
+			my %probe = jsonrpc => '2.0', id => 'boot', method => 'server/discover';
+			my $answered = Cro::HTTP::Client.new(:!persistent, :http<1.1>).post(
+				"http://127.0.0.1:$port/mcp",
+				content-type => 'application/json',
+				body         => to-json(%probe, :!pretty),
+				headers      => [
+					'MCP-Protocol-Version' => MODERN-PROTOCOL-VERSION,
+					'Mcp-Method'           => 'server/discover',
+				],
+			);
+			await Promise.anyof($answered, Promise.in(10));
+			return ($http, $port) if $answered.status === Kept;
+
+			$last-error = $answered.status === Broken
+				?? $answered.cause.message.lines.head
+				!! 'the endpoint never answered';
+		}
+
+		try $http.stop;
+	}
+
+	die "Could not start the MCP HTTP endpoint on any of 5 random ports: $last-error";
+}
+
+my ($http, $port) = boot();
+LEAVE { try $http.stop }
+
+my $endpoint = "http://127.0.0.1:$port/mcp";
+
+# === The client under test ===
+
+my $log-lock = Lock.new;
+my @log-messages;
+my %watchers;
+
+#| A promise kept the moment the server logs $message. Requesting the watch
+#| before the call is what keeps this file free of sleep-and-hope: the SSE
+#| notification itself is the signal that a request is in flight.
+sub watch(Str:D $message --> Promise:D) {
+	$log-lock.protect: { %watchers{$message} //= Promise.new };
+}
+
+my $mcp = MCP::Client.connect-http(
+	url             => $endpoint,
+	client-name     => 'mcp-client-http-test',
+	client-version  => '0.1.0',
+	request-timeout => TIMEOUT,
+	probe-timeout   => 10,
+	# Without a log level a modern server MUST NOT send notifications/message at
+	# all, so this is what makes the streaming path reachable.
+	log-level       => 'debug',
+	on-log          => -> %params {
+		# 'data' is where LoggingMessageNotificationParams puts the payload; a
+		# server that logs a string puts the string there.
+		my $text = (%params<data> // '').Str;
+		my $watcher = $log-lock.protect: {
+			@log-messages.push($text);
+			%watchers{$text} //= Promise.new;
+		};
+		try $watcher.keep(True);
+	},
+);
+LEAVE { try $mcp.close }
+
+sub logged(--> List) {
+	$log-lock.protect: { @log-messages.List };
+}
+
+subtest 'the era probe recognises a modern server over HTTP' => {
+	plan 5;
+
+	is $mcp.era, 'modern', 'server/discover answered, so the server is modern';
+	is $mcp.protocol-version, MODERN-PROTOCOL-VERSION, 'at the version we both speak';
+	is $mcp.server-info<name>, 'http-client-test', 'the server named itself';
+	is $mcp.server-info<version>, '0.4.2', '...and its version';
+	ok $mcp.capabilities<tools>:exists, 'and declared the tools capability';
+};
+
+subtest 'the catalogs come back' => {
+	plan 4;
+
+	is-deeply $mcp.list-tools.map(*<name>).sort.List,
+		('chatty', 'execute_sql', 'greet', 'slow').List, 'every registered tool is listed';
+	is $mcp.list-tools.first(*<name> eq 'greet')<inputSchema><properties><name><type>, 'string',
+		'with its input schema intact';
+	is-deeply $mcp.list-resources.map(*<uri>).List, (CAFE-URI,).List, 'and the resources';
+	is-deeply $mcp.list-prompts.map(*<name>).List, ('summarise',).List, 'and the prompts';
+};
+
+subtest 'a tool call round-trips as one JSON response' => {
+	plan 5;
+
+	my %result = $mcp.call-tool('greet', { name => 'Ada' });
+	is %result<content>[0]<text>, 'Hi, Ada', 'the handler ran and its text came back';
+	nok %result<isError>, 'and it did not report failure';
+	nok %result<resultType>:exists, 'the protocol envelope is stripped before the caller sees it';
+
+	# The fire-and-forget half of the transport role. A notification body is
+	# acknowledged with a bare 202 and nothing else, so the proof that it went
+	# out well-formed is that it neither throws nor disturbs the connection --
+	# a malformed one would have been a 400 the transport warns about on $*ERR.
+	# It carries _meta like any other modern message: the MCP-Protocol-Version
+	# header has to match the body even here.
+	lives-ok {
+		$mcp.transport.notify(notification('notifications/progress', {
+			progressToken => 'p1',
+			progress      => 1,
+			_meta         => { (META-PROTOCOL-VERSION) => MODERN-PROTOCOL-VERSION },
+		}));
+	}, 'a notification is sent with no answer to wait for';
+	is $mcp.call-tool('greet', { name => 'Bo' })<content>[0]<text>, 'Hi, Bo',
+		'and the next request is unbothered by it';
+};
+
+subtest 'a handler that logs upgrades the answer to an event stream' => {
+	plan 3;
+
+	my $before = logged().elems;
+	my %result = $mcp.call-tool('chatty');
+
+	is %result<content>[0]<text>, 'chattered',
+		'the response event resolved the call, not just the notifications';
+
+	# The notifications arrive on the same stream, ahead of the response, so by
+	# the time the call has returned they have already been dispatched. No
+	# waiting, no polling.
+	is-deeply logged()[$before .. *].List, ('thinking', 'still thinking').List,
+		'both notifications arrived, in the order the handler raised them';
+	ok $mcp.alive, 'and the connection is still usable afterwards';
+};
+
+subtest 'notifications reach the Supply as well as the log hook' => {
+	plan 2;
+
+	my @seen;
+	my $lock = Lock.new;
+	my $both = Promise.new;
+
+	my $tap = $mcp.notifications.tap: -> %note {
+		my $enough = $lock.protect: {
+			@seen.push(%note);
+			@seen.elems >= 2;
+		};
+		try $both.keep(True) if $enough;
+	};
+	LEAVE { $tap.close }
+
+	$mcp.call-tool('chatty');
+	timed($both, 'two notifications on the Supply');
+
+	is ($lock.protect: { @seen.elems }), 2, 'both notifications were emitted';
+	is-deeply ($lock.protect: { @seen.map(*<method>).List }),
+		('notifications/message', 'notifications/message').List,
+		'as parsed notification messages';
+};
+
+subtest 'a non-ASCII resource URI survives the Mcp-Name header' => {
+	plan 2;
+
+	# The server decodes Mcp-Name and compares it to params.uri before it will
+	# dispatch, so a 200 here means the sentinel encoding matched byte for byte.
+	my %result = $mcp.read-resource(CAFE-URI);
+	is %result<contents>[0]<text>, 'espresso', 'the resource was read';
+	is %result<contents>[0]<uri>, CAFE-URI, 'and it is the one we asked for';
+};
+
+subtest 'a prompt renders' => {
+	plan 2;
+
+	my %result = $mcp.get-prompt('summarise', { topic => 'raku' });
+	is %result<messages>[0]<content><text>, 'Please summarise raku.', 'the template ran';
+	is %result<messages>[0]<role>, 'user', 'in the shape prompts/get promises';
+};
+
+subtest 'a method this server does not have is a 404 the client can read' => {
+	plan 4;
+
+	# The transport maps 404 back to the JSON-RPC error in the body, which is
+	# what stops a modern 404 from looking like a legacy server's silence.
+	my $answer = $mcp.transport.request(
+		build-request(
+			9_001, 'nope/nope', {},
+			era => 'modern', protocol-version => MODERN-PROTOCOL-VERSION,
+			client-info => { name => 'mcp-client-http-test', version => '0.1.0' },
+			client-capabilities => {},
+		),
+	);
+	timed($answer, 'an answer to an unknown method');
+
+	is $answer.status, Broken, 'an unknown method fails the request';
+	ok $answer.cause ~~ X::MCP::Client::Protocol, '...as a protocol error';
+	is $answer.cause.code, METHOD_NOT_FOUND, '...carrying -32601 out of the 404 body';
+
+	# ping was removed in 2026-07-28, so the typed API turns the same 404 into a
+	# plain "no" rather than an exception.
+	nok $mcp.ping, 'ping reports a modern server as simply not having one';
+};
+
+subtest 'annotated arguments are mirrored into Mcp-Param headers' => {
+	plan 4;
+
+	# MCP::Server's schema builder cannot express x-mcp-header, so the annotated
+	# definition is delivered through the same seam a real tools/list response
+	# goes through -- after the catalog call above, which would otherwise
+	# overwrite it with the unannotated one.
+	$mcp.transport.capture-tool-list({
+		tools => [{
+			name        => 'execute_sql',
+			inputSchema => {
+				type       => 'object',
+				properties => {
+					region => { type => 'string', 'x-mcp-header' => 'Region' },
+					query  => { type => 'string' },
+				},
+			},
+		},],
+	});
+
+	is-deeply $mcp.transport.tool-annotations, { execute_sql => { Region => ('region',) } },
+		'the annotation was captured';
+
+	# The server cross-checks any Mcp-Param-* header whose name matches an
+	# argument, decoding the sentinel first -- so both of these 200s are the
+	# server agreeing with the header the client sent.
+	my %plain = $mcp.call-tool('execute_sql', { region => 'us-west1', query => 'SELECT 1' });
+	is %plain<content>[0]<text>, "ran 'SELECT 1' in us-west1",
+		'a plain ASCII region passes the server\'s header check';
+
+	my %fancy = $mcp.call-tool('execute_sql', { region => 'eu-café-1', query => 'SELECT 2' });
+	is %fancy<content>[0]<text>, "ran 'SELECT 2' in eu-café-1",
+		'and so does one that has to travel base64-encoded';
+
+	# The control: the same body with a header the client would never have
+	# built. Without this, the two passes above could mean the server was not
+	# looking.
+	my %msg = jsonrpc => '2.0', id => 'control', method => 'tools/call', params => {
+		name      => 'execute_sql',
+		arguments => { region => 'us-west1', query => 'SELECT 1' },
+		_meta     => { (META-PROTOCOL-VERSION) => MODERN-PROTOCOL-VERSION },
+	};
+	my $refused = Cro::HTTP::Client.new(:!persistent, :http<1.1>).post(
+		$endpoint,
+		content-type => 'application/json',
+		body         => to-json(%msg, :!pretty),
+		headers      => [
+			'MCP-Protocol-Version' => MODERN-PROTOCOL-VERSION,
+			'Mcp-Method'           => 'tools/call',
+			'Mcp-Name'             => 'execute_sql',
+			'Mcp-Param-Region'     => 'eu-west9',
+		],
+	);
+	timed($refused, 'the server to refuse a mismatched Mcp-Param');
+	is (($refused.cause ~~ X::Cro::HTTP::Error) ?? $refused.cause.response.status !! 0), 400,
+		'a Mcp-Param that disagrees with the body is refused, so the passes above mean something';
+};
+
+subtest 'a call that outlives its budget times out' => {
+	plan 3;
+
+	# The stream is already open by then -- the slow tool logs before it starts
+	# waiting -- so this is our own budget expiring on a live stream rather than
+	# Cro giving up on the response headers.
+	my $answer = $mcp.call-tool-async('slow', {}, timeout => 0.5);
+	timed($answer, 'the timed-out call to fail');
+
+	is $answer.status, Broken, 'the call fails rather than waiting the full request timeout';
+	ok $answer.cause ~~ X::MCP::Client::Timeout, '...as a timeout';
+	is $answer.cause.seconds, 0.5, '...naming the budget it outlived';
+};
+
+subtest 'cancelling an in-flight call hangs up on the server' => {
+	plan 4;
+
+	my $started = watch('slow started');
+	my $stop = Promise.new;
+	my $answer = $mcp.call-tool-async('slow', {}, cancelled => $stop);
+
+	# The server's own first log line is the signal that the handler is running:
+	# there is nothing to cancel before it.
+	timed($started, 'the slow tool to start');
+	pass 'the call is in flight';
+
+	$stop.keep(True);
+	timed($answer, 'the cancelled call to fail');
+
+	is $answer.status, Broken, 'a cancelled call does not quietly succeed';
+	ok $answer.cause ~~ X::MCP::Client::Cancelled,
+		'...it fails with the exception the caller asked for';
+
+	# Cancelling closes that request's connection, which is the whole of the
+	# wire-level signal -- and it must take nothing else with it. (What the
+	# server's handler makes of it is MCP::Server::HTTP's business; that it now
+	# reaches one as $*MCP-REQUEST-CONTEXT.cancelled is proved there, in
+	# t/19-http-server.rakutest.)
+	is $mcp.call-tool('greet', { name => 'Ib' })<content>[0]<text>, 'Hi, Ib',
+		'and the next call goes through, so only its own request was torn down';
+};
+
+subtest 'a server that has gone away is reported as gone, not as ancient' => {
+	plan 3;
+
+	# Cro's stop drains responses that are already in flight, so the honest
+	# place to observe a dead endpoint is the next request -- which is also the
+	# case that matters, because that is what a caller retrying will hit.
+	$http.stop;
+
+	my $answer = $mcp.call-tool-async('greet', { name => 'Zed' });
+	timed($answer, 'the request to a stopped server to fail');
+
+	is $answer.status, Broken, 'the request fails';
+	ok $answer.cause ~~ X::MCP::Client::ServerGone,
+		'as ServerGone -- a dead wire is not evidence about the protocol era';
+	ok $answer.cause.message.contains($endpoint),
+		'and it names the endpoint that stopped answering';
+};
+
+done-testing;

@@ -1,0 +1,404 @@
+use Test;
+use lib 'lib', 't/lib';
+use MCP::Server;
+use MCP::Client;
+use MCP::Client::Exceptions;
+use MCP::Client::Registry;
+use MCP::Client::Test::InProcessTransport;
+use MCP::Client::Test::TestKit;
+
+# The registry is the piece that lets an agent hold tools from several places at
+# once without the model ever finding out. Two things have to be true for that:
+# a provider is anything that speaks the two bridge methods (so a live
+# MCP::Server, a remote MCP::Client and another registry are all the same kind of
+# thing), and a call always comes back to the provider that published it --
+# however much the prefixes and the tool names look alike.
+
+plan 10;
+
+# A provider with no server behind it at all: it publishes the names it was
+# given and answers every call with "<label>:<name>", recording the batches it
+# was handed so a test can prove the routing rather than infer it.
+#
+# Its declarations are built once and handed out by reference, which is what
+# makes the "the registry does not mutate what a provider published" assertion
+# in the rewrite subtest mean something.
+my class ScriptedProvider {
+	has Str:D $.label is required;
+	has Str:D @.tool-names;
+	has Bool:D $.explode = False;
+
+	has Lock $!lock .= new;
+	has @!declared;
+	has @!batches;
+
+	submethod TWEAK {
+		@!declared = @!tool-names.map(-> $name {
+			%(
+				type => 'function',
+				function => %(
+					name => $name,
+					description => "$!label does $name",
+					parameters => %( type => 'object', properties => %() ),
+				),
+			);
+		});
+	}
+
+	#| The names of the calls in each batch this provider was handed, in order.
+	method batches(--> List:D) {
+		$!lock.protect: { @!batches.map(*.List).List };
+	}
+
+	#| Every call this provider saw, flattened, in order.
+	method seen(--> List:D) {
+		$!lock.protect: { @!batches.map(*.Slip).List };
+	}
+
+	method tools-for-llm(--> List) {
+		@!declared.List;
+	}
+
+	method execute-tool-calls(@tool-calls --> List) {
+		die "the $!label provider is not answering" if $!explode;
+
+		$!lock.protect: {
+			@!batches.push([@tool-calls.map({ $_<function><name> })]);
+		}
+
+		@tool-calls.map(-> %tc {
+			%(
+				role => 'tool',
+				tool_call_id => %tc<id>,
+				content => "$!label:{%tc<function><name>}",
+				is_error => False,
+			);
+		}).list;
+	}
+}
+
+# One of the two bridge methods is not enough: half a provider cannot be routed
+# to, and finding that out at add time beats finding it out mid-conversation.
+my class HalfProvider {
+	method tools-for-llm(--> List) { () }
+}
+
+# A toolkit registered straight onto a real MCP::Server, so at least one
+# provider in this file is the genuine article rather than a double.
+my class InlineKit {
+	method register($registrar) {
+		$registrar.tool: 'read_file',
+			description => 'Read a file from disk',
+			params => { path => { type => 'string', description => 'What to read', required => True } },
+			handler => -> :%args { "contents of {(%args<path> // '').Str}" };
+
+		$registrar.tool: 'ext_read',
+			description => 'Read a file the long way round',
+			params => { path => { type => 'string', description => 'What to read' } },
+			handler => -> :%args { "the long way round" };
+	}
+}
+
+sub inline-server(--> MCP::Server:D) {
+	my $server = MCP::Server.new(name => 'inline', version => '1.0.0');
+	$server.plug(InlineKit.new);
+	$server;
+}
+
+# A remote provider: a second real server, reached through MCP::Client. Nothing
+# in the registry knows the difference, which is the point of the duck type.
+sub remote-client(--> MCP::Client:D) {
+	my $server = MCP::Server.new(name => 'remote', version => '1.0.0');
+	$server.plug(MCP::Client::Test::TestKit.new(slow-ms => 10));
+	MCP::Client.new(
+		transport => MCP::Client::Test::InProcessTransport.new(:$server),
+		on-warn => -> Str:D $m { diag "client warning: $m" },
+	);
+}
+
+subtest 'add refuses what it could never route' => {
+	plan 8;
+
+	my $registry = MCP::Client::Registry.new;
+
+	throws-like { $registry.add(42, prefix => 'n') }, X::MCP::Client,
+		'a value that is not a provider at all';
+	throws-like { $registry.add(MCP::Server, prefix => 'n') }, X::MCP::Client,
+		'a type object, which has the methods but nothing to call them on';
+	throws-like { $registry.add(HalfProvider.new, prefix => 'n') }, X::MCP::Client,
+		'an object with only half the bridge';
+
+	throws-like { $registry.add(ScriptedProvider.new(label => 'a'), prefix => '') },
+		X::MCP::Client, 'an empty prefix, which would namespace nothing';
+	throws-like { $registry.add(ScriptedProvider.new(label => 'a'), prefix => 'no spaces') },
+		X::MCP::Client, 'a prefix that could not appear in a legal tool name';
+	throws-like { $registry.add(ScriptedProvider.new(label => 'a'), prefix => 'a', sep => '::') },
+		X::MCP::Client, 'and a separator that could not either';
+
+	$registry.add(ScriptedProvider.new(label => 'first'), prefix => 'fs');
+	throws-like { $registry.add(ScriptedProvider.new(label => 'second'), prefix => 'fs') },
+		X::MCP::Client, 'a prefix that is already taken';
+
+	# 'fs' + '_x' and 'fs_' + 'x' both publish fs_x…, and a call to one could
+	# not be told from a call to the other.
+	throws-like { $registry.add(ScriptedProvider.new(label => 'third'), prefix => 'fs_', sep => '') },
+		X::MCP::Client, 'and a different prefix that publishes into the same namespace';
+};
+
+subtest 'a provider is whatever speaks the two bridge methods' => {
+	plan 5;
+
+	my $registry = MCP::Client::Registry.new;
+	my $server = inline-server();
+	my $client = remote-client();
+	my $nested = MCP::Client::Registry.new;
+	$nested.add(ScriptedProvider.new(label => 'inner', tool-names => <ping>), prefix => 'in');
+
+	lives-ok { $registry.add($server, prefix => 'local') }, 'a live MCP::Server';
+	lives-ok { $registry.add($client, prefix => 'remote') }, 'a remote MCP::Client';
+	lives-ok { $registry.add($nested, prefix => 'nested') }, 'another registry';
+	lives-ok { $registry.add(ScriptedProvider.new(label => 'fake'), prefix => 'fake') },
+		'and anything else with the two methods';
+
+	is-deeply $registry.providers.map({ $_<prefix> }).List,
+		<local remote nested fake>.List,
+		'and they are held in the order they were registered';
+
+	$client.close;
+};
+
+subtest 'what a provider publishes is republished under its prefix' => {
+	plan 6;
+
+	my $registry = MCP::Client::Registry.new;
+	my $server = inline-server();
+	my $fake = ScriptedProvider.new(label => 'notes', tool-names => <search add>);
+	$registry.add($server, prefix => 'fs');
+	$registry.add($fake, prefix => 'nt');
+
+	my @tools = $registry.tools-for-llm;
+	is-deeply @tools.map({ $_<function><name> }).List,
+		<fs_ext_read fs_read_file nt_search nt_add>.List,
+		'every tool is namespaced by the prefix its provider was added under';
+	is-deeply @tools.map({ $_<function><name> }).grep(*.starts-with('nt_')).List,
+		<nt_search nt_add>.List,
+		'in the order each provider published them, providers in registration order';
+
+	my %read = @tools.first({ $_<function><name> eq 'fs_read_file' });
+	is %read<type>, 'function', 'the declaration is still an OpenAI-style function';
+	is %read<function><description>, 'Read a file from disk',
+		'the description comes through untouched';
+	is-deeply %read<function><parameters><required>.List, ('path',),
+		'and so does the schema, which the model needs in order to call it';
+
+	# The registry hands the model a rewritten copy; the provider's own
+	# declarations are not its to edit, and something else may still be reading
+	# them.
+	is-deeply $fake.tools-for-llm.map({ $_<function><name> }).List, <search add>.List,
+		'and the provider still publishes its own names, unprefixed';
+};
+
+subtest 'the longest matching prefix wins, whatever order it was added in' => {
+	plan 6;
+
+	# The trap this exists for: 'fs_ext_read' starts with the tag of *both*
+	# providers, and the shorter match ('fs_' + 'ext_read') names a tool the
+	# other provider really has. Anything less than longest-match routing sends
+	# it to the wrong server and gets a plausible-looking wrong answer back.
+	for (('fs', 'fs_ext'), ('fs_ext', 'fs')) -> @order {
+		my $registry = MCP::Client::Registry.new;
+		my %by-prefix =
+			fs => ScriptedProvider.new(label => 'basic', tool-names => <read_file ext_read>),
+			'fs_ext' => ScriptedProvider.new(label => 'extended', tool-names => <read>);
+		$registry.add(%by-prefix{$_}, prefix => $_) for @order;
+
+		my @results = $registry.execute-tool-calls([
+			%( id => '1', function => %( name => 'fs_read_file', arguments => %() ) ),
+			%( id => '2', function => %( name => 'fs_ext_read', arguments => %() ) ),
+			%( id => '3', function => %( name => 'fs_ext_read', arguments => %() ) ),
+		]);
+
+		is-deeply @results.map({ $_<content> }).List,
+			('basic:read_file', 'extended:read', 'extended:read'),
+			"added as {@order.join(', ')}: the longer prefix takes its calls";
+		is-deeply %by-prefix<fs>.seen.List, ('read_file',),
+			"added as {@order.join(', ')}: the shorter provider saw only its own call";
+		is-deeply %by-prefix<fs_ext>.seen.List, ('read', 'read'),
+			"added as {@order.join(', ')}: and each provider is called with the prefix stripped";
+	}
+};
+
+subtest 'calls are batched per provider and reassembled in the caller order' => {
+	plan 4;
+
+	my $registry = MCP::Client::Registry.new;
+	my $one = ScriptedProvider.new(label => 'one', tool-names => <a b>);
+	my $two = ScriptedProvider.new(label => 'two', tool-names => <a>);
+	$registry.add($one, prefix => 'p1');
+	$registry.add($two, prefix => 'p2');
+
+	my @results = $registry.execute-tool-calls([
+		%( id => 'c1', function => %( name => 'p1_a', arguments => %() ) ),
+		%( id => 'c2', function => %( name => 'p2_a', arguments => %() ) ),
+		%( id => 'c3', function => %( name => 'p1_b', arguments => %() ) ),
+		%( id => 'c4', function => %( name => 'p2_a', arguments => %() ) ),
+	]);
+
+	is-deeply @results.map({ $_<tool_call_id> }).List, <c1 c2 c3 c4>.List,
+		'one result per call, in the order the model asked for them';
+	is-deeply @results.map({ $_<content> }).List,
+		('one:a', 'two:a', 'one:b', 'two:a'),
+		'each answered by the provider that owns it';
+
+	is-deeply $one.batches.List, (('a', 'b'),),
+		'a provider is called once for the whole batch, not once per call';
+	is-deeply $two.batches.List, (('a', 'a'),),
+		'with its own calls in the order they were made';
+};
+
+subtest 'a call for a prefix nobody owns' => {
+	plan 3;
+
+	my $registry = MCP::Client::Registry.new;
+	my $only = ScriptedProvider.new(label => 'only', tool-names => <a>);
+	$registry.add($only, prefix => 'p1');
+
+	my @results = $registry.execute-tool-calls([
+		%( id => 'x', function => %( name => 'nope_a', arguments => %() ) ),
+		%( id => 'y', function => %( name => 'p1_a', arguments => %() ) ),
+	]);
+
+	ok @results[0]<is_error>, 'comes back as a result flagged as an error';
+	like @results[0]<content>, /'nope_a'/,
+		'naming the tool, so the model can see what it got wrong';
+	is @results[1]<content>, 'only:a', 'and the calls around it are answered normally';
+};
+
+subtest 'a provider that throws fails only its own calls' => {
+	plan 5;
+
+	my $registry = MCP::Client::Registry.new;
+	my $good = ScriptedProvider.new(label => 'good', tool-names => <a>);
+	my $bad = ScriptedProvider.new(label => 'bad', tool-names => <a>, explode => True);
+	$registry.add($good, prefix => 'ok');
+	$registry.add($bad, prefix => 'no');
+
+	my @results;
+	lives-ok {
+		@results = $registry.execute-tool-calls([
+			%( id => '1', function => %( name => 'ok_a', arguments => %() ) ),
+			%( id => '2', function => %( name => 'no_a', arguments => %() ) ),
+			%( id => '3', function => %( name => 'ok_a', arguments => %() ) ),
+			%( id => '4', function => %( name => 'no_a', arguments => %() ) ),
+		]);
+	}, 'a provider blowing up does not blow up the dispatch';
+
+	is-deeply @results.map({ $_<is_error> }).List, (False, True, False, True),
+		'only the calls that went to it are errors';
+	is-deeply @results.map({ $_<tool_call_id> }).List, ('1', '2', '3', '4'),
+		'and every call still gets exactly one result, in order';
+	like @results[1]<content>, /'is not answering'/,
+		'carrying what the provider said on its way down';
+
+	# Listing is the deliberate asymmetry: a provider that cannot say what it
+	# offers is not quietly dropped from the catalogue, because a model told
+	# about a tool yesterday and not today has no way to find out why.
+	my class MuteProvider {
+		method tools-for-llm(--> List) { die 'cannot list right now' }
+		method execute-tool-calls(@tool-calls --> List) { () }
+	}
+	$registry.add(MuteProvider.new, prefix => 'mute');
+	dies-ok { $registry.tools-for-llm }, 'a provider that cannot list its tools is not hidden';
+};
+
+subtest 'malformed calls, and providers that answer badly' => {
+	plan 5;
+
+	my $registry = MCP::Client::Registry.new;
+
+	# A provider that shortchanges the caller: two calls in, one result out, and
+	# the one it does return is not a hash.
+	my class SloppyProvider {
+		method tools-for-llm(--> List) {
+			(%( type => 'function', function => %( name => 'a', parameters => %() ) ),);
+		}
+		method execute-tool-calls(@tool-calls --> List) { ('just a string',) }
+	}
+
+	$registry.add(SloppyProvider.new, prefix => 'sl');
+
+	my @results;
+	lives-ok {
+		@results = $registry.execute-tool-calls([
+			'not a call at all',
+			%( id => 'no-function' ),
+			%( id => 'bad-function', function => 'also not a call' ),
+			%( id => 's1', function => %( name => 'sl_a', arguments => %() ) ),
+			%( id => 's2', function => %( name => 'sl_a', arguments => %() ) ),
+		]);
+	}, 'nothing a caller or a provider does makes dispatch throw';
+
+	is @results.elems, 5, 'one result per call, however malformed the call was';
+	is-deeply @results.head(3).map({ $_<is_error> }).List, (True, True, True),
+		'a call with no usable function name is an error result';
+	is-deeply @results[3], %(
+		role => 'tool', tool_call_id => 's1', content => 'just a string', is_error => False,
+	), 'a provider answering with a bare string is wrapped into a proper result';
+	ok @results[4]<is_error>,
+		'and the call it never answered at all is filled in as an error';
+};
+
+subtest 'remove' => {
+	plan 6;
+
+	my $registry = MCP::Client::Registry.new;
+	my $one = ScriptedProvider.new(label => 'one', tool-names => <a>);
+	my $two = ScriptedProvider.new(label => 'two', tool-names => <a>);
+	$registry.add($one, prefix => 'p1');
+	$registry.add($two, prefix => 'p2');
+
+	is $registry.remove('p1'), $one, 'remove hands back the provider it dropped';
+	is $registry.elems, 1, 'and the registry is one shorter';
+	ok !$registry.has-prefix('p1') && $registry.has-prefix('p2'),
+		'the prefix is free again, and the others are untouched';
+	is-deeply $registry.tools-for-llm.map({ $_<function><name> }).List, ('p2_a',),
+		'its tools are no longer published';
+
+	my @results = $registry.execute-tool-calls([
+		%( id => '1', function => %( name => 'p1_a', arguments => %() ) ),
+	]);
+	ok @results[0]<is_error>, 'and a call for it is answered like any other unknown prefix';
+
+	is-deeply $registry.remove('p1'), Nil, 'removing what is not there is not an error';
+};
+
+subtest 'registries nest, because a registry is a provider' => {
+	plan 5;
+
+	my $vendor = MCP::Client::Registry.new;
+	$vendor.add(ScriptedProvider.new(label => 'jira', tool-names => <search>), prefix => 'jira');
+	$vendor.add(ScriptedProvider.new(label => 'slack', tool-names => <post_message>), prefix => 'slack');
+
+	my $registry = MCP::Client::Registry.new;
+	$registry.add($vendor, prefix => 'corp');
+	$registry.add(inline-server(), prefix => 'fs');
+
+	my @names = $registry.tools-for-llm.map({ $_<function><name> });
+	is-deeply @names.List,
+		<corp_jira_search corp_slack_post_message fs_ext_read fs_read_file>.List,
+		'the inner prefixes are nested inside the outer one';
+
+	my @results = $registry.execute-tool-calls([
+		%( id => '1', function => %( name => 'corp_slack_post_message', arguments => %() ) ),
+		%( id => '2', function => %( name => 'fs_read_file', arguments => %( path => '/etc/hosts' ) ) ),
+		%( id => '3', function => %( name => 'corp_nope_x', arguments => %() ) ),
+	]);
+
+	is @results[0]<content>, 'slack:post_message',
+		'a call is unwrapped one prefix at a time on its way in';
+	is @results[1]<content>, 'contents of /etc/hosts',
+		'and a real server two levels down still gets its arguments';
+	ok @results[2]<is_error>,
+		'an unknown prefix inside the inner registry is still just an error result';
+	is @results[2]<tool_call_id>, '3', 'reported against the call that caused it';
+};

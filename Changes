@@ -1,0 +1,119 @@
+Revision history for MCP::Client
+
+{{$NEXT}}
+
+0.2.0  2026-08-09T19:47:09+01:00
+    - Initial release: a client for talking to third-party MCP servers over
+      stdio or Streamable HTTP, speaking both the 2025-11-25 ("legacy") and
+      2026-07-28 ("modern") protocol eras.
+    - MCP::Client::Exceptions: the typed failure vocabulary (timeouts, a dead
+      server process, protocol errors, version mismatches, cancellation, a
+      spent multi-round-trip budget, a closed transport, spawn failures).
+    - MCP::Client::Protocol: the client half of the wire format that
+      MCP::Server::Protocol does not cover - build-request (which stamps the
+      2026-07-28 _meta block for modern-era requests and leaves legacy ones
+      alone), parse-inbound (which, unlike the server's parse-message, accepts
+      id-only responses), normalize-result, decline-input-response and
+      is-modern-error.
+    - MCP::Client::Correlator: the pending-request table for a shared pipe,
+      with injectable clock and timer for deterministic timeout tests.
+    - MCP::Client::SSE: a standalone incremental Server-Sent Events parser that
+      survives chunk boundaries falling anywhere, including mid-UTF-8.
+    - MCP::Client::Cache: a ttlMs/cacheScope cache for the four cacheable
+      modern-era results; legacy results and ttlMs=0 results are never stored.
+    - MCP::Client::Transport: the role every transport does - request, notify,
+      close, alive - plus the contract around it (the client owns the JSON-RPC
+      ids, the promise carries the normalised result, JSON-RPC errors break it
+      with a typed exception, notifications never touch it).
+    - MCP::Client: the client itself. Probes the server's protocol era once and
+      caches the verdict, falls back to the 2025-11-25 initialize handshake for
+      servers that are not modern, runs the 2026-07-28 multi round-trip loop on
+      tools/call, resources/read and prompts/get (declaring exactly the client
+      capabilities its hooks can serve), caches what the server says may be
+      cached, and offers every call blocking or as a Promise.
+    - MCP::Client::Transport::Stdio: spawns the server as a child process (no
+      shell, ever) and speaks newline-framed JSON-RPC over its pipes. Failure
+      is a first-class citizen: a dying child fails every pending request with
+      its exit code and a stderr tail, stray stdout lines are logged and
+      dropped, and close escalates from EOF to SIGKILL through a grace period.
+    - MCP::Client::Transport::HTTP: the 2026-07-28 Streamable HTTP transport.
+      Stamps the required MCP-Protocol-Version / Mcp-Method / Mcp-Name headers,
+      implements x-mcp-header parameter mirroring (invalid annotations exclude
+      the tool, as the spec requires), reads both JSON and per-request SSE
+      responses, and decodes bodies as UTF-8 itself rather than trusting
+      charset guessing.
+    - MCP::Client::Registry: aggregates any number of tool providers - local
+      MCP::Server instances, MCP::Client connections, or other registries -
+      behind prefixed tool names, routing calls back to their owners and
+      answering unroutable ones as in-band tool errors.
+    - The LLM bridge: tools-for-llm and execute-tool-calls on MCP::Client,
+      shape-identical to MCP::Server's, so LLM::Chat::ToolLoop treats a remote
+      server and an in-process toolkit interchangeably. Declarations come out
+      sorted by tool name on both sides, and an empty or whitespace-only
+      arguments string - what models send for a tool that takes none - is read
+      as "no arguments" rather than answered with a parse error. Both match
+      MCP::Server's own bridge, which changed to agree.
+    - connect-stdio / connect-http accept the transport's own options
+      (on-stderr, kill-grace, stderr-lines, inherit-env; http-version,
+      persistent, connect-timeout) alongside client options, and a shared
+      on-warn carries both client and transport diagnostics.
+    - docs/Readme.rakudoc: the full guide - the era machine and its probe,
+      connecting over either transport, the result shapes and their caching,
+      the multi round-trip hooks and what declining means, the LLM bridge and
+      the registry, an exception table, and the limitations.
+    - t/15-mrtr-live.rakutest: the multi round-trip loop against a real
+      MCP::Server that really does elicit (MCP::Server 0.4.0 implements the
+      server half), through the in-process transport. Test-only addition - no
+      library code changed - and the cross-distribution counterpart to
+      t/06-mrtr.rakutest, which pins the same contract against a scripted wire.
+      Run it with: prove6 -Ilib -I../MCP-Server/lib t/
+    - examples/toolloop.raku: a runnable end-to-end tool loop over a registry
+      holding both an in-process MCP::Server toolkit and a spawned MCP server,
+      driven by a scripted LLM::Chat backend (LLM::Chat is not a dependency;
+      run the example with -I../LLM-Chat/lib).
+    - MCP::Client::Policy (0.2.0): Claude Code-style per-directory permissions
+      at the provider seam. A policy wraps any provider - a client, a registry,
+      another policy - and satisfies the same duck type, so it stacks anywhere
+      one goes. Reads pass, anything that changes the world stops at an on-ask
+      callback, and "always allow" leaves a session grant behind that is plain
+      data the caller can persist and reload. Denials are is_error results a
+      model can read, never exceptions; execute-tool-calls keeps the
+      never-throws promise exactly as MCP::Client and the registry do, batches
+      the allowed calls into one forward, and hands the provider the caller's
+      own untouched call hashes. tools-for-llm leaves out the tools a bare deny
+      rule refuses. Headless (no callback) every ask is a refusal that says so.
+    - MCP::Client::Policy::Rules: the engine, pure data in and out. Rules are
+      { tool (exact or trailing-'*' glob), decision (allow/deny/ask), under? };
+      every matching rule is evaluated and the strongest decision wins
+      (deny > ask > allow, so a serialised rule set merges and re-orders
+      safely), and a call no rule matched is asked about rather than allowed.
+      Containment is purely lexical and segment-wise - never IO, never a string
+      prefix (/tmp/root2 is not inside /tmp/root) - because the paths belong to
+      the server's filesystem and symlink truth is the server pack's sandbox to
+      enforce. It is tri-state: '..', a null byte, a backslash, an absolute path
+      with no root to measure from, a missing or non-string argument and
+      arguments that will not parse are all 'unknown', which fails closed both
+      ways - an allow rule needs every location 'yes', a deny or ask rule fires
+      on any 'yes' or 'unknown'. roots (tool-name prefix to directory, longest
+      prefix wins) absolutise relative arguments; path-params overrides the
+      path/from/to convention per tool.
+    - Policy.elicit-hook: one callback seam for two kinds of question. A
+      permission question carries the tool, the parsed arguments, a copy of the
+      call, the rule, the locations and a suggested "always" rule; a
+      server-elicit carries the server's own ElicitRequest. Both are asked under
+      one lock, because there is one human. With nobody to ask - or a callback
+      that throws, or answers with nonsense - the server is declined and the
+      call refused, never hung. Wire MCP::Client's on-elicit to it only when
+      .interactive: wiring it is what declares the elicitation capability.
+    - Policy.default-rules: allow the FileSystem pack's read-only tools
+      (fs_read/fs_list/fs_glob/fs_stat/fs_grep) and user_ask - asking the human
+      is inherently consented to, since the elicitation UI is where they answer
+      or decline. Deliberately no '* ask' catch-all: the engine already asks
+      about anything unmatched, and a catch-all would suppress session grants.
+    - t/14-policy.rakutest: twelve groups, including the stacked
+      policy-over-registry-over-policy case (and the footgun it comes with: a
+      rule written in the wrong layer's vocabulary matches nothing), the
+      elicit-hook end to end against a real eliciting MCP::Server behind the
+      in-process transport, and a parity guard that runs t/13's argument shapes
+      through an allow-everything policy to pin the policy's argument parser to
+      the bridge's. Run it with: prove6 -Ilib -I../MCP-Server/lib t/

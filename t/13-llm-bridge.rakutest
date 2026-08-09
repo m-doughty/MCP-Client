@@ -1,0 +1,324 @@
+use Test;
+use lib 'lib', 't/lib';
+use MCP::Server;
+use MCP::Client;
+use MCP::Client::Exceptions;
+use MCP::Client::Test::InProcessTransport;
+use MCP::Client::Test::TestKit;
+
+# The promise this file exists to keep: moving a toolkit from inside the process
+# to behind an MCP connection must not change one byte of what the model sees.
+# So the *same* TestKit instance is plugged into two servers -- one talked to
+# directly, one behind MCP::Client -- and their bridges are compared answer for
+# answer. Anything that drifts (a schema rendered differently, an error phrased
+# differently, isError read as an exception on one side) shows up here as a
+# diff rather than as a mysteriously worse agent.
+
+plan 8;
+
+# One kit, two servers. Everything the two bridges are asked about therefore has
+# identical handlers and identical schemas by construction, so a difference in
+# the output can only have come from the bridge or from the wire.
+sub twins(*%opts) {
+	my $kit = MCP::Client::Test::TestKit.new(slow-ms => 20);
+
+	my $local = MCP::Server.new(name => 'local-server', version => '1.0.0');
+	$local.plug($kit);
+
+	my $remote = MCP::Server.new(name => 'remote-server', version => '1.0.0');
+	$remote.plug($kit);
+
+	# A tool with neither a description nor parameters, registered identically on
+	# both: the "omit description when there is none" branch has to agree too.
+	for $local, $remote -> $server {
+		$server.tool: 'bare', handler => -> :%args { 'nothing to declare' };
+	}
+
+	my $wire = MCP::Client::Test::InProcessTransport.new(server => $remote);
+	my $client = MCP::Client.new(
+		transport => $wire,
+		on-warn => -> Str:D $m { diag "client warning: $m" },
+		|%opts,
+	);
+
+	($local, $client, $wire, $kit);
+}
+
+subtest 'the same toolkit declares itself the same way through a client' => {
+	plan 3;
+
+	my ($local, $client) = twins();
+
+	# Compared in the order each side hands them over, not as sets: both bridges
+	# sort by name (the local one because MCP::Server does, the client because
+	# tools/list does), so an order that drifted would be a real difference in
+	# what the model is shown, not a detail to be normalised away.
+	is-deeply $client.tools-for-llm.List, $local.tools-for-llm.List,
+		'every declaration is identical, down to the schemas and the order';
+
+	is-deeply $client.tools-for-llm.map({ $_<function><name> }).List,
+		<bare dying echo noisy slow>.List,
+		'and the client publishes them in the order the server sorts tools/list into';
+
+	is-deeply $client.tools-for-llm.map({ $_<type> }).unique.List, ('function',),
+		'each one declared as a function, which is what the APIs expect';
+
+	$client.close;
+};
+
+subtest 'what a declaration is made of' => {
+	plan 6;
+
+	my ($local, $client) = twins();
+
+	my %echo = $client.tools-for-llm.first({ $_<function><name> eq 'echo' });
+	is-deeply %echo.keys.sort.List, <function type>.List, 'a declaration is type + function';
+	is-deeply %echo<function>.keys.sort.List, <description name parameters>.List,
+		'and a function is name + description + parameters';
+	is %echo<function><description>, 'Return the text it was given',
+		'the description is the tool\'s own';
+	is-deeply %echo<function><parameters>,
+		$local.tools-for-llm.first({ $_<function><name> eq 'echo' })<function><parameters>,
+		'the parameters are the inputSchema, unchanged by the round trip';
+
+	my %bare = $client.tools-for-llm.first({ $_<function><name> eq 'bare' });
+	nok %bare<function><description>:exists,
+		'a tool with no description declares none rather than declaring an empty one';
+	is-deeply %bare<function><parameters>, { type => 'object', properties => {} },
+		'but it always declares parameters: a function without them is invalid';
+
+	$client.close;
+};
+
+subtest 'the same calls produce the same results either side of the wire' => {
+	plan 11;
+
+	my ($local, $client) = twins();
+
+	# One batch covering every shape a model (or a broken model) can send,
+	# including the empty-arguments case ('g'): models really do send "" as the
+	# arguments of a tool that takes none, and both bridges have to read that as
+	# "no arguments" rather than as a broken call.
+	my @calls = (
+		%( id => 'a', function => %( name => 'echo', arguments => %( text => 'hello there' ) ) ),
+		%( id => 'b', function => %( name => 'echo', arguments => '{"text":"from json"}' ) ),
+		%( id => 'c', function => %( name => 'nope', arguments => %() ) ),
+		%( id => 'd', function => %( name => 'echo', arguments => '{not json' ) ),
+		%( id => 'e', function => %( name => 'echo', arguments => '[1,2]' ) ),
+		%( id => 'f', function => %( name => 'echo', arguments => 42 ) ),
+		%( id => 'g', function => %( name => 'echo', arguments => '' ) ),
+		%( id => 'h', function => %( name => 'dying', arguments => %( reason => 'the well ran dry' ) ) ),
+		%( function => %( name => 'bare', arguments => %() ) ),
+		%( id => 'i', function => %( name => 'bare', arguments => "  \n " ) ),
+	);
+
+	my @through-client = $client.execute-tool-calls(@calls);
+	my @in-process = $local.execute-tool-calls(@calls);
+
+	is-deeply @through-client.List, @in-process.List,
+		'every result matches the local bridge exactly';
+
+	# Spelled out as well, so a failure above says which shape broke rather than
+	# printing nine hashes and leaving the reader to diff them.
+	is-deeply @through-client[0], %(
+		role => 'tool', tool_call_id => 'a', content => 'hello there', is_error => False,
+	), 'hash arguments: the tool ran and its text came back';
+	is @through-client[1]<content>, 'from json',
+		'JSON-string arguments are parsed, which is how the APIs actually send them';
+	is-deeply @through-client[2], %(
+		role => 'tool', tool_call_id => 'c', content => "Unknown tool: 'nope'", is_error => True,
+	), 'an unknown tool is an error result, phrased exactly as the local bridge phrases it';
+	like @through-client[3]<content>, /^'Invalid tool arguments JSON: '/,
+		'arguments that are not JSON say so';
+	is @through-client[4]<content>, 'Tool arguments must be a JSON object',
+		'JSON that is not an object says so';
+	is @through-client[5]<content>, 'Tool arguments must be a JSON object',
+		'and so does a number where an object should have been';
+	is-deeply @through-client[6], %(
+		role => 'tool', tool_call_id => 'g', content => '', is_error => False,
+	), 'but empty arguments are no arguments, and the tool runs';
+	is-deeply @through-client[9], %(
+		role => 'tool', tool_call_id => 'i', content => 'nothing to declare', is_error => False,
+	), 'and so is a string that is nothing but whitespace';
+	is-deeply @through-client[7], %(
+		role => 'tool', tool_call_id => 'h', content => 'the well ran dry', is_error => True,
+	), 'a tool that threw is an error result carrying what it said';
+	is @through-client[8]<tool_call_id>, '',
+		'a call with no id is answered against an empty one, not dropped';
+
+	$client.close;
+};
+
+subtest 'one result per call, in the caller\'s order, whatever happens' => {
+	plan 4;
+
+	my ($local, $client) = twins();
+
+	my @calls = (
+		%( id => '1', function => %( name => 'dying', arguments => %() ) ),
+		%( id => '2', function => %( name => 'echo', arguments => %( text => 'two' ) ) ),
+		%( id => '3', function => %( name => 'nope', arguments => %() ) ),
+		%( id => '4', function => %( name => 'echo', arguments => %( text => 'four' ) ) ),
+	);
+
+	my @results = $client.execute-tool-calls(@calls);
+	is @results.elems, 4, 'one result per call';
+	is-deeply @results.map({ $_<tool_call_id> }).List, ('1', '2', '3', '4'),
+		'in the order they were made, correlated by id';
+	is-deeply @results.map({ $_<is_error> }).List, (True, False, True, False),
+		'a failure in the middle does not disturb the calls around it';
+	is-deeply @results.map({ $_<is_error> }).List,
+		$local.execute-tool-calls(@calls).map({ $_<is_error> }).List,
+		'and the local bridge agrees about which of them failed';
+
+	$client.close;
+};
+
+subtest 'content blocks become the text a model reads' => {
+	plan 6;
+
+	# Client-only: these are shapes a *server* can answer with, and the local
+	# bridge never sees them because a local handler hands its answer straight
+	# back. The wire is where a tool result becomes content blocks, so this is
+	# where the blocks have to become text again.
+	my $server = MCP::Server.new(name => 'blocky', version => '1.0.0');
+	$server.tool: 'blocks', handler => -> :%args {
+		[
+			{ type => 'text', text => 'line one' },
+			{ type => 'text', text => 'line two' },
+			{ type => 'image', mimeType => 'image/png', data => 'AAAA' },
+			{ type => 'resource', resource => { uri => 'test://x', text => 'embedded text' } },
+			{ type => 'resource_link', uri => 'file:///srv/notes.md' },
+			{ type => 'invented', payload => 'who knows' },
+		];
+	};
+	$server.tool: 'structured', handler => -> :%args {
+		{ structuredContent => { ok => True } };
+	};
+	$server.tool: 'silent', handler => -> :%args { {} };
+	$server.tool: 'flagged', handler => -> :%args {
+		# The trailing comma is load-bearing: a one-element array literal holding
+		# a hash hits the single-argument rule and flattens it into Pairs.
+		{ content => [{ type => 'text', text => 'it went wrong' }, ], isError => True };
+	};
+
+	my $client = MCP::Client.new(
+		transport => MCP::Client::Test::InProcessTransport.new(:$server),
+		on-warn => -> Str:D $m { diag "client warning: $m" },
+	);
+
+	my @results = $client.execute-tool-calls([
+		%( id => '1', function => %( name => 'blocks', arguments => %() ) ),
+		%( id => '2', function => %( name => 'structured', arguments => %() ) ),
+		%( id => '3', function => %( name => 'silent', arguments => %() ) ),
+		%( id => '4', function => %( name => 'flagged', arguments => %() ) ),
+	]);
+
+	my @lines = @results[0]<content>.lines;
+	is-deeply @lines.head(2).List, ('line one', 'line two'),
+		'text blocks are joined a line each';
+	is @lines[2], '[image: image/png]',
+		'a binary block is named rather than inlined -- base64 in a transcript helps nobody';
+	is-deeply @lines.skip(3).List,
+		('embedded text', '[resource: file:///srv/notes.md]', '{"payload":"who knows","type":"invented"}'),
+		'an embedded resource gives up its text, a link gives up its URI, and an unknown block its JSON';
+
+	is @results[1]<content>, '{"structuredContent":{"ok":true}}',
+		'a result with no content array at all is rendered as JSON rather than lost';
+	is @results[2]<content>, '', 'and an empty result is empty';
+
+	is-deeply @results[3], %(
+		role => 'tool', tool_call_id => '4', content => 'it went wrong', is_error => True,
+	), 'isError on the result becomes is_error on the answer';
+
+	$client.close;
+};
+
+subtest 'a request that times out is a result, not an exception' => {
+	plan 4;
+
+	my ($local, $client, $wire, $kit) = twins(request-timeout => 0.5);
+	$client.era;   # probe under the probe budget, not the request one
+
+	my @results;
+	lives-ok {
+		@results = $client.execute-tool-calls([
+			%( id => '1', function => %( name => 'slow', arguments => %( ms => 3000 ) ) ),
+			%( id => '2', function => %( name => 'echo', arguments => %( text => 'still here' ) ) ),
+		]);
+	}, 'a tool that outlives its budget does not throw at the caller';
+
+	ok @results[0]<is_error>, 'it comes back flagged as an error';
+	like @results[0]<content>, /'timed out'/,
+		'saying what happened, in words a model can act on';
+	is @results[1]<content>, 'still here',
+		'and the next call in the batch is answered normally';
+
+	$client.close;
+};
+
+subtest 'execute-tool-calls never throws' => {
+	plan 7;
+
+	my ($local, $client) = twins();
+
+	my @results;
+	lives-ok {
+		@results = $client.execute-tool-calls([
+			'not a call at all',
+			%( id => 'x' ),
+			%( id => 'y', function => 'not an object either' ),
+			%( id => 'z', function => %( arguments => %() ) ),
+			%( id => 'w', function => %( name => 'echo', arguments => %( text => 'fine' ) ) ),
+		]);
+	}, 'malformed calls are survived, not thrown on';
+
+	is-deeply @results.map({ $_<is_error> }).List, (True, True, True, True, False),
+		'each broken call is its own error result, and the good one still runs';
+	is-deeply @results.map({ $_<role> }).unique.List, ('tool',),
+		'every entry is a tool message, which is what a transcript needs';
+	ok @results.map({ $_<content> ~~ Str:D }).all,
+		'and every content is a string, ready to be appended verbatim';
+
+	is-deeply $client.execute-tool-calls([]).List, ().List,
+		'an empty batch is an empty answer';
+
+	# The connection dying is the failure mode that matters most: a tool round
+	# that throws here takes the whole conversation down with it.
+	$client.close;
+	my @dead;
+	lives-ok {
+		@dead = $client.execute-tool-calls([
+			%( id => '1', function => %( name => 'echo', arguments => %( text => 'anyone there?' ) ) ),
+		]);
+	}, 'a closed connection is survived too';
+	ok @dead[0]<is_error> && @dead[0]<content>.contains('closed'),
+		'and reported as an error result naming the reason';
+};
+
+subtest 'the shape LLM::Chat::ToolLoop actually consumes' => {
+	plan 4;
+
+	# Pinned against LLM-Chat/lib/LLM/Chat/ToolLoop.rakumod: it hands
+	# execute-tools the backend's $resp.tool-calls verbatim, and reads
+	# %result<content> and %result<tool_call_id> off each answer.
+	my ($local, $client) = twins();
+
+	my @tool-calls = (
+		%( id => 'call_abc123', type => 'function',
+		   function => %( name => 'echo', arguments => '{"text":"round trip"}' ) ),
+	);
+
+	my @results = $client.execute-tool-calls(@tool-calls);
+	ok @results[0] ~~ Associative, 'a result is a hash, so ToolLoop does not stringify it';
+	is ~(@results[0]<content> // ''), 'round trip', 'content is the tool message body';
+	is ~(@results[0]<tool_call_id> // ''), 'call_abc123',
+		'tool_call_id ties it back to the call the model made';
+
+	# The extra members a backend puts on a tool call (type, index, ...) are not
+	# ours to object to.
+	is-deeply @results[0], $local.execute-tool-calls(@tool-calls)[0],
+		'and an unfamiliar member on the call changes nothing';
+
+	$client.close;
+};

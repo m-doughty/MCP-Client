@@ -1,0 +1,246 @@
+use Test;
+use lib 'lib';
+use MCP::Client::Exceptions;
+use MCP::Client::Correlator;
+
+plan 13;
+
+# A correlator wired to a clock and a timer the test drives by hand. Nothing in
+# this file sleeps, and nothing in it depends on how loaded the machine is.
+class VirtualClock {
+	has Real $.at is rw = 0;
+	has      @.timers;
+
+	method advance-to(Real $t) {
+		$!at = $t;
+		my @due = @!timers.grep({ .key <= $t });
+		@!timers = @!timers.grep({ .key > $t });
+		.value.() for @due;
+	}
+
+	method fire-all() {
+		my @due = @!timers;
+		@!timers = ();
+		.value.() for @due;
+	}
+}
+
+sub virtual-correlator(*%opts) {
+	my $clock = VirtualClock.new;
+	my $c = MCP::Client::Correlator.new(
+		now => sub { $clock.at },
+		schedule-after => sub (Real $s, &cb) { $clock.timers.push($s => &cb); Promise.kept },
+		|%opts,
+	);
+	($c, $clock);
+}
+
+subtest 'next-id hands out fresh ids' => {
+	plan 3;
+
+	my ($c, $clock) = virtual-correlator;
+	is $c.next-id, 1, 'ids start at 1';
+	is $c.next-id, 2, 'and go up';
+
+	# Concurrency: 8 threads racing for 100 ids each must never collide, or two
+	# in-flight requests would share a mailbox.
+	my $racer = MCP::Client::Correlator.new;
+	my @ids = await (^8).map: -> $ {
+		start { (^100).map({ $racer.next-id }).List }
+	};
+	is @ids.map(*.Slip).unique.elems, 800, '800 ids from 8 threads are all distinct';
+};
+
+subtest 'register and resolve' => {
+	plan 5;
+
+	my ($c, $clock) = virtual-correlator;
+	my $p = $c.register(1, method => 'tools/call');
+
+	isa-ok $p, Promise, 'register hands back a Promise';
+	is $c.pending-count, 1, 'the request is outstanding';
+	ok $c.resolve(1, { ok => True }), 'resolve reports a hit';
+	is-deeply (await $p), { ok => True }, 'the promise carries the value';
+	is $c.pending-count, 0, 'and the request is no longer outstanding';
+};
+
+subtest 'register and reject' => {
+	plan 3;
+
+	my ($c, $clock) = virtual-correlator;
+	my $p = $c.register('abc');
+	ok $c.reject('abc', X::MCP::Client::Protocol.new(detail => 'server said no', code => -32601)),
+		'reject reports a hit';
+	throws-like { await $p }, X::MCP::Client::Protocol, 'the promise carries the failure';
+	is $c.pending-count, 0, 'the request is no longer outstanding';
+};
+
+subtest 'unknown ids are dropped, not fatal' => {
+	plan 4;
+
+	my ($c, $clock) = virtual-correlator;
+	nok $c.resolve(99, { late => True }), 'resolving an unknown id reports a miss';
+	nok $c.reject(99, X::MCP::Client::Cancelled.new), 'rejecting an unknown id reports a miss';
+	nok $c.cancel(99), 'cancelling an unknown id reports a miss';
+
+	# The common case: an answer that arrives after its request gave up.
+	my $p = $c.register(1, timeout => 5);
+	$clock.fire-all;
+	nok $c.resolve(1, { too => 'late' }), 'an answer to a timed-out request is dropped';
+};
+
+subtest 'timeouts fire on the virtual clock' => {
+	plan 6;
+
+	my ($c, $clock) = virtual-correlator;
+	my $p = $c.register(1, method => 'tools/call', timeout => 30);
+
+	is $clock.timers.elems, 1, 'a timer was scheduled';
+	is $clock.timers[0].key, 30, 'for the requested delay';
+	is $p.status, Planned, 'nothing has happened yet';
+
+	$clock.advance-to(30);
+	throws-like { await $p }, X::MCP::Client::Timeout,
+		message => /'tools/call'/, 'the promise breaks with a Timeout naming the method';
+	is $c.pending-count, 0, 'and the request is off the books';
+	is $p.cause.seconds, 30, 'the exception carries the budget it blew';
+};
+
+subtest 'the default timeout applies when none is named' => {
+	plan 3;
+
+	my ($c, $clock) = virtual-correlator(default-timeout => 12);
+	$c.register(1);
+	is $clock.timers[0].key, 12, 'the default is used';
+
+	my ($forever, $clock2) = virtual-correlator(default-timeout => 0);
+	$forever.register(1);
+	is $clock2.timers.elems, 0, 'a default of 0 schedules no timer at all';
+
+	$c.register(2, timeout => 0);
+	is $clock.timers.elems, 1, 'an explicit 0 overrides a non-zero default';
+};
+
+subtest 'a stale timer cannot kill a live request' => {
+	plan 3;
+
+	my ($c, $clock) = virtual-correlator;
+
+	# A caller supplying its own ids may reuse one once the first is answered.
+	$c.register(1, timeout => 5);
+	$c.resolve(1, { first => True });
+	my $second = $c.register(1, timeout => 5);
+
+	is $clock.timers.elems, 2, 'both registrations scheduled a timer';
+	$clock.timers[0].value.();          # the first request's timer, now stale
+	is $second.status, Planned, 'the stale timer left the live request alone';
+
+	$clock.timers[1].value.();
+	throws-like { await $second }, X::MCP::Client::Timeout, 'its own timer still works';
+};
+
+subtest 'cancel' => {
+	plan 4;
+
+	my ($c, $clock) = virtual-correlator;
+	my $p = $c.register(1, method => 'tools/call');
+	ok $c.cancel(1), 'cancel reports a hit';
+	throws-like { await $p }, X::MCP::Client::Cancelled,
+		message => /'tools/call'/, 'the promise breaks as cancelled, naming the method';
+	is $c.pending-count, 0, 'the request is off the books';
+
+	my $q = $c.register(2);
+	$c.cancel(2, X::MCP::Client::TransportClosed.new(detail => 'shutting down'));
+	throws-like { await $q }, X::MCP::Client::TransportClosed,
+		'a caller-supplied exception is used instead';
+};
+
+subtest 'fail-all with requests registered concurrently' => {
+	plan 5;
+
+	my $c = MCP::Client::Correlator.new(default-timeout => 0);
+	my @promises;
+	my $lock = Lock.new;
+
+	# Registrations racing the failure: every one of them must end up settled,
+	# whichever side of fail-all it landed on.
+	my @workers = (^8).map: -> $w {
+		start {
+			for ^25 -> $i {
+				my $p = $c.register("$w-$i");
+				$lock.protect: { @promises.push($p) };
+			}
+		}
+	};
+
+	my $failed = $c.fail-all(X::MCP::Client::ServerGone.new(exit-code => 9, stderr-tail => 'killed'));
+	await @workers;
+
+	# Anything registered after fail-all comes back already broken, so the two
+	# numbers together must account for all 200.
+	ok $failed <= 200, "fail-all failed the {$failed} that were outstanding";
+	is @promises.elems, 200, 'all 200 registrations produced a promise';
+	is @promises.grep({ .status == Planned }).elems, 0, 'none of them is still waiting';
+	ok @promises.all.cause ~~ X::MCP::Client::ServerGone, 'all of them carry the same failure';
+	is $c.pending-count, 0, 'the table is empty';
+};
+
+subtest 'a closed correlator fails fast' => {
+	plan 5;
+
+	my ($c, $clock) = virtual-correlator;
+	nok $c.closed, 'starts open';
+
+	$c.fail-all(X::MCP::Client::ServerGone.new(exit-code => 1));
+	ok $c.closed, 'fail-all closes it';
+	isa-ok $c.failure, X::MCP::Client::ServerGone, 'and remembers why';
+
+	my $p = $c.register(1);
+	throws-like { await $p }, X::MCP::Client::ServerGone,
+		'a later registration is broken on arrival';
+	is $clock.timers.elems, 0, 'and no pointless timer was scheduled for it';
+};
+
+subtest 'fail-all can spare the table' => {
+	plan 3;
+
+	my ($c, $clock) = virtual-correlator;
+	my $p = $c.register(1);
+	is $c.fail-all(X::MCP::Client::TransportClosed.new, :!close), 1, 'the outstanding request failed';
+	nok $c.closed, 'but the correlator stayed open';
+
+	my $q = $c.register(2);
+	is $q.status, Planned, 'and later requests are tracked as usual';
+};
+
+subtest 'misuse is refused loudly' => {
+	plan 3;
+
+	my ($c, $clock) = virtual-correlator;
+	throws-like { $c.register(Any) }, X::MCP::Client::Protocol,
+		'an undefined id is a caller bug';
+
+	$c.register(1);
+	throws-like { $c.register(1) }, X::MCP::Client::Protocol,
+		message => /'already in flight'/, 'so is reusing an id that is still in flight';
+
+	lives-ok { $c.resolve(1, {}); $c.register(1) },
+		'the same id is fine once the first request is answered';
+};
+
+subtest 'introspection' => {
+	plan 6;
+
+	my ($c, $clock) = virtual-correlator;
+	$c.register(1, method => 'tools/call');
+	$c.register('two', method => 'resources/read');
+
+	is-deeply $c.pending-ids, ('1', 'two'), 'pending ids, sorted';
+	is $c.method-for(1), 'tools/call', 'the method registered for an id';
+	is $c.method-for('two'), 'resources/read', 'and for another';
+	nok $c.method-for('nobody').defined, 'Nil for an id nobody registered';
+
+	$clock.at = 4;
+	is $c.age-of(1), 4, 'age is measured on the injected clock';
+	nok $c.age-of('nobody').defined, 'Nil for an id nobody registered';
+};

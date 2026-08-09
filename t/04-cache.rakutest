@@ -1,0 +1,179 @@
+use Test;
+use lib 'lib';
+use MCP::Client::Cache;
+
+plan 12;
+
+# A cache on a clock the test moves by hand, so "this expires in 30 seconds"
+# is checked in microseconds and never depends on machine load.
+class Clock {
+	has Real $.at is rw = 0;
+}
+
+sub virtual-cache() {
+	my $clock = Clock.new;
+	(MCP::Client::Cache.new(now => sub { $clock.at }), $clock);
+}
+
+sub listing(Int $ttl-ms, Str $scope = 'public') {
+	{ tools => [{ name => 'echo' },], ttlMs => $ttl-ms, cacheScope => $scope };
+}
+
+subtest 'store and retrieve' => {
+	plan 5;
+
+	my ($cache, $clock) = virtual-cache;
+	ok $cache.put('tools/list', listing(30_000)), 'a cacheable result is stored';
+	is $cache.elems, 1, 'one entry';
+
+	my %hit = $cache.get('tools/list');
+	is-deeply %hit<tools>, [{ name => 'echo' },], 'the result comes back intact';
+	is %hit<ttlMs>, 30_000, 'including the cache metadata it arrived with';
+	is $cache.scope-of('tools/list'), 'public', 'the scope is readable';
+};
+
+subtest 'a miss is a Nil, not a failure' => {
+	plan 3;
+
+	my ($cache, $clock) = virtual-cache;
+	nok $cache.get('tools/list').defined, 'nothing stored under that key';
+	nok $cache.scope-of('tools/list').defined, 'no scope either';
+	is $cache.elems, 0, 'and asking did not create anything';
+};
+
+subtest 'ttlMs is honoured to the second' => {
+	plan 5;
+
+	my ($cache, $clock) = virtual-cache;
+	$cache.put('tools/list', listing(30_000));
+
+	$clock.at = 29.999;
+	ok $cache.get('tools/list').defined, 'still good just before the deadline';
+
+	$clock.at = 30;
+	nok $cache.get('tools/list').defined, 'gone at the deadline';
+	is $cache.elems, 0, 'and the expired entry was dropped on the way past';
+
+	$cache.put('resources/read', listing(500));
+	$clock.at = 30.4;
+	ok $cache.get('resources/read').defined, 'milliseconds are milliseconds';
+	$clock.at = 30.5;
+	nok $cache.get('resources/read').defined, 'not seconds';
+};
+
+subtest 'an expired entry has no scope either' => {
+	plan 2;
+
+	my ($cache, $clock) = virtual-cache;
+	$cache.put('tools/list', listing(1_000, 'private'));
+	is $cache.scope-of('tools/list'), 'private', 'scope while live';
+	$clock.at = 2;
+	nok $cache.scope-of('tools/list').defined, 'no scope once expired';
+};
+
+subtest 'ttlMs 0 means not cacheable' => {
+	plan 3;
+
+	my ($cache, $clock) = virtual-cache;
+	nok $cache.put('resources/read', listing(0)), 'refused';
+	is $cache.elems, 0, 'nothing stored';
+	nok $cache.get('resources/read').defined, 'and nothing to get';
+};
+
+subtest 'a result with no cache metadata is not cacheable' => {
+	plan 4;
+
+	my ($cache, $clock) = virtual-cache;
+	nok $cache.put('tools/list', { tools => [] }), 'no ttlMs at all: refused';
+	nok $cache.put('tools/list', { tools => [], ttlMs => -1 }), 'a negative ttlMs: refused';
+	nok $cache.put('tools/list', { tools => [], ttlMs => 'soon' }), 'a non-numeric ttlMs: refused';
+	is $cache.elems, 0, 'nothing stored';
+};
+
+subtest 'legacy results are never cached' => {
+	plan 3;
+
+	my ($cache, $clock) = virtual-cache;
+	# A legacy server sends no cache metadata; one that somehow did would still
+	# be refused, because the legacy era makes no such promise.
+	nok $cache.put('tools/list', listing(30_000), era => 'legacy'), 'refused';
+	is $cache.elems, 0, 'nothing stored';
+	ok $cache.put('tools/list', listing(30_000), era => 'modern'), 'modern is stored';
+};
+
+subtest 'a missing cacheScope defaults to private' => {
+	plan 2;
+
+	my ($cache, $clock) = virtual-cache;
+	$cache.put('tools/list', { tools => [], ttlMs => 1_000 });
+	is $cache.scope-of('tools/list'), 'private', 'the conservative default';
+
+	$cache.put('other', { tools => [], ttlMs => 1_000, cacheScope => 'public' });
+	is $cache.scope-of('other'), 'public', 'an explicit scope is kept';
+};
+
+subtest 'refresh bypasses and evicts' => {
+	plan 3;
+
+	my ($cache, $clock) = virtual-cache;
+	$cache.put('tools/list', listing(30_000));
+
+	nok $cache.get('tools/list', :refresh).defined, 'a refreshing read misses on purpose';
+	is $cache.elems, 0, 'and the stale entry is gone rather than left to be served';
+
+	$cache.put('tools/list', listing(30_000));
+	ok $cache.get('tools/list', :refresh(False)).defined, ':refresh(False) reads normally';
+};
+
+subtest 'invalidate and clear' => {
+	plan 5;
+
+	my ($cache, $clock) = virtual-cache;
+	$cache.put('tools/list', listing(30_000));
+	$cache.put('prompts/list', listing(30_000));
+
+	ok $cache.invalidate('tools/list'), 'invalidate reports a hit';
+	nok $cache.invalidate('tools/list'), 'and a miss the second time';
+	is $cache.elems, 1, 'the other entry is untouched';
+
+	is $cache.clear, 1, 'clear reports how many it dropped';
+	is $cache.elems, 0, 'and the cache is empty';
+};
+
+subtest 'purge-expired' => {
+	plan 4;
+
+	my ($cache, $clock) = virtual-cache;
+	$cache.put('short', listing(1_000));
+	$cache.put('long', listing(60_000));
+
+	$clock.at = 10;
+	is $cache.elems, 2, 'expired entries linger until something looks at them';
+	is $cache.purge-expired, 1, 'purge drops the expired one';
+	is-deeply $cache.keys-stored, ('long',), 'and only the expired one';
+	is $cache.purge-expired, 0, 'a second purge finds nothing';
+};
+
+subtest 'keys are built from the method and its parameters' => {
+	plan 6;
+
+	my ($cache, $clock) = virtual-cache;
+
+	is $cache.key-for('tools/list'), 'tools/list', 'a method with no parameters keys as itself';
+	is $cache.key-for('resources/read', { uri => 'file:///a', extra => 1 }),
+		$cache.key-for('resources/read', { extra => 1, uri => 'file:///a' }),
+		'parameter order does not change the key';
+	isnt $cache.key-for('resources/read', { uri => 'file:///a' }),
+		$cache.key-for('resources/read', { uri => 'file:///b' }),
+		'different parameters give different keys';
+	isnt $cache.key-for('resources/read', { uri => 'x' }),
+		$cache.key-for('prompts/get', { uri => 'x' }),
+		'different methods give different keys';
+	isnt $cache.key-for('tools/list'), $cache.key-for('tools/list', { cursor => 'p2' }),
+		'a paginated listing does not collide with an unpaginated one';
+
+	# The keys are usable as keys, which is the only thing that really matters.
+	my $key = $cache.key-for('resources/read', { uri => 'file:///a' });
+	$cache.put($key, listing(1_000));
+	ok $cache.get($key).defined, 'a generated key round-trips through the cache';
+};

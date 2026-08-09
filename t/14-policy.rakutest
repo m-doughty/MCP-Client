@@ -1,0 +1,784 @@
+use Test;
+use lib 'lib', 't/lib';
+use JSON::Fast;
+use MCP::Server;
+use MCP::Client;
+use MCP::Client::Exceptions;
+use MCP::Client::Registry;
+use MCP::Client::Policy;
+use MCP::Client::Test::InProcessTransport;
+use MCP::Client::Test::TestKit;
+
+# A permission layer is only worth having if it is wrong in the safe direction.
+# So the shape of this file is: prove the engine says what it should about every
+# combination of rule and path (subtests 2-4), prove the seam around it never
+# lets a refusal become an exception or an allow become a surprise (5-10), and
+# then prove the two questions a human ever gets asked -- "may it?" and the
+# server's own "what should I do?" -- come out of the same seam (11).
+#
+# Run it with the sibling checkout on the path:
+#
+#   prove6 -Ilib -I../MCP-Server/lib t/14-policy.rakutest
+
+plan 12;
+
+constant TIMEOUT = 30;
+
+# === Doubles ===
+
+# The t/12 provider, with one addition: it keeps the call objects themselves,
+# not just their names, so "the policy forwards what it was given, untouched"
+# can be asserted by identity rather than inferred from a matching name.
+my class ScriptedProvider {
+	has Str:D $.label is required;
+	has Str:D @.tool-names;
+	has Bool:D $.explode = False;
+	has Int $.short;
+
+	has Lock $!lock .= new;
+	has @!declared;
+	has @!batches;
+
+	submethod TWEAK {
+		@!declared = @!tool-names.map(-> $name {
+			%(
+				type => 'function',
+				function => %(
+					name => $name,
+					description => "$!label does $name",
+					parameters => %( type => 'object', properties => %() ),
+				),
+			);
+		});
+	}
+
+	#| The names of the calls in each batch this provider was handed, in order.
+	method batches(--> List:D) {
+		$!lock.protect: { @!batches.map({ $_.map({ $_<function><name> }).List }).List };
+	}
+
+	#| Every call object this provider saw, flattened, in order.
+	method seen(--> List:D) {
+		$!lock.protect: { @!batches.map(*.Slip).List };
+	}
+
+	method tools-for-llm(--> List) {
+		@!declared.List;
+	}
+
+	method execute-tool-calls(@tool-calls --> List) {
+		die "the $!label provider is not answering" if $!explode;
+
+		$!lock.protect: { @!batches.push([@tool-calls]) };
+
+		my @answers = @tool-calls.map(-> $tc {
+			%(
+				role => 'tool',
+				tool_call_id => ($tc<id> // ''),
+				content => "$!label:{$tc<function><name>}",
+				is_error => False,
+			);
+		}).list;
+
+		$!short.defined ?? @answers.head($!short).List !! @answers.List;
+	}
+}
+
+my class HalfProvider {
+	method tools-for-llm(--> List) { () }
+}
+
+sub provider(*%opts --> ScriptedProvider:D) {
+	ScriptedProvider.new(label => 'fs', tool-names => <read write move delete>, |%opts);
+}
+
+sub call(Str:D $id, Str:D $name, $arguments = %()) {
+	%( id => $id, function => %( name => $name, arguments => $arguments ) );
+}
+
+#| A policy over a fresh scripted provider, with everything else defaulted.
+sub policy-over($provider, *%opts --> MCP::Client::Policy:D) {
+	MCP::Client::Policy.new(:$provider, |%opts);
+}
+
+#| A server whose handler asks a question, cribbed from t/15: the live half of
+#| subtest 11 needs a real elicitation, not a simulated one.
+sub eliciting-server(--> MCP::Server:D) {
+	my $server = MCP::Server.new(name => 'asks', version => '1.0.0');
+
+	$server.tool: 'greet',
+		description => 'Greet somebody, asking who if it has to',
+		params => { name => { type => 'string', description => 'Who to greet' } },
+		handler => -> :%args {
+			my $who = %args<name>;
+			unless $who ~~ Str:D && $who.chars {
+				my $answer = $*MCP-REQUEST-CONTEXT.elicit(
+					'Who should I greet?',
+					properties => { name => { type => 'string', description => 'A name' } },
+					required => ['name',],
+				);
+				$who = $answer.accepted ?? $answer.content<name> !! Str;
+			}
+			$who.defined ?? "Hello, $who!" !! 'Nobody, then.';
+		};
+
+	$server;
+}
+
+subtest 'what a policy refuses to be built out of' => {
+	plan 12;
+
+	throws-like { MCP::Client::Policy.new(provider => 42) }, X::MCP::Client,
+		'a value that is not a provider at all';
+	throws-like { MCP::Client::Policy.new(provider => MCP::Server) }, X::MCP::Client,
+		'a type object, which has the methods but nothing to call them on';
+	throws-like { MCP::Client::Policy.new(provider => HalfProvider.new) }, X::MCP::Client,
+		'an object with only half the bridge';
+
+	throws-like { policy-over(provider(), rules => { tool => 'a', decision => 'allow' }) },
+		X::MCP::Client, 'rules that are not a list';
+	throws-like { policy-over(provider(), rules => ['fs_read',]) },
+		X::MCP::Client, 'a rule that is not an object';
+	throws-like { policy-over(provider(), rules => [{ tool => 'read', decision => 'maybe' },]) },
+		X::MCP::Client, 'a decision nobody implements';
+	throws-like { policy-over(provider(), rules => [{ tool => 'fs_*_x', decision => 'allow' },]) },
+		X::MCP::Client, 'a glob with a star anywhere but the end';
+	throws-like { policy-over(provider(), rules => [{ tool => 'read', decision => 'allow', under => '/a/../b' },]) },
+		X::MCP::Client, "an under with a '..' in it, which only the server could resolve";
+
+	# The whole point of refusing unknown members: `dir` for `under` would turn
+	# a rule about one directory into a rule about every call to that tool.
+	throws-like { policy-over(provider(), rules => [{ tool => 'read', decision => 'deny', dir => '/etc' },]) },
+		X::MCP::Client, 'a rule with a member the engine has never heard of';
+
+	throws-like { policy-over(provider(), roots => { fs => '/srv/../etc' }) },
+		X::MCP::Client, 'a root that is not a usable directory';
+	throws-like { policy-over(provider(), path-params => { 'read' => [42,] }) },
+		X::MCP::Client, 'path-params that are not argument names';
+
+	throws-like { policy-over(provider(), rule => [{ tool => 'read', decision => 'allow' },]) },
+		X::MCP::Client, 'and an option name with a typo in it, which would otherwise mean no rules at all';
+};
+
+subtest 'the rule matrix: what matches, and which decision wins' => {
+	plan 9;
+
+	# Headless throughout: with nobody to ask, `ask` and `deny` are both
+	# refusals, so what is being read here is purely which rule fired.
+	sub decide(@rules, Str:D $tool, $args = %()) {
+		my $policy = policy-over(provider(), :@rules);
+		my @out = $policy.execute-tool-calls([call('1', $tool, $args),]);
+		@out[0];
+	}
+
+	nok decide([{ tool => 'read', decision => 'allow' },], 'read')<is_error>,
+		'an exact name matches the tool it names';
+	ok decide([{ tool => 'read', decision => 'allow' },], 'write')<is_error>,
+		'and nothing else -- an unmatched tool is asked about, not allowed';
+	nok decide([{ tool => 'r*', decision => 'allow' },], 'read')<is_error>,
+		"a trailing '*' matches by prefix";
+	nok decide([{ tool => '*', decision => 'allow' },], 'delete')<is_error>,
+		"and '*' on its own matches everything";
+
+	# Deny > ask > allow, whichever order the rules were serialised in. A
+	# permission file that answers differently depending on which half was read
+	# first is not a permission file.
+	my @strongest =
+		{ tool => 'read', decision => 'allow' },
+		{ tool => 'r*', decision => 'deny' },
+		{ tool => '*', decision => 'ask' },
+	;
+	ok decide(@strongest, 'read')<is_error>, 'deny beats ask beats allow';
+	ok decide(@strongest.reverse.List, 'read')<is_error>, 'in any order';
+	like decide(@strongest, 'read')<content>, /'deny r*'/,
+		'and the refusal names the rule that did it';
+
+	# The most specific rule of the winning decision is the one reported, so a
+	# UI explains the narrow rule rather than the blanket one.
+	like decide([{ tool => '*', decision => 'deny' }, { tool => 'read', decision => 'deny' }], 'read')<content>,
+		/'deny read'/, 'reporting the most specific rule that reached that decision';
+
+	ok decide([], 'read')<is_error>,
+		'and a tool no rule mentions is asked about: nobody has consented to it';
+};
+
+subtest 'containment is segment-wise, and roots make it absolute' => {
+	plan 8;
+
+	sub allowed(@rules, Str:D $tool, %args, *%opts --> Bool) {
+		my $policy = policy-over(provider(), :@rules, |%opts);
+		!$policy.execute-tool-calls([call('1', $tool, %args),])[0]<is_error>;
+	}
+
+	my @under = { tool => '*', decision => 'allow', under => '/tmp/root' },;
+
+	ok allowed(@under, 'read', { path => '/tmp/root/x' }), 'a path inside the directory';
+	ok allowed(@under, 'read', { path => '/tmp/root' }), 'the directory itself';
+	nok allowed(@under, 'read', { path => '/tmp/rootless/x' }),
+		'and not /tmp/root2 -- containment is segments, never a string prefix';
+	ok allowed(@under, 'read', { path => '/tmp//root/./x' }),
+		'doubled separators and . segments say nothing either way';
+
+	# Both ends of a move have to be inside, and a root is what makes the
+	# relative arguments a model actually sends comparable at all.
+	my @moves = { tool => 'move', decision => 'allow', under => 'scratch' },;
+	ok allowed(@moves, 'move', { from => 'scratch/a', to => 'scratch/b' }, roots => { fs => '/srv' }),
+		'a move with both ends inside is allowed, with the rule written relative to the root';
+	nok allowed(@moves, 'move', { from => 'scratch/a', to => 'live/b' }, roots => { fs => '/srv' }),
+		'and one end outside is enough to stop it';
+
+	# Longest prefix wins, so a family of tools can share a root while one of
+	# them lives somewhere else.
+	ok allowed(
+		[{ tool => '*', decision => 'allow', under => '/opt/other' },],
+		'read', { path => 'x' },
+		roots => { '' => '/srv', 'read' => '/opt/other' },
+	), 'roots are keyed by tool-name prefix, longest first';
+
+	# A tool whose location argument is called something else entirely.
+	ok allowed(
+		[{ tool => 'read', decision => 'allow', under => '/srv' },],
+		'read', { file => '/srv/x' },
+		path-params => { 'read' => ['file',] },
+	), 'and path-params overrides the path/from/to convention per tool';
+};
+
+subtest 'fail closed: an argument that cannot be read is not ruled out' => {
+	plan 9;
+
+	sub verdict(@rules, Str:D $tool, $args, *%opts) {
+		my $policy = policy-over(provider(), :@rules, roots => { '' => '/srv' }, |%opts);
+		$policy.execute-tool-calls([call('1', $tool, $args),])[0];
+	}
+
+	my @allow = { tool => '*', decision => 'allow', under => '/srv' },;
+	my @deny = { tool => '*', decision => 'deny', under => '/srv' },;
+
+	ok verdict(@allow, 'read', { path => '../etc/passwd' })<is_error>,
+		"a '..' segment is not resolved here, so an allow rule does not fire";
+	ok verdict(@deny, 'read', { path => '../etc/passwd' })<is_error>,
+		'and a deny rule fires on it: what cannot be ruled out is not ruled out';
+	like verdict(@deny, 'read', { path => '../etc/passwd' })<content>, /'cannot be checked'/,
+		'saying which of the two things went wrong';
+
+	ok verdict(@allow, 'read', { path => "/srv/x\0y" })<is_error>, 'a null byte in a path';
+	ok verdict(@allow, 'read', { path => 'C:\srv\x' })<is_error>,
+		'a backslash, which is a separator on one server and a filename character on another';
+	ok verdict(@allow, 'read', { path => 42 })<is_error>, 'an argument that is not a string';
+	ok verdict(@allow, 'read', %())<is_error>,
+		'and no location argument at all: a predicate that cannot be evaluated is not satisfied';
+
+	# An allow rule needs every location it was given, not one of them.
+	ok verdict([{ tool => 'move', decision => 'allow', under => '/srv' },], 'move',
+		{ from => '/srv/a', to => '/etc/b' })<is_error>,
+		'an allow rule needs all of a call\'s locations, not any';
+
+	# Arguments that will not parse cannot be checked either -- and this is the
+	# case a model produces by accident every day.
+	ok verdict(@allow, 'read', '{not json')<is_error>,
+		'and arguments that are not JSON are unevaluable, not empty';
+};
+
+subtest 'the ask flow: what the callback is handed, and what it may answer' => {
+	plan 23;
+
+	my @asked;
+	my $answer = { action => 'allow-once' };
+	my $fs = provider();
+	my $policy = policy-over($fs,
+		rules => [{ tool => 'write', decision => 'ask', under => 'scratch' },],
+		roots => { '' => '/srv' },
+		on-ask => -> %request { @asked.push(%request); $answer },
+	);
+
+	ok $policy.interactive, 'a policy with a callback says it is interactive';
+
+	my @out = $policy.execute-tool-calls([call('1', 'write', '{"path":"scratch/notes.md"}'),]);
+	nok @out[0]<is_error>, 'allow-once lets the call through';
+	is @out[0]<content>, 'fs:write', 'to the provider, which answered it';
+
+	is @asked.elems, 1, 'the human was asked exactly once';
+	my %request = @asked[0];
+	is-deeply %request.keys.sort.List,
+		<arguments call kind paths reason rule suggestion tool>.List,
+		'the request is made of exactly the members the contract names';
+	is %request<kind>, 'permission', 'a permission question says so';
+	is %request<tool>, 'write', 'naming the tool';
+	is-deeply %request<arguments>, { path => 'scratch/notes.md' },
+		'with the arguments parsed, however the model sent them';
+	is-deeply %request<rule>, { tool => 'write', decision => 'ask', under => 'scratch' },
+		'the rule that asked for the question';
+	is %request<reason>, 'rule', 'and why it is being asked';
+	is-deeply %request<paths>.List, ('/srv/scratch/notes.md',),
+		'the locations the call names, made absolute';
+	is-deeply %request<suggestion>, { tool => 'write', under => '/srv/scratch' },
+		'and the rule to offer as "always", which is the directory the file is in';
+
+	# --- and every other thing a callback can answer ---
+
+	sub answered($reply, *%opts) {
+		my $fs = provider();
+		my $policy = policy-over($fs,
+			rules => [{ tool => '*', decision => 'ask' },],
+			on-ask => ($reply ~~ Callable ?? $reply !! -> %request { $reply }),
+			|%opts,
+		);
+		my %out = $policy.execute-tool-calls([call('1', 'write'),])[0];
+		%( result => %out, seen => $fs.seen.elems );
+	}
+
+	my %denied = answered({ action => 'deny-once' });
+	ok %denied<result><is_error>, 'deny-once refuses the call';
+	like %denied<result><content>, /'the user refused'/, 'saying who refused it';
+	is %denied<seen>, 0, 'and the provider never hears about it';
+
+	my %confused = answered({ action => 'have a biscuit' });
+	ok %confused<result><is_error>, 'an action nobody understands is a refusal';
+	like %confused<result><content>, /'have a biscuit'/, 'quoting what it was told';
+
+	ok answered('not even a hash')<result><is_error>,
+		'and so is an answer that is not an answer';
+
+	my %threw = answered(-> %request { die 'the dialog fell over' });
+	ok %threw<result><is_error>, 'a callback that throws refuses this call';
+	like %threw<result><content>, /'the dialog fell over'/,
+		'carrying what it said on the way down -- and not throwing at the caller';
+	is %threw<seen>, 0, 'with the call never forwarded';
+
+	# There is one human, and they can only answer one question at a time. Two
+	# batches on two threads must not put two dialogs on the screen: the
+	# callback reports on itself here, because nothing else could.
+	my $guard = Lock.new;
+	my $inside = 0;
+	my $overlapped = False;
+	my $shared = policy-over(provider(),
+		rules => [{ tool => '*', decision => 'ask' },],
+		on-ask => -> %request {
+			$guard.protect: { $overlapped = True if $inside; $inside++ };
+			sleep 0.05;
+			$guard.protect: { $inside-- };
+			{ action => 'allow-once' };
+		},
+	);
+	my @racing = (
+		start { $shared.execute-tool-calls([call('1', 'read'),]) },
+		start { $shared.execute-tool-calls([call('2', 'write'),]) },
+	);
+	await Promise.allof(@racing);
+	nok $overlapped, 'two callers never have two questions open at once';
+	is-deeply @racing.map({ $_.result[0]<is_error> }).List, (False, False),
+		'and both of them are answered';
+};
+
+subtest 'grants: what "always" remembers, and what it cannot override' => {
+	plan 12;
+
+	my @asked;
+	my $fs = provider();
+	my $policy = policy-over($fs,
+		rules => [
+			{ tool => 'delete', decision => 'deny' },
+			{ tool => 'write', decision => 'ask' },
+		],
+		roots => { '' => '/srv' },
+		on-ask => -> %request { @asked.push(%request<tool>); { action => 'always-allow' } },
+	);
+
+	# Three writes into the same directory, in one batch: the human sees the
+	# first one only, because the grant the first answer left behind is in force
+	# by the time the second is evaluated.
+	my @out = $policy.execute-tool-calls([
+		call('1', 'write', '{"path":"scratch/a"}'),
+		call('2', 'write', '{"path":"scratch/b"}'),
+		call('3', 'write', '{"path":"scratch/c"}'),
+	]);
+	is-deeply @out.map({ $_<is_error> }).List, (False, False, False), 'all three went through';
+	is @asked.elems, 1, 'and the human was asked once: a grant is in force for the rest of the batch';
+
+	is-deeply $policy.grants.List, ({ tool => 'write', decision => 'allow', under => '/srv/scratch' },),
+		'the grant is the suggestion, with the decision taken from the action';
+
+	$policy.execute-tool-calls([call('4', 'write', '{"path":"scratch/d"}'),]);
+	is @asked.elems, 1, 'and it outlives the batch it was made in';
+
+	# A file somewhere else is a different question.
+	$policy.execute-tool-calls([call('5', 'write', '{"path":"live/e"}'),]);
+	is @asked.elems, 2, 'while a call the grant does not cover is asked about again';
+
+	# Plain data in, plain data out: a UI that persists grants gets them back.
+	my @round-tripped = from-json(to-json($policy.grants)).list;
+	my $reloaded = policy-over(provider(), grants => @round-tripped, roots => { '' => '/srv' });
+	nok $reloaded.execute-tool-calls([call('1', 'write', '{"path":"scratch/f"}'),])[0]<is_error>,
+		'grants survive a JSON round trip and a new session';
+	is-deeply $reloaded.grants.List, @round-tripped.List, 'unchanged by the trip';
+
+	# A static deny is not a thing "always allow" can vote away: grants are only
+	# consulted once the static rules have said "ask".
+	my $stubborn = policy-over(provider(),
+		rules => [{ tool => 'delete', decision => 'deny' },],
+		grants => [{ tool => 'delete', decision => 'allow' },],
+		on-ask => -> %request { { action => 'allow-once' } },
+	);
+	ok $stubborn.execute-tool-calls([call('1', 'delete'),])[0]<is_error>,
+		'a static deny beats an allow grant';
+
+	# Between grants, the same precedence the rules use.
+	my $mixed = policy-over(provider(),
+		grants => [
+			{ tool => 'write', decision => 'allow' },
+			{ tool => 'w*', decision => 'deny' },
+		],
+	);
+	ok $mixed.execute-tool-calls([call('1', 'write'),])[0]<is_error>,
+		'and a deny grant beats an allow grant';
+
+	# An explicit rule is taken as written -- a UI that narrows the offer to a
+	# bare tool must not have the suggestion's `under` put back on.
+	my @narrow;
+	my $explicit = policy-over(provider(),
+		rules => [{ tool => 'write', decision => 'ask' },],
+		roots => { '' => '/srv' },
+		on-ask => -> %request {
+			@narrow.push(%request);
+			{ action => 'always-deny', rule => { tool => 'w*' } };
+		},
+	);
+	my @refused = $explicit.execute-tool-calls([
+		call('1', 'write', '{"path":"scratch/a"}'),
+		call('2', 'write', '{"path":"elsewhere/b"}'),
+	]);
+	is-deeply @refused.map({ $_<is_error> }).List, (True, True),
+		'an always-deny refuses the call it was asked about, and the ones the rule catches';
+	is-deeply $explicit.grants.List, ({ tool => 'w*', decision => 'deny' },),
+		'remembering exactly the rule it was given, not the suggestion';
+
+	# A rule that will not validate is not remembered, and the call it came with
+	# is refused rather than quietly allowed.
+	my $bad = policy-over(provider(),
+		on-ask => -> %request { { action => 'always-allow', rule => { tool => 'w*', under => '/a/../b' } } },
+	);
+	my %out = $bad.execute-tool-calls([call('1', 'write'),])[0];
+	ok %out<is_error> && !$bad.grants.elems,
+		'and a rule that will not validate is refused rather than remembered';
+};
+
+subtest 'headless: nobody to ask is an answer, not a hang' => {
+	plan 5;
+
+	my $fs = provider();
+	my $policy = policy-over($fs, rules => MCP::Client::Policy.default-rules);
+
+	nok $policy.interactive, 'a policy with no callback says it is not interactive';
+
+	# The default rules are about the packs' own names, so a bare 'write' is not
+	# on them -- and neither is anything else nobody wrote a rule about.
+	my @out = $policy.execute-tool-calls([call('1', 'write', '{"path":"x"}'),]);
+	ok @out[0]<is_error>, 'an ask with nobody to ask is a refusal';
+	like @out[0]<content>, /'without a permission prompt'/,
+		'saying so in words a model can act on rather than retry blindly';
+	is $fs.seen.elems, 0, 'and the provider is never troubled';
+
+	is-deeply MCP::Client::Policy.default-rules.map({ $_<tool> }).List,
+		<fs_read fs_list fs_glob fs_stat fs_grep user_ask>.List,
+		'the default rules are the read-only tools, and asking the human';
+};
+
+subtest 'never throws, and forwards exactly what it was given' => {
+	plan 11;
+
+	my $fs = provider();
+	my $policy = policy-over($fs, rules => [{ tool => '*', decision => 'allow' },]);
+
+	my @calls = (
+		'not a call at all',
+		%( id => 'no-function' ),
+		%( id => 'bad-function', function => 'also not a call' ),
+		call('a', 'read'),
+		call('b', 'write'),
+	);
+
+	my @out;
+	lives-ok { @out = $policy.execute-tool-calls(@calls) },
+		'nothing a caller sends makes dispatch throw';
+	is @out.elems, 5, 'one result per call, however malformed the call was';
+	is-deeply @out.map({ $_<is_error> }).List, (True, True, True, False, False),
+		'a call with no usable function name is an error result: the policy cannot vouch for it';
+	is-deeply @out.map({ $_<tool_call_id> }).List, ('', 'no-function', 'bad-function', 'a', 'b'),
+		'and every result is tied back to the call that caused it';
+
+	is-deeply $fs.batches.List, (('read', 'write'),),
+		'the allowed calls go to the provider as one batch, in the caller order';
+	ok $fs.seen[0] === @calls[3] && $fs.seen[1] === @calls[4],
+		'as the very objects the caller passed: a policy cannot change what an allowed call does';
+
+	is-deeply $policy.execute-tool-calls([]).List, ().List, 'an empty batch is an empty answer';
+
+	# A provider that dies takes its own calls down and nothing else. Denied
+	# calls in the same batch were never its business in the first place.
+	my $bad = ScriptedProvider.new(label => 'bad', tool-names => <read>, explode => True);
+	my $over-bad = policy-over($bad, rules => [{ tool => 'read', decision => 'allow' },]);
+	my @dead;
+	lives-ok { @dead = $over-bad.execute-tool-calls([call('1', 'read'), call('2', 'write')]) },
+		'a provider blowing up does not blow up the dispatch';
+	like @dead[0]<content>, /'is not answering'/, 'carrying what it said on the way down';
+	ok @dead[1]<is_error> && @dead[1]<content>.contains('Permission'),
+		'and the refused call is still refused by the policy, not by the wreckage';
+
+	# A provider that shortchanges the caller: two calls in, one result out. The
+	# caller is owed one result per call whatever the provider thinks.
+	my $stingy = ScriptedProvider.new(label => 'stingy', tool-names => <read>, short => 1);
+	my @short = policy-over($stingy, rules => [{ tool => '*', decision => 'allow' },])
+		.execute-tool-calls([call('1', 'read'), call('2', 'read')]);
+	ok !@short[0]<is_error> && @short[1]<is_error>,
+		'and a provider that answered too few calls has the gap filled in';
+};
+
+subtest 'stacking: a policy over a registry over a policy' => {
+	plan 6;
+
+	# The inner policy sees the names its provider publishes; the outer one sees
+	# the names the model does. Same tools, two vocabularies.
+	my $fs = provider();
+	my $inner = policy-over($fs, rules => [
+		{ tool => 'delete', decision => 'deny' },
+		{ tool => '*', decision => 'allow' },
+	]);
+
+	my $registry = MCP::Client::Registry.new;
+	$registry.add($inner, prefix => 'fs');
+
+	my @asked;
+	my $outer = MCP::Client::Policy.new(
+		provider => $registry,
+		rules => [
+			{ tool => 'fs_write', decision => 'ask' },
+			{ tool => '*', decision => 'allow' },
+		],
+		on-ask => -> %request { @asked.push(%request<tool>); { action => 'allow-once' } },
+	);
+
+	# The prefix goes on at the registry, and the inner policy's bare deny has
+	# already taken `delete` out from underneath it: filtering happens at every
+	# layer, in that layer's own vocabulary.
+	is-deeply $outer.tools-for-llm.map({ $_<function><name> }).List,
+		<fs_read fs_write fs_move>.List,
+		'the catalogue comes through both layers with the registry\'s prefix on it';
+
+	my @out = $outer.execute-tool-calls([
+		call('1', 'fs_read'),
+		call('2', 'fs_write'),
+		call('3', 'fs_delete'),
+	]);
+
+	is-deeply @out.map({ $_<is_error> }).List, (False, False, True),
+		'the outer policy asks about the write, and the inner one refuses the delete';
+	is-deeply @asked.List, ('fs_write',),
+		'the outer policy asks under the name the model used';
+	like @out[2]<content>, /'deny delete'/,
+		'and the inner refusal names the tool as the inner policy sees it';
+	is-deeply $fs.batches.List, (('read', 'write'),),
+		'only the calls both layers agreed to reach the provider';
+
+	# The documented footgun, pinned: a rule written at the wrong layer never
+	# matches anything, and the engine's fallthrough is an ask -- which here,
+	# with a blanket allow above it, means the rule simply does nothing.
+	my $mislabelled = policy-over(provider(), rules => [
+		{ tool => 'fs_delete', decision => 'deny' },
+		{ tool => '*', decision => 'allow' },
+	]);
+	my $wrapped = MCP::Client::Registry.new.add($mislabelled, prefix => 'fs');
+	my @through = $wrapped.execute-tool-calls([call('1', 'fs_delete'),]);
+	nok @through[0]<is_error>,
+		'while a rule naming a tool by the wrong layer\'s name matches nothing at all';
+};
+
+subtest 'tools-for-llm: a tool nobody may call is a tool nobody is told about' => {
+	plan 6;
+
+	my $fs = provider();
+
+	is-deeply policy-over($fs, rules => [{ tool => 'delete', decision => 'deny' },])
+		.tools-for-llm.map({ $_<function><name> }).List,
+		<read write move>.List,
+		'a bare deny rule takes its tools out of the catalogue';
+
+	is-deeply policy-over($fs, rules => [{ tool => 'm*', decision => 'deny' }, { tool => 'read', decision => 'allow' }])
+		.tools-for-llm.map({ $_<function><name> }).List,
+		<read write delete>.List,
+		'globs hide by prefix, and an allow rule hides nothing';
+
+	is-deeply policy-over($fs, rules => [{ tool => 'delete', decision => 'deny', under => '/srv' },])
+		.tools-for-llm.map({ $_<function><name> }).List,
+		<read write move delete>.List,
+		'a deny that only applies to some paths keeps the tool: the model may still call it elsewhere';
+
+	is-deeply policy-over($fs, rules => [{ tool => 'delete', decision => 'deny' },], filter-tools => False)
+		.tools-for-llm.map({ $_<function><name> }).List,
+		<read write move delete>.List,
+		'and filter-tools => False publishes the catalogue unabridged';
+
+	# The asymmetry MCP::Client::Registry keeps as well: a catalogue that cannot
+	# be fetched is not a shorter catalogue.
+	my class MuteProvider {
+		method tools-for-llm(--> List) { die 'cannot list right now' }
+		method execute-tool-calls(@tool-calls --> List) { () }
+	}
+	dies-ok { policy-over(MuteProvider.new).tools-for-llm },
+		'a provider that cannot list its tools is not hidden behind an empty list';
+
+	# A declaration with nothing to match on is passed through rather than
+	# dropped: hiding it would conceal that a provider published something odd.
+	my class OddProvider {
+		method tools-for-llm(--> List) { ('a bare string', %( type => 'function' )) }
+		method execute-tool-calls(@tool-calls --> List) { () }
+	}
+	is-deeply policy-over(OddProvider.new, rules => [{ tool => '*', decision => 'deny' },]).tools-for-llm.List,
+		('a bare string', %( type => 'function' )),
+		'and a declaration with no name to match is published as it was';
+};
+
+subtest 'one seam, two kinds of question' => {
+	plan 11;
+
+	# --- The closure, on its own ---
+
+	my @seen;
+	my $reply = { action => 'accept', content => { name => 'Ada' } };
+	my $policy = policy-over(provider(),
+		on-ask => -> %request { @seen.push(%request); $reply },
+	);
+
+	my %request = method => 'elicitation/create', params => { message => 'Who?' };
+	my %answer = $policy.elicit-hook.(%request);
+
+	is-deeply %answer, { action => 'accept', content => { name => 'Ada' } },
+		'an ElicitResult from the callback is the hook\'s answer, untouched';
+	is @seen[0]<kind>, 'server-elicit', 'the callback is told which kind of question this is';
+	is-deeply @seen[0]<request>, %request, 'and handed the server\'s request as it stands';
+	is-deeply @seen[0].keys.sort.List, <kind request>.List,
+		'a server elicitation carries nothing else: there is no call to have an opinion about';
+
+	# A copy, not a window: a UI that edits what it was handed cannot reach back
+	# into the request the client is still using.
+	@seen[0]<request><params><message> = 'edited';
+	is %request<params><message>, 'Who?', 'the request the callback sees is a copy';
+
+	is-deeply policy-over(provider()).elicit-hook.(%request), { action => 'decline' },
+		'with nobody to ask, the server is declined -- which is an ordinary answer';
+	is-deeply policy-over(provider(), on-ask => -> %r { die 'no dialog here' }).elicit-hook.(%request),
+		{ action => 'decline' }, 'a callback that throws declines rather than escaping into the client';
+	is-deeply policy-over(provider(), on-ask => -> %r { 'whatever' }).elicit-hook.(%request),
+		{ action => 'decline' }, 'and so does one that answers with something that is not a result';
+
+	# --- The same hook, against a server that really does ask ---
+
+	{
+		my @kinds;
+		my $live;
+		my $client = MCP::Client.new(
+			transport => MCP::Client::Test::InProcessTransport.new(server => eliciting-server()),
+			client-name => 'policy-live',
+			on-warn => -> Str:D $m { diag "client warning: $m" },
+			on-elicit => -> %req { $live.elicit-hook.(%req) },
+		);
+		$live = MCP::Client::Policy.new(
+			provider => $client,
+			rules => [{ tool => 'greet', decision => 'ask' },],
+			on-ask => -> %req {
+				@kinds.push(%req<kind>);
+				%req<kind> eq 'permission'
+					?? { action => 'allow-once' }
+					!! { action => 'accept', content => { name => 'Ada' } };
+			},
+		);
+
+		my $work = start { $live.execute-tool-calls([call('1', 'greet', '{}'),]) };
+		await Promise.anyof($work, Promise.in(TIMEOUT));
+		die 'Timed out waiting for the live elicitation round trip' if $work.status === Planned;
+		my @out = $work.result;
+
+		is @out[0]<content>, 'Hello, Ada!',
+			'a real server\'s question, answered by the same callback that allowed the call';
+		is-deeply @kinds.List, ('permission', 'server-elicit'),
+			'both kinds through one seam, in the order they arose';
+
+		$client.close;
+	}
+
+	# Headless, with the hook still wired: the server asks, the policy declines,
+	# and the handler decides what to do about it. Nothing hangs.
+	{
+		my $silent;
+		my $client = MCP::Client.new(
+			transport => MCP::Client::Test::InProcessTransport.new(server => eliciting-server()),
+			client-name => 'policy-live-headless',
+			on-warn => -> Str:D $m { diag "client warning: $m" },
+			on-elicit => -> %req { $silent.elicit-hook.(%req) },
+		);
+		$silent = MCP::Client::Policy.new(
+			provider => $client,
+			rules => [{ tool => 'greet', decision => 'allow' },],
+		);
+
+		my $work = start { $silent.execute-tool-calls([call('1', 'greet', '{}'),]) };
+		await Promise.anyof($work, Promise.in(TIMEOUT));
+		die 'Timed out waiting for the live decline' if $work.status === Planned;
+
+		is $work.result[0]<content>, 'Nobody, then.',
+			'and with nobody to ask, the server is declined and the handler carries on';
+
+		$client.close;
+	}
+};
+
+subtest 'the argument shapes the bridge parses, parsed twice' => {
+	plan 3;
+
+	# The policy has to parse a call's arguments before the provider is allowed
+	# to, which means the same rules are written down in two places. This is the
+	# test that keeps them the same: every shape a model (or a broken model)
+	# sends, through an allow-everything policy, must come back exactly as the
+	# bare provider answers it.
+	#
+	# Malformed *calls* are deliberately not in this list: MCP::Server's bridge
+	# dies on a call it cannot bind, and the policy refuses them itself rather
+	# than forwarding a call it could not read.
+	my $kit = MCP::Client::Test::TestKit.new(slow-ms => 5);
+	my $server = MCP::Server.new(name => 'parity', version => '1.0.0');
+	$server.plug($kit);
+	$server.tool: 'bare', handler => -> :%args { 'nothing to declare' };
+
+	my $policy = MCP::Client::Policy.new(
+		provider => $server,
+		rules => [{ tool => '*', decision => 'allow' },],
+	);
+
+	my @calls = (
+		%( id => 'a', function => %( name => 'echo', arguments => %( text => 'hello there' ) ) ),
+		%( id => 'b', function => %( name => 'echo', arguments => '{"text":"from json"}' ) ),
+		%( id => 'c', function => %( name => 'nope', arguments => %() ) ),
+		%( id => 'd', function => %( name => 'echo', arguments => '{not json' ) ),
+		%( id => 'e', function => %( name => 'echo', arguments => '[1,2]' ) ),
+		%( id => 'f', function => %( name => 'echo', arguments => 42 ) ),
+		%( id => 'g', function => %( name => 'echo', arguments => '' ) ),
+		%( id => 'h', function => %( name => 'bare', arguments => "  \n " ) ),
+		%( function => %( name => 'bare', arguments => %() ) ),
+	);
+
+	is-deeply $policy.execute-tool-calls(@calls).List, $server.execute-tool-calls(@calls).List,
+		'every shape comes back exactly as the provider alone answers it';
+
+	# And the same shapes, with a rule that has to look at the arguments: the
+	# ones that will not parse are unevaluable, not empty.
+	my $strict = MCP::Client::Policy.new(
+		provider => $server,
+		rules => [{ tool => '*', decision => 'allow', under => '/srv' },],
+	);
+	my @strict = $strict.execute-tool-calls(@calls);
+	is-deeply @strict.map({ $_<is_error> }).List, (True xx 9).List,
+		'and under a rule with a predicate, arguments that name no location are all refused';
+	ok @strict.map({ $_<content>.contains('Permission') }).all,
+		'by the policy, before the provider ever sees them';
+};
+
+done-testing;

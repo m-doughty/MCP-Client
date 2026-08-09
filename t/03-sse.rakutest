@@ -1,0 +1,234 @@
+use Test;
+use lib 'lib';
+use MCP::Client::SSE;
+
+plan 14;
+
+# Collect everything a parser emits. The supply is live, so the tap has to be
+# in place before the first feed.
+sub collector(MCP::Client::SSE:D $sse) {
+	my @seen;
+	$sse.events.tap: -> %event { @seen.push(%event) };
+	@seen;
+}
+
+# Feed $body through a fresh parser in $n roughly-equal text chunks.
+sub events-in-chunks(Str:D $body, Int:D $n, Bool:D :$close = True --> List) {
+	my $sse = MCP::Client::SSE.new;
+	my @seen := collector($sse);
+	my $size = max(($body.chars / $n).ceiling, 1);
+	my $i = 0;
+	while $i < $body.chars {
+		$sse.feed($body.substr($i, $size));
+		$i += $size;
+	}
+	$sse.close if $close;
+	@seen.List;
+}
+
+subtest 'one event' => {
+	plan 4;
+
+	my @seen = events-in-chunks("event: message\ndata: hello\n\n", 1);
+	is @seen.elems, 1, 'one event';
+	is @seen[0]<type>, 'message', 'type';
+	is @seen[0]<data>, 'hello', 'data, with the syntactic space stripped';
+	nok @seen[0]<id>:exists, 'no id key when the event set none';
+};
+
+subtest 'chunk boundaries are irrelevant' => {
+	plan 3;
+
+	my $body = "event: message\ndata: \{\"jsonrpc\":\"2.0\",\"id\":1}\n\n"
+		~ ": keepalive\n\n"
+		~ "event: notification\ndata: \{\"method\":\"x\"}\n\n";
+
+	# Split the same body into every chunk size from "all at once" down to
+	# "one character at a time"; every one must produce the same two events.
+	my @bad;
+	for 1..$body.chars -> $n {
+		my @seen = events-in-chunks($body, $n);
+		@bad.push($n) unless @seen.elems == 2
+			&& @seen[0]<data> eq '{"jsonrpc":"2.0","id":1}'
+			&& @seen[1]<data> eq '{"method":"x"}';
+	}
+	is @bad.elems, 0, "all {$body.chars} chunkings produced the same two events";
+	is events-in-chunks($body, 1)[0]<type>, 'message', 'first event type';
+	is events-in-chunks($body, 1)[1]<type>, 'notification', 'second event type';
+};
+
+subtest 'byte chunks may split a multi-byte character' => {
+	plan 1;
+
+	my $text = "data: héllo—wörld ✓\n\n";
+	my $bytes = $text.encode('utf-8');
+	my Bool $all-ok = True;
+
+	for 1..^$bytes.elems -> $cut {
+		my $sse = MCP::Client::SSE.new;
+		my @seen := collector($sse);
+		$sse.feed($bytes.subbuf(0, $cut));
+		$sse.feed($bytes.subbuf($cut));
+		$sse.close;
+		$all-ok &&= @seen.elems == 1 && @seen[0]<data> eq 'héllo—wörld ✓';
+	}
+
+	ok $all-ok, "every one of {$bytes.elems - 1} byte-level splits produced the same event";
+};
+
+subtest 'every line terminator the spec allows' => {
+	plan 3;
+
+	my @lf = events-in-chunks("data: a\n\ndata: b\n\n", 1);
+	is @lf.map(*.<data>).join(','), 'a,b', 'LF';
+
+	my @crlf = events-in-chunks("data: a\r\n\r\ndata: b\r\n\r\n", 1);
+	is @crlf.map(*.<data>).join(','), 'a,b', 'CRLF';
+
+	my @cr = events-in-chunks("data: a\r\rdata: b\r\r", 1);
+	is @cr.map(*.<data>).join(','), 'a,b', 'bare CR';
+};
+
+subtest 'keepalives and comments are skipped' => {
+	plan 3;
+
+	my @seen = events-in-chunks(": ping\n\n: OPENROUTER PROCESSING\n\ndata: real\n\n", 1);
+	is @seen.elems, 1, 'only the data-bearing event was dispatched';
+	is @seen[0]<data>, 'real', 'and it is intact';
+
+	my @inline = events-in-chunks(": a comment\ndata: real\n\n", 1);
+	is @inline[0]<data>, 'real', 'a comment inside an event is skipped too';
+};
+
+subtest 'multi-line data is joined with newlines' => {
+	plan 2;
+
+	my @seen = events-in-chunks("data: \{\ndata:   \"a\": 1\ndata: }\n\n", 1);
+	is @seen.elems, 1, 'still one event';
+	is @seen[0]<data>, "\{\n  \"a\": 1\n}",
+		'lines joined with LF, one syntactic space stripped from each';
+};
+
+subtest 'fields' => {
+	plan 6;
+
+	my @seen = events-in-chunks("event: custom\ndata: x\nid: 42\nretry: 2500\n\n", 1);
+	is @seen[0]<type>, 'custom', 'event names the type';
+	is @seen[0]<id>, '42', 'id';
+	is @seen[0]<retry>, 2500, 'retry, as a number';
+
+	my @unnamed = events-in-chunks("data: x\n\n", 1);
+	is @unnamed[0]<type>, 'message', "an unnamed event's type defaults to message";
+
+	my @junk = events-in-chunks("data: x\nretry: soon\nunknown-field: whatever\n\n", 1);
+	nok @junk[0]<retry>:exists, 'a non-numeric retry is ignored';
+	is @junk[0]<data>, 'x', 'an unknown field is ignored without harming the event';
+};
+
+subtest 'field syntax corner cases' => {
+	plan 4;
+
+	is events-in-chunks("data:no-space\n\n", 1)[0]<data>, 'no-space',
+		'the space after the colon is optional';
+	is events-in-chunks("data:  two spaces\n\n", 1)[0]<data>, ' two spaces',
+		'only one space is syntax; the rest is data';
+	is events-in-chunks("data: a: b: c\n\n", 1)[0]<data>, 'a: b: c',
+		'only the first colon separates field from value';
+	is events-in-chunks("data\n\n", 1)[0]<data>, '',
+		'a field name with no colon is that field with an empty value';
+};
+
+subtest 'events with no data are not dispatched' => {
+	plan 3;
+
+	is events-in-chunks("event: message\nid: 1\n\n", 1).elems, 0, 'fields but no data';
+	is events-in-chunks("\n\n\n\n", 1).elems, 0, 'blank lines only';
+	is events-in-chunks("data: \n\n", 1).elems, 1,
+		'an empty data value is still data, and is dispatched';
+};
+
+subtest 'the incomplete tail is held back' => {
+	plan 4;
+
+	my $sse = MCP::Client::SSE.new;
+	my @seen := collector($sse);
+
+	$sse.feed("data: first\n\ndata: sec");
+	is @seen.elems, 1, 'only the complete event was emitted';
+	is $sse.pending-tail, 'data: sec', 'the rest is held';
+
+	$sse.feed("ond\n\n");
+	is @seen.elems, 2, 'the held tail completed';
+	is @seen[1]<data>, 'second', 'and is intact';
+};
+
+subtest 'closing flushes an unterminated final event' => {
+	plan 4;
+
+	# The last event of an HTTP body routinely arrives without its trailing
+	# blank line, and for MCP that event is the response itself.
+	my @flushed = events-in-chunks("data: first\n\ndata: last-with-no-blank-line", 1);
+	is @flushed.elems, 2, 'the unterminated tail is dispatched on close';
+	is @flushed[1]<data>, 'last-with-no-blank-line', 'intact';
+
+	my $strict = MCP::Client::SSE.new;
+	my @seen := collector($strict);
+	$strict.feed("data: first\n\ndata: dropped");
+	$strict.close(:!flush);
+	is @seen.elems, 1, ':!flush discards it instead';
+
+	my $sse = MCP::Client::SSE.new;
+	my @none := collector($sse);
+	$sse.close;
+	is @none.elems, 0, 'closing an empty parser emits nothing';
+};
+
+subtest 'the supply ends when the parser does' => {
+	plan 4;
+
+	my $sse = MCP::Client::SSE.new;
+	my $done = Promise.new;
+	my $quit = Promise.new;
+	$sse.events.tap(-> $ { }, done => { $done.keep(True) }, quit => -> $e { $quit.keep($e) });
+
+	nok $sse.closed, 'starts open';
+	$sse.close;
+	ok $sse.closed, 'closed';
+	await Promise.anyof($done, Promise.in(10));
+	is $done.status, Kept, 'the events supply was told it is done';
+
+	my $failing = MCP::Client::SSE.new;
+	my $reason = Promise.new;
+	$failing.events.tap(-> $ { }, quit => -> $e { $reason.keep($e) });
+	$failing.quit(X::AdHoc.new(payload => 'connection reset'));
+	await Promise.anyof($reason, Promise.in(10));
+	is $reason.status, Kept, 'quit propagates the failure to the tap';
+};
+
+subtest 'closing is idempotent and feeding afterwards is harmless' => {
+	plan 3;
+
+	my $sse = MCP::Client::SSE.new;
+	my @seen := collector($sse);
+	$sse.feed("data: one\n\n");
+	$sse.close;
+	$sse.close;
+	lives-ok { $sse.feed("data: two\n\n") }, 'feeding a closed parser does not throw';
+	is @seen.elems, 1, 'and emits nothing';
+	lives-ok { $sse.quit(X::AdHoc.new(payload => 'too late')) },
+		'quitting a closed parser does not throw';
+};
+
+subtest 'last-event-id tracks the stream' => {
+	plan 3;
+
+	my $sse = MCP::Client::SSE.new;
+	my @seen := collector($sse);
+
+	is $sse.last-event-id, '', 'empty before anything arrives';
+	$sse.feed("data: a\nid: 7\n\ndata: b\n\n");
+	is $sse.last-event-id, '7', 'set by an event that carried an id, kept by one that did not';
+
+	$sse.feed("data: c\nid: 9\n\n");
+	is $sse.last-event-id, '9', 'updated by a later id';
+};

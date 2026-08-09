@@ -1,0 +1,449 @@
+use Test;
+use lib 'lib';
+use JSON::Fast;
+use MCP::Server::Protocol;
+use MCP::Server::HTTP::Validation;
+use MCP::Client::Exceptions;
+use MCP::Client::Transport::HTTP;
+
+plan 11;
+
+# Everything here is decided before a byte goes out, so nothing in this file
+# opens a socket. The one thing it does reach for is the *server's* own
+# validation module: the point of several of these tests is not "the client
+# agrees with itself" but "the client's headers are the ones this server
+# accepts", and the only honest way to say that is to run them through
+# MCP::Server::HTTP::Validation.
+
+#| A modern-era request body, exactly as MCP::Client::Protocol::build-request
+#| would have produced it: the protocol version travels in _meta on every
+#| request, and the header has to be copied from there.
+sub body($id, Str:D $method, %params = {}, Str :$version = MODERN-PROTOCOL-VERSION --> Hash) {
+	my %p = %params;
+	%p<_meta> = { (META-PROTOCOL-VERSION) => $version };
+
+	my %msg = jsonrpc => '2.0', method => $method, params => %p;
+	%msg<id> = $id if $id.defined;
+	%msg;
+}
+
+#| The headers one message implies, keyed by the name as it goes on the wire.
+sub headers-of(%msg, :%annotations, Str :$protocol-version --> Hash) {
+	my %out;
+	for request-headers(%msg, :%annotations, :$protocol-version) -> $header {
+		%out{$header.key} = $header.value;
+	}
+	%out;
+}
+
+#| The same headers as MCP::Server::HTTP sees them: lowercased, repeats joined
+#| with a comma.
+sub wire-headers(%msg, :%annotations --> Hash) {
+	my %out;
+	for request-headers(%msg, :%annotations) -> $header {
+		my $name = $header.key.lc;
+		%out{$name} = %out{$name}:exists
+			?? "{%out{$name}},{$header.value}"
+			!! $header.value;
+	}
+	%out;
+}
+
+#| One tool definition with whatever inputSchema the test wants to try.
+sub tool(Str:D $name, %schema --> Hash) {
+	{ name => $name, description => "the $name tool", inputSchema => %schema };
+}
+
+subtest 'the routing headers a message implies' => {
+	plan 8;
+
+	my %headers = headers-of(body(1, 'tools/list'));
+
+	is %headers<MCP-Protocol-Version>, MODERN-PROTOCOL-VERSION,
+		'the protocol version is stamped on every request';
+	is %headers<Mcp-Method>, 'tools/list', 'the method is mirrored verbatim';
+	is %headers<Accept>, 'application/json, text/event-stream',
+		'both answer shapes are accepted, which the specification makes a MUST';
+	nok %headers<Mcp-Name>:exists, 'tools/list names nothing, so it sends no Mcp-Name';
+
+	# The header MUST match params._meta, so it is copied from the body rather
+	# than from anything the transport believes about itself.
+	my %older = headers-of(body(2, 'tools/list', {}, version => '2027-01-01'));
+	is %older<MCP-Protocol-Version>, '2027-01-01',
+		'the header follows the body, whatever version the body claims';
+
+	my %bare = jsonrpc => '2.0', id => 3, method => 'server/discover';
+	is headers-of(%bare)<MCP-Protocol-Version>, MODERN-PROTOCOL-VERSION,
+		'a body with no _meta at all falls back to the modern version';
+	is headers-of(%bare, protocol-version => '2029-09-09')<MCP-Protocol-Version>, '2029-09-09',
+		'...or to whatever fallback the transport was configured with';
+
+	my %notification = jsonrpc => '2.0', method => 'notifications/initialized',
+		params => { _meta => { (META-PROTOCOL-VERSION) => MODERN-PROTOCOL-VERSION } };
+	is headers-of(%notification)<Mcp-Method>, 'notifications/initialized',
+		'a notification carries the same routing headers a request does';
+};
+
+subtest 'Mcp-Name follows the method' => {
+	plan 6;
+
+	is headers-of(body(1, 'tools/call', { name => 'greet', arguments => {} }))<Mcp-Name>,
+		'greet', 'tools/call names params.name';
+	is headers-of(body(2, 'prompts/get', { name => 'summarise' }))<Mcp-Name>,
+		'summarise', 'prompts/get names params.name';
+	is headers-of(body(3, 'resources/read', { uri => 'mem://notes' }))<Mcp-Name>,
+		'mem://notes', 'resources/read names params.uri, not params.name';
+
+	nok headers-of(body(4, 'resources/list'))<Mcp-Name>:exists,
+		'a listing names nothing';
+	nok headers-of(body(5, 'server/discover'))<Mcp-Name>:exists,
+		'neither does the bootstrap probe';
+
+	# A malformed call is the server's to refuse, and it will: the point here is
+	# that the client does not invent a name to paper over it.
+	nok headers-of(body(6, 'tools/call', { arguments => {} }))<Mcp-Name>:exists,
+		'a tools/call with no name sends no Mcp-Name rather than an empty one';
+};
+
+subtest 'header values use the base64 sentinel when they must' => {
+	plan 8;
+
+	is header-encode('us-west1'), 'us-west1', 'plain ASCII travels as-is';
+	is header-encode('Hello, 世界'), '=?base64?SGVsbG8sIOS4lueVjA==?=',
+		'non-ASCII is base64 of the UTF-8 form';
+	is header-encode(' padded '), '=?base64?IHBhZGRlZCA=?=',
+		'leading and trailing whitespace is not header-safe';
+	is header-encode("line1\nline2"), '=?base64?bGluZTEKbGluZTI=?=',
+		'a newline would be a header injection, so it never goes out raw';
+	is header-encode('=?base64?literal?='), '=?base64?PT9iYXNlNjQ/bGl0ZXJhbD89?=',
+		'a plain value shaped like the sentinel is encoded too, to avoid ambiguity';
+
+	# The whole point of the encoding is that the far end can undo it. Decoded
+	# by the server's own decoder, not by a mirror of it written here.
+	is decode-header-value(header-encode('mem://café')), 'mem://café',
+		'the server decodes what the client encoded';
+	is decode-header-value(header-encode('=?base64?literal?=')), '=?base64?literal?=',
+		'...including a value that only looked encoded';
+
+	my %headers = headers-of(body(1, 'resources/read', { uri => 'mem://café' }));
+	ok %headers<Mcp-Name>.starts-with('=?base64?'),
+		'a non-ASCII resource URI cannot travel as-is, so Mcp-Name is encoded';
+};
+
+subtest 'x-mcp-header annotations are validated' => {
+	plan 11;
+
+	my %good = tool('execute_sql', {
+		type       => 'object',
+		properties => {
+			region => { type => 'string', 'x-mcp-header' => 'Region' },
+			query  => { type => 'string' },
+		},
+	});
+	my %valid = tool-header-annotations(%good);
+	ok %valid<valid>, 'a primitive top-level property may carry an annotation';
+	is-deeply %valid<headers>, { Region => ('region',) },
+		'...and the header maps to that property path';
+
+	my %nested = tool('deep', {
+		type       => 'object',
+		properties => {
+			outer => {
+				type       => 'object',
+				properties => { tenant => { type => 'string', 'x-mcp-header' => 'Tenant' } },
+			},
+		},
+	});
+	my %nested-check = tool-header-annotations(%nested);
+	ok %nested-check<valid>,
+		'a nested property is fine as long as every step of the chain is a properties key';
+	is-deeply %nested-check<headers>, { Tenant => ('outer', 'tenant') },
+		'...and its path is the whole chain';
+
+	my sub rejects(%tool, Str:D $needle, Str:D $description) {
+		my %check = tool-header-annotations(%tool);
+		my $rejected = !%check<valid> && (%check<reason> // '').contains($needle);
+		ok $rejected, $description;
+		diag "reason was: {%check<reason> // '(accepted)'}" unless $rejected;
+	}
+
+	rejects tool('in-items', {
+		type       => 'object',
+		properties => {
+			rows => { type => 'array', items => { type => 'string', 'x-mcp-header' => 'Row' } },
+		},
+	}), 'statically reachable', 'an annotation under items is not statically reachable';
+
+	rejects tool('in-anyof', {
+		type       => 'object',
+		properties => {
+			mode => { anyOf => [{ type => 'string', 'x-mcp-header' => 'Mode' }, { type => 'integer' }] },
+		},
+	}), 'statically reachable', 'neither is one under a composition keyword';
+
+	rejects tool('numeric', {
+		type       => 'object',
+		properties => { ratio => { type => 'number', 'x-mcp-header' => 'Ratio' } },
+	}), 'rather than string, integer or boolean',
+		'number is pointedly not a permitted type';
+
+	rejects tool('objecty', {
+		type       => 'object',
+		properties => { blob => { type => 'object', 'x-mcp-header' => 'Blob' } },
+	}), 'rather than string, integer or boolean', 'nor is an object';
+
+	rejects tool('empty-name', {
+		type       => 'object',
+		properties => { region => { type => 'string', 'x-mcp-header' => '' } },
+	}), 'is empty', 'an empty header name is refused';
+
+	rejects tool('injection', {
+		type       => 'object',
+		properties => { region => { type => 'string', 'x-mcp-header' => "Region\r\nX-Evil" } },
+	}), 'field-name token', 'a header name carrying CRLF is refused outright';
+
+	rejects tool('collision', {
+		type       => 'object',
+		properties => {
+			region => { type => 'string', 'x-mcp-header' => 'Region' },
+			area   => { type => 'string', 'x-mcp-header' => 'REGION' },
+		},
+	}), 'more than once', 'names collide case-insensitively';
+};
+
+subtest 'annotated arguments are mirrored into Mcp-Param headers' => {
+	plan 8;
+
+	my %annotations =
+		Region => ('region',),
+		Live   => ('live',),
+		Rows   => ('limit',),
+		Tenant => ('outer', 'tenant'),
+		Absent => ('nope',);
+
+	my %arguments =
+		region => 'us-west1',
+		live   => False,
+		limit  => 42,
+		outer  => { tenant => 'acme' },
+		nulled => Any;
+
+	my %headers = headers-of(
+		body(1, 'tools/call', { name => 'execute_sql', arguments => %arguments }),
+		:%annotations,
+	);
+
+	is %headers<Mcp-Param-Region>, 'us-west1', 'a string argument goes across as itself';
+	is %headers<Mcp-Param-Live>, 'false',
+		'a boolean is the lowercase word, not Raku\'s idea of a false Int';
+	is %headers<Mcp-Param-Rows>, '42', 'an integer is its decimal form';
+	is %headers<Mcp-Param-Tenant>, 'acme', 'a nested path is read at its exact position';
+	nok %headers<Mcp-Param-Absent>:exists,
+		'an argument that is not there produces no header at all';
+
+	my %nulled = headers-of(
+		body(2, 'tools/call', {
+			name => 'execute_sql', arguments => { region => Any },
+		}),
+		annotations => { Region => ('region',) },
+	);
+	nok %nulled<Mcp-Param-Region>:exists, 'neither does a null one';
+
+	my %encoded = headers-of(
+		body(3, 'tools/call', {
+			name => 'execute_sql', arguments => { region => 'us west 1 ☕' },
+		}),
+		annotations => { Region => ('region',) },
+	);
+	is %encoded<Mcp-Param-Region>, header-encode('us west 1 ☕'),
+		'a value that is not header-safe uses the sentinel';
+	is decode-header-value(%encoded<Mcp-Param-Region>), 'us west 1 ☕',
+		'...which the server decodes back to the argument';
+};
+
+subtest 'the server accepts the headers this client builds' => {
+	plan 6;
+
+	# header-checks is the server's own gate: Nil means "these headers agree
+	# with this body". Anything else is the 400 the client would have got.
+	my sub accepted(%msg, :%annotations --> Str) {
+		my $verdict = header-checks(wire-headers(%msg, :%annotations), %msg);
+		$verdict ~~ Associative ?? $verdict<message> !! Str;
+	}
+
+	nok accepted(body(1, 'tools/list')).defined, 'a plain listing passes';
+	nok accepted(body(2, 'server/discover')).defined, 'so does the bootstrap probe';
+	nok accepted(body(3, 'resources/read', { uri => 'mem://café' })).defined,
+		'so does a sentinel-encoded Mcp-Name';
+	nok accepted(body(4, 'prompts/get', { name => 'summarise' })).defined,
+		'so does a prompt render';
+
+	my %call = body(5, 'tools/call', {
+		name      => 'execute_sql',
+		arguments => { region => 'us-west1', live => True, limit => 42, note => 'héllo' },
+	});
+	my %annotations = Region => ('region',), Live => ('live',), Limit => ('limit',), Note => ('note',);
+	nok accepted(%call, :%annotations).defined,
+		'and so does a call with every flavour of mirrored parameter';
+
+	# The mirror is what the server cross-checks, so a client that got it wrong
+	# would be caught here -- which is the whole reason to run this test through
+	# the server's code rather than the client's.
+	my %tampered = wire-headers(%call, :%annotations);
+	%tampered<mcp-param-region> = 'eu-west9';
+	my $verdict = header-checks(%tampered, %call);
+	is ($verdict ~~ Associative ?? $verdict<code> !! Int), HEADER_MISMATCH,
+		'a Mcp-Param that disagrees with the body is exactly what -32020 is for';
+};
+
+subtest 'a tool with a bad annotation is excluded from tools/list' => {
+	plan 6;
+
+	my @warnings;
+	my $transport = MCP::Client::Transport::HTTP.new(
+		url     => 'http://127.0.0.1:9/mcp',
+		on-warn => -> Str:D $message { @warnings.push($message) },
+	);
+	LEAVE { $transport.close }
+
+	my %result = capture => 'me', tools => [
+		tool('execute_sql', {
+			type       => 'object',
+			properties => {
+				region => { type => 'string', 'x-mcp-header' => 'Region' },
+				query  => { type => 'string' },
+			},
+		}),
+		tool('broken', {
+			type       => 'object',
+			properties => {
+				rows => { type => 'array', items => { type => 'string', 'x-mcp-header' => 'Row' } },
+			},
+		}),
+		tool('plain', { type => 'object', properties => { text => { type => 'string' } } }),
+	];
+
+	my %filtered = $transport.capture-tool-list(%result);
+
+	is-deeply %filtered<tools>.map(*<name>).List, ('execute_sql', 'plain').List,
+		'the tool with the unreachable annotation is gone, the others are untouched';
+	is %filtered<capture>, 'me', 'the rest of the result is passed through';
+	is @warnings.elems, 1, 'exactly one warning, naming one tool';
+	ok @warnings[0].contains('broken'), '...and it names the tool it dropped';
+	ok @warnings[0].contains('statically reachable'), '...and says why';
+
+	is-deeply $transport.tool-annotations, { execute_sql => { Region => ('region',) } },
+		'only the tool that actually annotates anything is remembered';
+};
+
+subtest 'responses are dispatched on status and content type' => {
+	plan 7;
+
+	is response-kind(200, 'text/event-stream'), 'sse', 'an event stream is streamed';
+	is response-kind(200, 'text/event-stream; charset=utf-8'), 'sse',
+		'...whatever parameters the content type carries';
+	is response-kind(200, 'application/json'), 'json', 'a JSON body is read whole';
+	is response-kind(200, 'APPLICATION/JSON'), 'json', 'content types compare case-insensitively';
+	is response-kind(200, Str), 'json',
+		'a 200 with no content type at all is read as JSON, and fails honestly if it is not';
+	is response-kind(202, Str), 'accepted', '202 is a notification acknowledgement';
+	is response-kind(404, 'application/json'), 'error', 'everything else is an error to be read';
+};
+
+subtest 'an unsuccessful response becomes a coded protocol error' => {
+	plan 8;
+
+	my $not-found = error-for-status(404, to-json(
+		error-response(1, METHOD_NOT_FOUND, 'Method not found'), :!pretty,
+	));
+	isa-ok $not-found, X::MCP::Client::Protocol, 'a 404 is a protocol error';
+	is $not-found.code, METHOD_NOT_FOUND,
+		'...carrying the -32601 the transport maps onto 404';
+
+	# This is the branch the era probe depends on: a modern server refuses an
+	# unknown version with a 400 whose body says which versions it does speak.
+	my $version = error-for-status(400, to-json(
+		unsupported-protocol-version-error(
+			1, requested => '1999-01-01', supported => SUPPORTED-PROTOCOL-VERSIONS,
+		), :!pretty,
+	));
+	is $version.code, UNSUPPORTED_PROTOCOL_VERSION, 'a 400 keeps its modern error code';
+	is-deeply $version.data<supported>.List, SUPPORTED-PROTOCOL-VERSIONS.List,
+		'...and the data verbatim, which is what the probe retries from';
+
+	my $mismatch = error-for-status(400, to-json(
+		error-response(Any, HEADER_MISMATCH, 'Missing required Mcp-Method header'), :!pretty,
+	));
+	is $mismatch.code, HEADER_MISMATCH,
+		'an error response whose id is null is still read as one';
+
+	# A proxy in front of the server, or a server that is not an MCP server at
+	# all. There is no code to report, and pretending otherwise would tell the
+	# era probe the peer is modern.
+	my $html = error-for-status(400, '<html><body>Bad Request</body></html>');
+	nok $html.code.defined, 'an unreadable body has no code to surface';
+	ok $html.message.contains('400'), '...so the status is what the message names';
+
+	my $empty = error-for-status(405, '');
+	ok $empty.message.contains('405'), 'an empty body names its status too';
+};
+
+subtest 'the transport refuses settings it cannot honour' => {
+	plan 6;
+
+	my sub dies-with(&code, Str:D $needle, Str:D $description) {
+		my Str $message;
+		{
+			CATCH { default { $message = .message } }
+			code();
+		}
+		my $matched = ($message // '').contains($needle);
+		ok $matched, $description;
+		diag "message was: {$message // '(nothing thrown)'}" unless $matched;
+	}
+
+	dies-with { MCP::Client::Transport::HTTP.new(url => '') },
+		'non-empty url', 'an empty endpoint is refused';
+	dies-with { MCP::Client::Transport::HTTP.new(url => 'ftp://example.com/mcp') },
+		'http:// or https://', 'a non-HTTP endpoint is refused rather than half-tried';
+	dies-with { MCP::Client::Transport::HTTP.new(url => 'http://x/mcp', http-version => '3') },
+		'unsupported http-version', 'only the versions Cro speaks are accepted';
+	dies-with { MCP::Client::Transport::HTTP.new(url => 'http://x/mcp', connect-timeout => 0) },
+		'connect-timeout', 'a zero connect timeout would never connect';
+
+	# A caller-supplied copy of a derived header would be sent twice, joined
+	# with a comma by the server, and then fail its own validation -- so it is
+	# refused where the mistake was made.
+	dies-with { MCP::Client::Transport::HTTP.new(
+			url => 'http://x/mcp', headers => { 'mcp-method' => 'tools/list' },
+		) },
+		'derived from each message', 'a derived header cannot be overridden';
+	dies-with { MCP::Client::Transport::HTTP.new(
+			url => 'http://x/mcp', headers => { 'Mcp-Param-Region' => 'eu' },
+		) },
+		'derived from each message', 'nor can a mirrored parameter be forged';
+};
+
+subtest 'a closed transport fails requests rather than sending them' => {
+	plan 6;
+
+	my $transport = MCP::Client::Transport::HTTP.new(url => 'http://127.0.0.1:9/mcp');
+	ok $transport.alive, 'a fresh transport is alive';
+
+	$transport.close;
+	nok $transport.alive, 'a closed one is not';
+	lives-ok { $transport.close }, 'closing twice is allowed';
+
+	my $answer = $transport.request(body(1, 'tools/list'));
+	await Promise.anyof($answer, Promise.in(10));
+	is $answer.status, Broken, 'a request after close is broken, not left hanging';
+	isa-ok $answer.cause, X::MCP::Client::TransportClosed,
+		'...with the failure the client knows how to read';
+
+	# A notification has no answer to fail, so a transport that cannot deliver
+	# one says nothing rather than throwing at a caller who has moved on.
+	lives-ok { $transport.notify(body(Nil, 'notifications/initialized')) },
+		'a notification after close is a silent no-op, not an exception';
+};
+
+done-testing;

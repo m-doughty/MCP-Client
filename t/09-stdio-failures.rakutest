@@ -1,0 +1,196 @@
+use Test;
+use lib 'lib', 't/lib';
+use MCP::Server::Protocol;
+use MCP::Client;
+use MCP::Client::Exceptions;
+use MCP::Client::Transport::Stdio;
+
+# Every way a child process can let a client down. The rule this file exists to
+# enforce is that none of them hang and none of them lose the diagnosis: a
+# server that dies says why, a server that talks nonsense is survived, and a
+# request that gives up leaves the connection usable.
+
+plan 5;
+
+constant FIXTURE = $?FILE.IO.parent.add('lib/fixture-server.raku').absolute;
+
+sub include-args(--> List) {
+	$*REPO.repo-chain
+		.grep(* ~~ CompUnit::Repository::FileSystem)
+		.map({ '-I' ~ .prefix.absolute })
+		.List;
+}
+
+sub spawn(Str :$era = 'both', :%transport, *%opts) {
+	my @args = |include-args(), FIXTURE, "--era=$era";
+	my $wire = MCP::Client::Transport::Stdio.new(
+		command   => $*EXECUTABLE.absolute,
+		args      => @args,
+		on-log    => -> Str:D $message { diag "transport: $message" },
+		on-stderr => -> Str:D $line { diag "server stderr: $line" },
+		|%transport,
+	);
+	my $client = MCP::Client.new(
+		transport => $wire,
+		client-name => 'stdio-failure-test',
+		on-warn => -> Str:D $message { diag "client: $message" },
+		|%opts,
+	);
+	($client, $wire);
+}
+
+# Run something that is expected to fail and hand back what it failed with,
+# without ever waiting longer than $within for it. A test that hangs on one of
+# three CI operating systems is worse than a test that fails on all of them.
+sub failure-of(&code, Real :$within = 30) {
+	my $work = start {
+		my $error;
+		{
+			CATCH { default { $error = $_ } }
+			code();
+		}
+		$error // 'the call succeeded, and was not supposed to';
+	};
+	await Promise.anyof($work, Promise.in($within));
+	$work.status ~~ Kept
+		?? $work.result
+		!! "the call had not settled after {$within}s";
+}
+
+sub settled(Promise:D $promise, Real :$within = 60 --> Bool:D) {
+	await Promise.anyof($promise, Promise.in($within));
+	$promise.status !~~ Planned;
+}
+
+# Bounded polling for a condition another thread will make true. Not a sleep:
+# it returns the moment the condition holds, and gives up rather than hanging.
+sub wait-until(&condition, Real :$within = 20 --> Bool:D) {
+	my $deadline = now + $within;
+	loop {
+		return True if condition();
+		return False if now > $deadline;
+		sleep 0.02;
+	}
+}
+
+subtest 'the child dies with work outstanding' => {
+	plan 8;
+
+	my ($client, $wire) = spawn();
+	$client.era;
+
+	# One request that will never be answered because the server is about to
+	# take the pipe with it, and one that asks it to.
+	my $orphan = $client.call-tool-async('gate_wait', {});
+	my $died = failure-of({ $client.call-tool('crash', { code => 3, message => 'the boiler went' }) });
+
+	isa-ok $died, X::MCP::Client::ServerGone, 'the call that killed it reports a dead server';
+	is $died.exit-code, 3, 'carrying the exit code';
+	ok $died.stderr-tail.contains('the boiler went'),
+		'and the tail of stderr, which is where servers write the reason';
+	ok $died.message.contains('the boiler went'), 'the message quotes it too';
+
+	ok settled($orphan), 'everything else outstanding settled as well';
+	isa-ok $orphan.cause, X::MCP::Client::ServerGone,
+		'with the same verdict -- nothing is left waiting for a process that has gone';
+
+	nok $wire.alive, 'the transport knows it is dead';
+
+	# And it stays dead: a client that keeps calling gets an immediate answer
+	# rather than a request timeout apiece.
+	my $after = failure-of({ $client.call-tool('echo', { text => 'anyone there?' }) }, within => 15);
+	isa-ok $after, X::MCP::Client::ServerGone, 'later calls fail immediately, not eventually';
+
+	$client.close;
+};
+
+subtest 'a line of stdout that is not JSON-RPC' => {
+	plan 4;
+
+	my @dropped;
+	my ($client, $wire) = spawn(transport => {
+		on-log => -> Str:D $message { @dropped.push($message) },
+	});
+	$client.era;
+
+	# Servers print banners, deprecation notices and progress bars to stdout.
+	# One of them must never end a session.
+	my %answer = $client.call-tool('banner', { text => 'fixture-server v0.1.0 (not JSON)' });
+	is %answer<content>[0]<text>, 'banner printed', 'the call it interrupted still answered';
+	is @dropped.grep({ .contains('dropped a line of stdout') }).elems, 1,
+		'the junk line was reported once';
+	ok @dropped.grep({ .contains('not JSON') }).elems, 'and quoted, so it can be diagnosed';
+
+	is $client.call-tool('echo', { text => 'still here' })<content>[0]<text>, 'still here',
+		'and the session carried on';
+
+	$client.close;
+};
+
+subtest 'a command that cannot be started' => {
+	plan 4;
+
+	my $wire = MCP::Client::Transport::Stdio.new(
+		command => 'mcp-client-no-such-command-4d5a1f',
+		args    => ['--stdio'],
+	);
+	my $client = MCP::Client.new(transport => $wire, on-warn => -> Str:D $m { diag $m });
+
+	my $failed = failure-of({ $client.list-tools }, within => 15);
+	isa-ok $failed, X::MCP::Client::SpawnFailed, 'a missing executable is a spawn failure';
+	ok $failed.message.contains('mcp-client-no-such-command-4d5a1f'),
+		'whose message names the command';
+	ok wait-until({ !$wire.alive }), 'and the transport gives up rather than waiting';
+
+	# A working directory that does not exist is caught before we even try, so
+	# the caller gets the real reason instead of an exec error about the command.
+	throws-like {
+		MCP::Client::Transport::Stdio.new(command => $*EXECUTABLE.absolute, cwd => '/no/such/place')
+	}, X::MCP::Client::SpawnFailed, message => /'/no/such/place'/,
+		'and so is a working directory that does not exist';
+
+	$client.close;
+};
+
+subtest 'closing with a request in flight' => {
+	plan 3;
+
+	my ($client, $wire) = spawn();
+	$client.era;
+
+	my $blocked = $client.call-tool-async('gate_wait', {});
+	# Nothing will ever release that gate, so the only way this call ends is the
+	# connection ending underneath it.
+	$client.close;
+
+	ok settled($blocked), 'the in-flight call settled rather than hanging';
+	isa-ok $blocked.cause, X::MCP::Client::TransportClosed,
+		'as a deliberate close, not as a server that died';
+	nok $wire.alive, 'and the transport is down';
+};
+
+subtest 'a timeout leaves the connection standing' => {
+	plan 5;
+
+	my @notes;
+	my ($client, $wire) = spawn(transport => {
+		on-log => -> Str:D $message { @notes.push($message) },
+	});
+	$client.era;
+
+	# The server will answer this in its own time. We are not going to wait.
+	my $slow = failure-of({ $client.call-tool('slow', { ms => 3_000 }, timeout => 1) }, within => 20);
+	isa-ok $slow, X::MCP::Client::Timeout, 'the call gave up on its budget';
+	is $slow.seconds, 1, 'after exactly the budget it was given';
+
+	ok $wire.alive, 'the connection is still up';
+	is $client.call-tool('echo', { text => 'next question' })<content>[0]<text>, 'next question',
+		'and the next request goes through it normally';
+
+	# The abandoned answer turns up eventually. It correlates with nothing, so it
+	# is dropped and said so -- never delivered to whatever is using that id now.
+	ok wait-until({ @notes.grep({ .contains('late answer') }).elems }),
+		'the answer that arrived too late was dropped';
+
+	$client.close;
+};

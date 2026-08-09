@@ -1,0 +1,329 @@
+use Test;
+use lib 'lib', 't/lib';
+use MCP::Server;
+use MCP::Server::Protocol;
+use MCP::Client;
+use MCP::Client::Exceptions;
+use MCP::Client::Protocol;
+use MCP::Client::Test::InProcessTransport;
+
+# The multi round-trip loop against a server that really does ask.
+#
+# t/06 pins the client half against a scripted wire; MCP::Server's t/21 pins
+# the server half against hand-built messages. This is where the two meet:
+# real MCP::Server handlers calling $*MCP-REQUEST-CONTEXT.elicit, real
+# MCP::Client running its round-trip loop, real capability negotiation, and no
+# wire in between to blur a mismatch into a serialisation bug.
+#
+# Run it with the sibling checkout on the path:
+#
+#   prove6 -Ilib -I../MCP-Server/lib t/15-mrtr-live.rakutest
+
+plan 9;
+
+constant TIMEOUT = 30;
+
+#| Await a promise, giving up loudly rather than hanging the suite.
+sub timed($promise, Str:D $what) {
+	await Promise.anyof($promise, Promise.in(TIMEOUT));
+	die "Timed out after {TIMEOUT}s waiting for $what" if $promise.status === Planned;
+	$promise.result;
+}
+
+# === The server ===
+
+#| A server whose handlers ask questions. Fresh per subtest: the client caches
+#| the era and the catalogs, and the server's elicitation table is per-instance.
+sub eliciting-server(*%opts --> MCP::Server:D) {
+	my $server = MCP::Server.new(
+		name => 'eliciting-server', version => '2.0.0',
+		instructions => 'Ask if you are not sure', |%opts,
+	);
+
+	$server.tool: 'greet',
+		description => 'Greet somebody, asking who if it has to',
+		params => { name => { type => 'string', description => 'Who to greet' } },
+		handler => -> :%args {
+			my $who = %args<name>;
+			unless $who ~~ Str:D && $who.chars {
+				my $answer = $*MCP-REQUEST-CONTEXT.elicit(
+					'Who should I greet?',
+					properties => { name => { type => 'string', description => 'A name' } },
+					required => ['name',],
+				);
+				# A handler is a Block, not a Routine: `return` here would be an
+				# error rather than an early exit, so the refusal is a value.
+				$who = $answer.accepted ?? $answer.content<name> !! Str;
+			}
+			$who.defined ?? "Hello, $who!" !! 'Nobody, then.';
+		};
+
+	# Three questions, one per round.
+	$server.tool: 'interview', :handler(-> :%args {
+		my @said;
+		for <name quest colour> -> $about {
+			my $answer = $*MCP-REQUEST-CONTEXT.elicit(
+				"What is your $about?",
+				properties => { reply => { type => 'string' } },
+				required => ['reply',],
+			);
+			@said.push($answer.accepted ?? $answer.content<reply> !! '(refused)');
+		}
+		@said.join(' / ');
+	});
+
+	# Never satisfied: the client's round budget is the only thing that stops it.
+	$server.tool: 'insatiable', :handler(-> :%args {
+		loop {
+			$*MCP-REQUEST-CONTEXT.elicit(
+				'and another thing?', properties => { more => { type => 'string' } },
+			);
+		}
+	});
+
+	$server.resource: 'live://letter', :name<letter>, :handler(-> :%args {
+		my $answer = $*MCP-REQUEST-CONTEXT.elicit(
+			'Whom is the letter for?',
+			properties => { who => { type => 'string' } },
+			required => ['who',],
+		);
+		"Dear {$answer.accepted ?? $answer.content<who> !! 'nobody'},";
+	});
+
+	$server.prompt: 'toast', :handler(-> :%args {
+		my $answer = $*MCP-REQUEST-CONTEXT.elicit(
+			'To whom shall we drink?',
+			properties => { who => { type => 'string' } },
+			required => ['who',],
+		);
+		{
+			description => "a toast to {$answer.accepted ?? $answer.content<who> !! 'nobody'}",
+			messages => [{ role => 'user', content => { type => 'text', text => 'cheers' } },],
+		};
+	});
+
+	$server;
+}
+
+# === The client ===
+
+#| Server, transport, client and the log of questions the hook was asked, all
+#| wired together. The hook is scripted: it answers from @answers in order and
+#| repeats the last one once it runs out, which is what makes an insatiable
+#| server terminate on the client's budget rather than on the script's end.
+sub fixture(@answers, Bool :$concurrent = True, *%client-opts --> Hash) {
+	my $server = eliciting-server(|(%client-opts<server-opts> // {}));
+	%client-opts<server-opts>:delete;
+
+	my @asked;
+	my $lock = Lock.new;
+	my $next = 0;
+
+	my &on-elicit = -> %request {
+		$lock.protect: {
+			@asked.push(%request);
+			my $index = $next min (@answers.elems - 1);
+			$next++;
+			@answers.elems > 0 ?? @answers[$index] !! { action => 'decline' };
+		};
+	};
+
+	my $wire = MCP::Client::Test::InProcessTransport.new(:$server, :$concurrent);
+	my $client = MCP::Client.new(
+		transport => $wire,
+		client-name => 'mrtr-live',
+		on-warn => -> Str:D $m { diag "client warning: $m" },
+		|(%client-opts<no-hook> ?? () !! (:&on-elicit)),
+		|%client-opts.grep({ .key ne 'no-hook' }).Hash,
+	);
+
+	{ server => $server, wire => $wire, client => $client, asked => @asked };
+}
+
+sub accept(%content = {}) { { action => 'accept', content => %content } }
+
+subtest 'One question, asked and answered, end to end' => {
+	plan 8;
+
+	my %kit = fixture([accept({ name => 'Ada' }),]);
+	my @asked := %kit<asked>;
+
+	my %answer = %kit<client>.call-tool('greet', {});
+	is %answer<content>[0]<text>, 'Hello, Ada!', 'The tool finished with the user\'s answer in it';
+	nok %answer<resultType>:exists, 'And the protocol bookkeeping is stripped off it';
+	nok %answer<requestState>:exists, 'Including the continuation token';
+
+	is @asked.elems, 1, 'The hook was consulted once';
+	is @asked[0]<method>, 'elicitation/create', 'With a real ElicitRequest';
+	is @asked[0]<params><message>, 'Who should I greet?', 'Carrying the handler\'s question';
+	is-deeply @asked[0]<params><requestedSchema><required>.List, ('name',),
+		'And the schema the handler described';
+
+	is %kit<wire>.requests-for('tools/call').elems, 2,
+		'It took two requests: the call and the retry that answered it';
+};
+
+subtest 'The retry is the original call plus the answers and the state' => {
+	plan 6;
+
+	my %kit = fixture([accept({ name => 'Bo' }),]);
+	%kit<client>.call-tool('greet', { name => '' });
+
+	my @sent = %kit<wire>.requests-for('tools/call');
+	isnt @sent[0]<id>, @sent[1]<id>, 'Each round is an independent request with its own id';
+
+	my %first = @sent[0]<params>;
+	nok %first<inputResponses>:exists, 'The first request carries no answers';
+	nok %first<requestState>:exists, 'And no state';
+
+	my %retry = @sent[1]<params>;
+	is %retry<name>, 'greet', 'The retry repeats the original method parameters';
+	is-deeply %retry<arguments>, { name => '' }, 'Arguments and all';
+
+	# The token the server minted is opaque to the client and must come back
+	# unexamined: this is the one thing the whole continuation hangs on.
+	ok %retry<requestState> ~~ Str:D && %retry<requestState>.starts-with('mrtr-'),
+		'And the server\'s own requestState, echoed back as the string it was';
+};
+
+subtest 'Three rounds, three questions, three tokens' => {
+	plan 5;
+
+	my %kit = fixture([
+		accept({ reply => 'Arthur' }),
+		accept({ reply => 'the Grail' }),
+		accept({ reply => 'blue' }),
+	]);
+	my @asked := %kit<asked>;
+
+	is %kit<client>.call-tool('interview', {})<content>[0]<text>,
+		'Arthur / the Grail / blue', 'Every answer reached the question that asked for it';
+	is-deeply @asked.map({ $_<params><message> }).List,
+		('What is your name?', 'What is your quest?', 'What is your colour?').List,
+		'The hook saw the questions in the order the handler asked them';
+
+	my @sent = %kit<wire>.requests-for('tools/call');
+	is @sent.elems, 4, 'Three rounds plus the original call';
+
+	my @states = @sent[1 .. 3].map({ $_<params><requestState> });
+	is @states.unique.elems, 3, 'Every round carried a token of its own';
+	is @sent[3]<params><inputResponses>.keys.elems, 1,
+		'And only that round\'s answers -- they do not accumulate';
+};
+
+subtest 'A user who says no is a result, not a failure' => {
+	plan 4;
+
+	my %declining = fixture([{ action => 'decline' },]);
+	my %answer = %declining<client>.call-tool('greet', {});
+	is %answer<content>[0]<text>, 'Nobody, then.', 'The handler decided what to do about it';
+	nok %answer<isError>, 'And the call is not an error';
+
+	my %cancelling = fixture([{ action => 'cancel' },]);
+	is %cancelling<client>.call-tool('greet', {})<content>[0]<text>, 'Nobody, then.',
+		'A cancel reaches the handler the same way';
+
+	# A hook that answers with something that is not an ElicitResult declines on
+	# the client side before the server ever sees it -- and the call still ends.
+	my %confused = fixture(['whatever',]);
+	is %confused<client>.call-tool('greet', {})<content>[0]<text>, 'Nobody, then.',
+		'So does a hook that answers with nonsense';
+};
+
+subtest 'The client\'s round budget stops a server that never stops asking' => {
+	plan 5;
+
+	my %kit = fixture(
+		[accept({ more => 'yes' }),],
+		max-input-rounds => 2,
+		server-opts => { elicitation-ttl => 0.5 },
+	);
+
+	my $thrown;
+	{
+		CATCH { default { $thrown = $_ } }
+		%kit<client>.call-tool('insatiable', {});
+	}
+
+	ok $thrown ~~ X::MCP::Client::InputLoopExceeded, 'The call fails rather than looping forever';
+	is $thrown.rounds, 2, 'The exception names the budget';
+	is %kit<wire>.requests-for('tools/call').elems, 3, 'The original plus exactly two retries';
+
+	# The server does not know the client gave up -- nothing in the protocol
+	# tells it -- so the parked call is held by its TTL and nothing else. That
+	# TTL expiring is what unwinds the handler and frees the place.
+	is %kit<server>.pending-elicitations, 1, 'The abandoned call is still parked for now';
+	my $drained = start {
+		until %kit<server>.pending-elicitations == 0 { sleep 0.1 }
+		True;
+	};
+	ok timed($drained, 'the server to reap the abandoned call'),
+		'And the TTL reaps it, unwinding the handler behind it';
+};
+
+subtest 'A client with no hook is never asked in the first place' => {
+	plan 5;
+
+	my %kit = fixture([], no-hook => True);
+	is-deeply %kit<client>.declared-capabilities, {},
+		'A client with no hooks declares no capabilities';
+
+	# So the server must not ask -- and rather than asking anyway, it tells the
+	# handler it cannot, which the framework turns into an error result.
+	my %answer = %kit<client>.call-tool('greet', {});
+	ok %answer<isError>, 'The call comes back as an error result';
+	ok %answer<content>[0]<text>.contains('did not declare the elicitation capability'),
+		'Explaining exactly why the question was not asked';
+	is %kit<wire>.requests-for('tools/call').elems, 1,
+		'One request: there was no round trip to make';
+	is %kit<server>.pending-elicitations, 0, 'And nothing was parked on the server';
+};
+
+subtest 'resources/read and prompts/get go round the loop as well' => {
+	plan 6;
+
+	my %kit = fixture([accept({ who => 'Ada' }), accept({ who => 'Bo' })]);
+
+	my %read = %kit<client>.read-resource('live://letter');
+	is %read<contents>[0]<text>, 'Dear Ada,', 'The resource read completes';
+	is %kit<wire>.requests-for('resources/read').elems, 2, 'After one round';
+	nok %read<ttlMs>:exists, 'And the cacheability envelope is stripped off the result';
+
+	my %prompt = %kit<client>.get-prompt('toast', {});
+	is %prompt<description>, 'a toast to Bo', 'The prompt render completes';
+	is %kit<wire>.requests-for('prompts/get').elems, 2, 'After one round of its own';
+
+	is %kit<asked>.elems, 2, 'Each asked exactly one question';
+};
+
+subtest 'The async twins go round the loop too' => {
+	plan 3;
+
+	my %kit = fixture([accept({ name => 'Ada' }),]);
+	my $promise = %kit<client>.call-tool-async('greet', {});
+	isa-ok $promise, Promise, 'call-tool-async returns a Promise';
+
+	my %answer = timed($promise, 'the async call to finish');
+	is %answer<content>[0]<text>, 'Hello, Ada!', 'Which carries the finished result';
+	is %kit<wire>.requests-for('tools/call').elems, 2, 'With the round trip done for us';
+};
+
+subtest 'It works whichever thread the transport dispatches on' => {
+	plan 4;
+
+	# :concurrent dispatches each request on a thread of its own, as a real
+	# pipe would; :!concurrent runs it on the caller's. The server parks its
+	# handler on a thread either way, so a mistake there would deadlock the
+	# second case -- which is precisely why it is tested.
+	for True, False -> $concurrent {
+		my %kit = fixture([accept({ name => 'Ada' }),], :$concurrent);
+		my $call = start { %kit<client>.call-tool('greet', {}) };
+		my %answer = timed($call, "a call over a {$concurrent ?? 'concurrent' !! 'serial'} transport");
+
+		is %answer<content>[0]<text>, 'Hello, Ada!',
+			"The round trip completes with :{$concurrent ?? '' !! '!'}concurrent";
+		is %kit<server>.pending-elicitations, 0, 'And leaves nothing parked';
+	}
+};
+
+done-testing;

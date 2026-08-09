@@ -1,0 +1,187 @@
+use Test;
+use lib 'lib', 't/lib';
+use MCP::Server::Protocol;
+use MCP::Client;
+use MCP::Client::Exceptions;
+use MCP::Client::Transport::Stdio;
+
+# The first test with a real pipe in it. t/07 proved the client and the server
+# agree about shapes; this one proves the framing, the correlation and the
+# lifecycle survive a subprocess.
+
+plan 5;
+
+# The fixture lives next door to this file, and is run with the same raku that
+# is running the tests -- no PATH lookup, no shell, no assumption about the
+# working directory beyond the one prove6 already makes.
+constant FIXTURE = $?FILE.IO.parent.add('lib/fixture-server.raku').absolute;
+
+# Pass the parent's -I paths through to the child. From a checkout that is
+# lib/, t/lib/ and ../MCP-Server/lib; under `prove6 -I. t` against installed
+# dependencies it is whatever `use lib` above resolved to, and MCP::Server comes
+# out of the installation repo the child inherits anyway.
+sub include-args(--> List) {
+	$*REPO.repo-chain
+		.grep(* ~~ CompUnit::Repository::FileSystem)
+		.map({ '-I' ~ .prefix.absolute })
+		.List;
+}
+
+sub spawn(Str :$era = 'both', *%opts) {
+	my @args = |include-args(), FIXTURE, "--era=$era";
+	my $wire = MCP::Client::Transport::Stdio.new(
+		command   => $*EXECUTABLE.absolute,
+		args      => @args,
+		on-log    => -> Str:D $message { diag "transport: $message" },
+		on-stderr => -> Str:D $line { diag "server stderr: $line" },
+	);
+	my $client = MCP::Client.new(
+		transport => $wire,
+		client-name => 'stdio-test',
+		on-warn => -> Str:D $message { diag "client: $message" },
+		|%opts,
+	);
+	($client, $wire);
+}
+
+# Bounded waiting, everywhere: a test that hangs on CI tells nobody anything,
+# and every wait in this file has a correct answer that arrives in well under a
+# second on a machine that is not on fire.
+sub settled(Promise:D $promise, Real :$within = 60 --> Bool:D) {
+	await Promise.anyof($promise, Promise.in($within));
+	$promise.status !~~ Planned;
+}
+
+# Bounded polling for a condition another thread will make true. Not a sleep: it
+# returns the instant the condition holds, and gives up rather than hanging.
+sub wait-until(&condition, Real :$within = 30 --> Bool:D) {
+	my $deadline = now + $within;
+	loop {
+		return True if condition();
+		return False if now > $deadline;
+		sleep 0.02;
+	}
+}
+
+subtest 'a spawned server, from probe to answer' => {
+	plan 9;
+
+	my ($client, $wire) = spawn();
+
+	is $client.era, 'modern', 'the probe settled the era down a real pipe';
+	is $client.protocol-version, MODERN-PROTOCOL-VERSION, 'at the modern version';
+	is-deeply $client.server-info, { name => 'fixture-server', version => '0.1.0' },
+		'and the server named itself';
+	ok $client.alive, 'the connection is up';
+	ok $wire.pid.defined, 'and there is a child process behind it';
+
+	ok $client.list-tools.map({ $_<name> }).grep('echo').elems,
+		'the tool catalog came back through the pipe';
+
+	my %echoed = $client.call-tool('echo', { text => 'down the pipe and back' });
+	is %echoed<content>[0]<text>, 'down the pipe and back', 'a tool call round trips';
+
+	is $client.read-resource('test://cached')<contents>[0]<text>, 'cached body',
+		'so does a resource read';
+	is $client.get-prompt('greeting', { name => 'Ada' })<messages>[0]<content><text>,
+		'Hello, Ada!', 'and a prompt';
+
+	$client.close;
+};
+
+subtest 'the legacy handshake, over the same pipe' => {
+	plan 6;
+
+	# Configured for the legacy era only, the fixture still answers
+	# server/discover -- it is the bootstrap probe -- but names no modern
+	# versions, which is the server saying "talk to me the old way".
+	my ($client, $wire) = spawn(era => 'legacy');
+
+	is $client.era, 'legacy', 'an empty supportedVersions sends us to initialize';
+	is $client.protocol-version, LEGACY-PROTOCOL-VERSION, 'the legacy version is in force';
+	is-deeply $client.server-info, { name => 'fixture-server', version => '0.1.0' },
+		'serverInfo came off the initialize result this time';
+	ok $client.capabilities<logging>:exists,
+		'including the logging capability, which only a legacy result carries';
+	ok $client.list-tools.map({ $_<name> }).grep('echo').elems, 'and the catalog still works';
+	ok $client.ping, 'ping exists in the legacy era, and answers';
+
+	$client.close;
+};
+
+subtest 'two requests in flight at once' => {
+	plan 5;
+
+	my ($client, $wire) = spawn();
+	$client.era;   # probe first, so the burst below races nothing but itself
+
+	# gate_wait blocks until gate_open releases it, and gate_open will not
+	# release until gate_wait has arrived. Both can therefore only complete if
+	# the server had both in hand at the same time -- and both answers can only
+	# reach the right caller if the correlator matched them by id rather than by
+	# arrival order.
+	my $wait = $client.call-tool-async('gate_wait', {});
+	my $open = $client.call-tool-async('gate_open', {});
+	my $both = Promise.allof($wait, $open);
+
+	ok settled($both), 'both calls settled';
+	ok $wait.status ~~ Kept, 'the blocked call came back';
+	ok $open.status ~~ Kept, 'so did the one that released it';
+	is (await $wait)<content>[0]<text>, 'waited',
+		'the first call really was blocked when the second arrived';
+	is (await $open)<content>[0]<text>, 'opened', 'and the second ran while it waited';
+
+	$client.close;
+};
+
+subtest 'notifications share the pipe with answers' => {
+	plan 7;
+
+	my @logged;
+	my @tapped;
+	my ($client, $wire) = spawn(
+		log-level => 'info',
+		on-log    => -> %params { @logged.push(%params) },
+	);
+	$client.notifications.tap(-> %note { @tapped.push(%note) });
+
+	my %answer = $client.call-tool('noisy', { text => 'halfway there' });
+	is %answer<content>[0]<text>, 'logged at info', 'the answer arrived';
+	is @logged.elems, 1, 'and so did the notification that preceded it';
+	is @logged[0]<data>, 'halfway there', 'with its params intact';
+	is-deeply @tapped.map({ $_<method> }).List, ('notifications/message',),
+		'routed to the client Supply as well';
+
+	# One pipe, two conversations: with more than one request outstanding there
+	# is no way to tell whose notification this is, so it goes to the
+	# connection-wide sink instead of guessing. It must still arrive exactly once.
+	my $blocked = $client.call-tool-async('gate_wait', {});
+	ok wait-until({ $wire.pending-count == 1 }), 'a second call is outstanding';
+
+	$client.call-tool('noisy', { text => 'two in flight' });
+	is @logged.elems, 2, 'the notification arrived anyway, and only once';
+	is @logged[1]<data>, 'two in flight', 'with the right payload';
+
+	$client.call-tool('gate_open', {});
+	settled($blocked);
+
+	$client.close;
+};
+
+subtest 'a clean shutdown' => {
+	plan 6;
+
+	my ($client, $wire) = spawn();
+	$client.era;
+	ok $wire.alive, 'the transport is alive to begin with';
+
+	$client.close;
+
+	nok $wire.alive, 'closing takes the transport down';
+	nok $client.alive, 'and the client with it';
+	is $wire.exit-code, 0,
+		'the child exited of its own accord when its stdin closed -- no kill needed';
+	nok $wire.signal.defined, 'so no signal was involved';
+
+	lives-ok { $client.close }, 'and closing again is a no-op';
+};

@@ -1,0 +1,474 @@
+use Test;
+use lib 'lib', 't/lib';
+use MCP::Server::Protocol;
+use MCP::Client::Exceptions;
+use MCP::Client::Protocol;
+use MCP::Client;
+use MCP::Client::Test::FakeTransport;
+
+plan 16;
+
+# Shapes here are the 2026-07-28 ones, verified against
+# https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/mrtr:
+# inputRequests and inputResponses are *maps* keyed by server-assigned ids, and
+# an inputResponses value is a bare client result with no envelope around it.
+
+sub modern-wire(--> MCP::Client::Test::FakeTransport:D) {
+	my $wire = MCP::Client::Test::FakeTransport.new;
+	$wire.script('server/discover', { result => {
+		supportedVersions => [MODERN-PROTOCOL-VERSION],
+		capabilities      => { tools => {}, resources => {}, prompts => {} },
+	} });
+	$wire;
+}
+
+sub needs-input(:%requests, Str :$state) {
+	my %result = resultType => RESULT-TYPE-INPUT-REQUIRED;
+	%result<inputRequests> = %requests if %requests.elems;
+	%result<requestState> = $state if $state.defined;
+	{ result => %result };
+}
+
+sub elicit-request(Str:D $message = 'Please provide your GitHub username') {
+	{
+		method => 'elicitation/create',
+		params => {
+			mode => 'form',
+			message => $message,
+			requestedSchema => {
+				type => 'object',
+				properties => { name => { type => 'string' } },
+				required => ['name'],
+			},
+		},
+	};
+}
+
+sub done-result(Str:D $text = 'done') {
+	{ result => { content => [{ type => q{text}, text => $text },] } };
+}
+
+# A request's params without the per-request _meta block, which every modern
+# request carries and which t/05 pins separately -- what is left is the part of
+# the retry the round-trip loop is responsible for.
+sub params-of(%msg --> Hash) {
+	my %params = (%msg<params> // {}).Hash;
+	%params<_meta>:delete;
+	%params;
+}
+
+subtest 'a call that completes first time never enters the loop' => {
+	plan 4;
+
+	my $wire = modern-wire();
+	$wire.script('tools/call', done-result());
+	my $client = MCP::Client.new(transport => $wire);
+
+	my %answer = $client.call-tool('echo', { text => 'hi' });
+	is-deeply %answer, { content => [{ type => q{text}, text => q{done} },] },
+		'the tool result comes back';
+	nok %answer<resultType>:exists, 'protocol bookkeeping is stripped off it';
+	is $wire.requests-for('tools/call').elems, 1, 'exactly one request went out';
+	is-deeply params-of($wire.requests-for(q{tools/call})[0]),
+		{ name => q{echo}, arguments => { text => q{hi} } },
+		'carrying nothing but the call itself';
+};
+
+subtest 'one round: the answer goes back under the server key that asked' => {
+	plan 8;
+
+	my @seen;
+	my $wire = modern-wire();
+	$wire.script('tools/call',
+		needs-input(
+			requests => { github_login => elicit-request() },
+			state    => 'AEAD-protected blob',
+		),
+		done-result('octocat'),
+	);
+	my $client = MCP::Client.new(
+		transport => $wire,
+		on-elicit => -> %request {
+			@seen.push(%request);
+			{ action => 'accept', content => { name => 'octocat' } };
+		},
+	);
+
+	my %answer = $client.call-tool('gh', { repo => 'raku' });
+	is %answer<content>[0]<text>, 'octocat', 'the final result is what comes back';
+	is $wire.requests-for('tools/call').elems, 2, 'it took two requests';
+
+	is @seen.elems, 1, 'the hook was called once';
+	is @seen[0]<method>, 'elicitation/create', 'with the request method';
+	is @seen[0]<params><message>, 'Please provide your GitHub username',
+		'and the whole request params, verbatim';
+
+	my %retry = $wire.requests-for('tools/call')[1]<params>;
+	is-deeply %retry<inputResponses>,
+		{ github_login => { action => 'accept', content => { name => 'octocat' } } },
+		'the retry carries an inputResponses map keyed by the server key';
+	is %retry<requestState>, 'AEAD-protected blob', 'and the requestState beside it';
+	nok $wire.requests-for('tools/call')[0]<params><inputResponses>:exists,
+		'while the first request carried neither';
+};
+
+subtest 'several rounds, each one asking something new' => {
+	plan 6;
+
+	my @asked;
+	my $wire = modern-wire();
+	$wire.script('tools/call',
+		needs-input(requests => { first => elicit-request('one?') }, state => 'state-1'),
+		needs-input(requests => { second => elicit-request('two?') }, state => 'state-2'),
+		needs-input(requests => { third => elicit-request('three?') }, state => 'state-3'),
+		done-result(),
+	);
+	my $client = MCP::Client.new(
+		transport => $wire,
+		on-elicit => -> %request {
+			@asked.push(%request<params><message>);
+			{ action => 'accept', content => { name => 'x' } };
+		},
+	);
+
+	is $client.call-tool('t', {})<content>[0]<text>, 'done', 'the call still completes';
+	is $wire.requests-for('tools/call').elems, 4, 'three rounds plus the original';
+	is-deeply @asked, ['one?', 'two?', 'three?'], 'every round reached the hook';
+
+	my @retries = $wire.requests-for('tools/call')[1..3];
+	is-deeply @retries.map({ $_<params><requestState> }).List,
+		('state-1', 'state-2', 'state-3'), 'each retry carried that round\'s state';
+	is-deeply @retries.map({ $_<params><inputResponses>.keys.sort.Str }).List,
+		('first', 'second', 'third'), 'and that round\'s answers, keyed by its own keys';
+	is-deeply @retries[2]<params><inputResponses>.keys.sort.List, ('third',),
+		'answers do not accumulate across rounds -- the server rebuilds from requestState';
+};
+
+subtest 'requestState is opaque and echoed back byte for byte' => {
+	plan 5;
+
+	# Deliberately hostile: it looks like JSON, it has quotes, braces, a newline
+	# and characters outside Latin-1. A client that parses, re-serialises or
+	# normalises any of that breaks a server that AEAD-signed the bytes.
+	my $blob = qq{\{"iss":"srv","exp":1234\}\n·ünïcødé·\\"escaped\\"};
+
+	my $wire = modern-wire();
+	$wire.script('tools/call',
+		needs-input(requests => { ask => elicit-request() }, state => $blob),
+		done-result(),
+	);
+	my $client = MCP::Client.new(transport => $wire, on-elicit => -> %r { { action => 'accept' } });
+	$client.call-tool('t', {});
+
+	my $echoed = $wire.requests-for('tools/call')[1]<params><requestState>;
+	ok $echoed ~~ Str, 'it comes back as a string, not parsed into a structure';
+	is $echoed, $blob, 'and equal to what the server sent';
+	is-deeply $echoed.encode('utf-8').list, $blob.encode('utf-8').list,
+		'byte for byte, encoding included';
+	is $echoed.chars, $blob.chars, 'nothing was trimmed';
+
+	# And when the server sends none, the client MUST NOT invent one.
+	my $stateless = modern-wire();
+	$stateless.script('tools/call',
+		needs-input(requests => { ask => elicit-request() }),
+		done-result(),
+	);
+	my $bare = MCP::Client.new(transport => $stateless, on-elicit => -> %r { { action => 'accept' } });
+	$bare.call-tool('t', {});
+	nok $stateless.requests-for('tools/call')[1]<params><requestState>:exists,
+		'no requestState from the server means none in the retry';
+};
+
+subtest 'every round is an independent request with a new id' => {
+	plan 4;
+
+	my $wire = modern-wire();
+	$wire.script('tools/call',
+		needs-input(requests => { a => elicit-request() }, state => 's1'),
+		needs-input(requests => { b => elicit-request() }, state => 's2'),
+		done-result(),
+	);
+	my $client = MCP::Client.new(transport => $wire, on-elicit => -> %r { { action => 'accept' } });
+	$client.call-tool('t', {});
+
+	my @ids = $wire.requests-for('tools/call').map({ $_<id> });
+	is @ids.elems, 3, 'three requests';
+	is @ids.unique.elems, 3, 'three different ids -- the spec requires it';
+	ok ([<] @ids), 'and they only ever go up';
+	nok @ids.grep({ $_ == $wire.requests-for('server/discover')[0]<id> }),
+		'none of them reuses the probe id either';
+};
+
+subtest 'an unwired hook declines rather than failing the call' => {
+	plan 5;
+
+	my $wire = modern-wire();
+	$wire.script('tools/call',
+		needs-input(
+			requests => { ask => elicit-request(), where => { method => 'roots/list' } },
+			state    => 'st',
+		),
+		done-result(),
+	);
+	# No hooks at all -- which is also why a well-behaved server would never
+	# have asked: we declared no capabilities.
+	my $client = MCP::Client.new(transport => $wire);
+
+	is $client.call-tool('t', {})<content>[0]<text>, 'done', 'the call still completes';
+
+	my %responses = $wire.requests-for('tools/call')[1]<params><inputResponses>;
+	is-deeply %responses<ask>, { action => 'decline' },
+		'elicitation declines with an ElicitResult';
+	is-deeply %responses<where>, { roots => [] },
+		'roots declines with an empty ListRootsResult';
+	is-deeply %responses.keys.sort.List, ('ask', 'where'), 'and nothing else was invented';
+	is-deeply $client.declared-capabilities, {},
+		'a client with no hooks declares no capabilities';
+};
+
+subtest 'a hook that throws declines, and the loop carries on' => {
+	plan 5;
+
+	my @warnings;
+	my $wire = modern-wire();
+	$wire.script('tools/call',
+		needs-input(requests => { ask => elicit-request() }, state => 's1'),
+		needs-input(requests => { ask => elicit-request() }, state => 's2'),
+		done-result(),
+	);
+	my $calls = 0;
+	my $client = MCP::Client.new(
+		transport => $wire,
+		on-warn   => -> Str:D $m { @warnings.push($m) },
+		on-elicit => -> %request {
+			++$calls;
+			die 'the permission dialog exploded' if $calls == 1;
+			{ action => 'accept' };
+		},
+	);
+
+	is $client.call-tool('t', {})<content>[0]<text>, 'done',
+		'a throwing hook does not take the call down with it';
+	is $calls, 2, 'and the hook is still consulted on the next round';
+	is-deeply $wire.requests-for('tools/call')[1]<params><inputResponses>,
+		{ ask => { action => 'decline' } }, 'the round it threw on declined';
+	is-deeply $wire.requests-for('tools/call')[2]<params><inputResponses>,
+		{ ask => { action => 'accept' } }, 'the round it survived answered';
+	ok @warnings.grep({ .contains('the permission dialog exploded') }),
+		'and the caller was told, rather than the exception being swallowed';
+};
+
+subtest 'a hook that answers with nonsense declines too' => {
+	plan 2;
+
+	my $wire = modern-wire();
+	$wire.script('tools/call',
+		needs-input(requests => { ask => elicit-request() }, state => 's'),
+		done-result(),
+	);
+	my $client = MCP::Client.new(transport => $wire, on-elicit => -> %r { 'not a result' });
+
+	is $client.call-tool('t', {})<content>[0]<text>, 'done', 'the call completes';
+	is-deeply $wire.requests-for('tools/call')[1]<params><inputResponses>,
+		{ ask => { action => 'decline' } },
+		'a hook return that is not a result body is treated as a refusal';
+};
+
+subtest 'sampling has no refusal shape, so its key is left out entirely' => {
+	plan 4;
+
+	my $wire = modern-wire();
+	$wire.script('tools/call',
+		needs-input(
+			requests => {
+				think => { method => 'sampling/createMessage', params => { maxTokens => 100 } },
+				ask    => elicit-request(),
+				odd    => { method => 'divination/entrails' },
+			},
+			state => 'st',
+		),
+		done-result(),
+	);
+	my $client = MCP::Client.new(transport => $wire);
+
+	is $client.call-tool('t', {})<content>[0]<text>, 'done', 'the call completes';
+
+	my %responses = $wire.requests-for('tools/call')[1]<params><inputResponses>;
+	is-deeply %responses.keys.sort.List, ('ask',),
+		'only the kinds with a declinable result are answered';
+	nok %responses<think>:exists,
+		'a CreateMessageResult cannot say no, so no answer is fabricated for it';
+	nok %responses<odd>:exists, 'nor for a kind we have never heard of';
+};
+
+subtest 'a round with nothing answerable still retries, without an empty map' => {
+	plan 3;
+
+	my $wire = modern-wire();
+	$wire.script('tools/call',
+		needs-input(
+			requests => { think => { method => 'sampling/createMessage', params => {} } },
+			state    => 'st',
+		),
+		done-result(),
+	);
+	my $client = MCP::Client.new(transport => $wire);
+
+	is $client.call-tool('t', {})<content>[0]<text>, 'done', 'the call completes';
+	my %retry = $wire.requests-for('tools/call')[1]<params>;
+	nok %retry<inputResponses>:exists,
+		'an inputResponses with no entries is left out rather than sent empty';
+	is %retry<requestState>, 'st', 'the state still goes back';
+};
+
+subtest 'inputRequests absent: retry immediately with the state alone' => {
+	plan 4;
+
+	my $wire = modern-wire();
+	$wire.script('tools/call',
+		needs-input(state => 'resume-here'),
+		done-result(),
+	);
+	my $client = MCP::Client.new(transport => $wire);
+
+	is $client.call-tool('t', { a => 1 })<content>[0]<text>, 'done', 'the call completes';
+	is $wire.requests-for('tools/call').elems, 2, 'with one retry';
+
+	my %retry = params-of($wire.requests-for(q{tools/call})[1]);
+	is-deeply %retry,
+		{ name => q{t}, arguments => { a => 1 }, requestState => q{resume-here} },
+		'the retry is the original call plus the state, and nothing else';
+	nok %retry<inputResponses>:exists, 'no inputResponses when nothing was asked';
+};
+
+subtest 'input_required with neither requests nor state is a protocol violation' => {
+	plan 3;
+
+	my $wire = modern-wire();
+	$wire.script('tools/call', { result => { resultType => RESULT-TYPE-INPUT-REQUIRED } });
+	my $client = MCP::Client.new(transport => $wire);
+
+	throws-like { $client.call-tool('t', {}) }, X::MCP::Client::Protocol,
+		'a server must send at least one of them, and this one sent neither';
+	is $wire.requests-for('tools/call').elems, 1,
+		'retrying an identical request would only spin, so we do not';
+
+	my $weird = modern-wire();
+	$weird.script('tools/call', { result => { resultType => 'daydreaming' } });
+	throws-like { MCP::Client.new(transport => $weird).call-tool('t', {}) },
+		X::MCP::Client::Protocol,
+		'and a resultType we do not recognise is invalid, per the base spec';
+};
+
+subtest 'the round budget is a hard stop' => {
+	plan 5;
+
+	my $wire = modern-wire();
+	# A server that will never be satisfied.
+	$wire.script-any(|(needs-input(requests => { ask => elicit-request() }, state => 's') xx 20));
+	my $client = MCP::Client.new(
+		transport => $wire, max-input-rounds => 3,
+		on-elicit => -> %r { { action => 'accept' } },
+	);
+
+	my $thrown;
+	{
+		CATCH { default { $thrown = $_ } }
+		$client.call-tool('t', {});
+	}
+
+	ok $thrown ~~ X::MCP::Client::InputLoopExceeded, 'the call fails rather than looping forever';
+	is $thrown.rounds, 3, 'the exception names the budget';
+	is $thrown.method, 'tools/call', 'and the call that hit it';
+	is $wire.requests-for('tools/call').elems, 4, 'the original plus exactly three retries';
+
+	my $default = modern-wire();
+	$default.script-any(|(needs-input(state => 's') xx 40));
+	throws-like { MCP::Client.new(transport => $default).call-tool('t', {}) },
+		X::MCP::Client::InputLoopExceeded, message => /'8'/,
+		'and the default budget is eight rounds';
+};
+
+subtest 'only the three methods the spec names are ever retried' => {
+	plan 6;
+
+	for <tools/list resources/list prompts/list ping> -> $method {
+		my $wire = modern-wire();
+		$wire.script($method, needs-input(state => 'st'));
+		my $client = MCP::Client.new(transport => $wire);
+
+		# "Servers MUST NOT send InputRequiredResult responses on any other
+		# client requests" -- so this is the server breaking the protocol, and
+		# the client says so rather than quietly starting a round-trip loop on
+		# a method that has nowhere to put the answers.
+		throws-like {
+			given $method {
+				when 'tools/list'     { $client.list-tools }
+				when 'resources/list' { $client.list-resources }
+				when 'prompts/list'   { $client.list-prompts }
+				when 'ping'           { $client.ping }
+			}
+		}, X::MCP::Client::Protocol, "input_required on $method is a protocol error";
+	}
+
+	my $wire = modern-wire();
+	$wire.script('tools/list', needs-input(state => 'st'));
+	my $client = MCP::Client.new(transport => $wire);
+	try $client.list-tools;
+	is $wire.requests-for('tools/list').elems, 1, 'and it is not retried';
+
+	my $cached = modern-wire();
+	$cached.script('tools/list', needs-input(state => 'st'),
+		{ result => { tools => [{ name => q{ok} },] } });
+	my $second = MCP::Client.new(transport => $cached);
+	try $second.list-tools;
+	is $second.list-tools[0]<name>, 'ok', 'a refused listing is not cached as a result';
+};
+
+subtest 'resources/read and prompts/get go round the loop as well' => {
+	plan 6;
+
+	my $wire = modern-wire();
+	$wire.script('resources/read',
+		needs-input(requests => { ask => elicit-request('which file?') }, state => 'r1'),
+		{ result => { contents => [{ uri => q{file:///a}, text => q{body} },], ttlMs => 0 } },
+	);
+	$wire.script('prompts/get',
+		needs-input(requests => { ask => elicit-request('what tone?') }, state => 'p1'),
+		{ result => { description => q{a prompt}, messages => [{ role => q{user} },] } },
+	);
+	my $client = MCP::Client.new(transport => $wire, on-elicit => -> %r { { action => 'accept' } });
+
+	my %read = $client.read-resource('file:///a');
+	is %read<contents>[0]<text>, 'body', 'the resource read completes';
+	is $wire.requests-for('resources/read').elems, 2, 'after one round';
+	is-deeply params-of($wire.requests-for(q{resources/read})[1]),
+		{ uri => 'file:///a', inputResponses => { ask => { action => 'accept' } },
+			requestState => 'r1' },
+		'and the retry is the original read plus the answers';
+
+	my %prompt = $client.get-prompt('greet', { name => 'world' });
+	is %prompt<description>, 'a prompt', 'the prompt render completes';
+	is $wire.requests-for('prompts/get').elems, 2, 'after one round';
+	is-deeply params-of($wire.requests-for(q{prompts/get})[1]),
+		{ name => 'greet', arguments => { name => 'world' },
+			inputResponses => { ask => { action => 'accept' } }, requestState => 'p1' },
+		'and its retry keeps the original arguments';
+};
+
+subtest 'the async twins go round the loop too' => {
+	plan 3;
+
+	my $wire = modern-wire();
+	$wire.script('tools/call',
+		needs-input(requests => { ask => elicit-request() }, state => 's'),
+		done-result('async'),
+	);
+	my $client = MCP::Client.new(transport => $wire, on-elicit => -> %r { { action => 'accept' } });
+
+	my $promise = $client.call-tool-async('t', { x => 1 });
+	isa-ok $promise, Promise, 'call-tool-async returns a Promise';
+	my %answer = await $promise;
+	is %answer<content>[0]<text>, 'async', 'which carries the final result';
+	is $wire.requests-for('tools/call').elems, 2, 'with the round trip done for us';
+};

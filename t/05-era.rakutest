@@ -1,0 +1,603 @@
+use Test;
+use lib 'lib', 't/lib';
+use MCP::Server::Protocol;
+use MCP::Client::Exceptions;
+use MCP::Client::Protocol;
+use MCP::Client;
+use MCP::Client::Test::FakeTransport;
+
+plan 24;
+
+# A DiscoverResult as a modern server sends it: the version list, capabilities,
+# instructions, cache metadata, and serverInfo tucked into the result's _meta.
+sub discover-result(:@versions = (MODERN-PROTOCOL-VERSION,), :%capabilities = { tools => {} }) {
+	{
+		supportedVersions => @versions.List,
+		capabilities      => %capabilities,
+		instructions      => 'use the tools',
+		ttlMs             => 3_600_000,
+		cacheScope        => 'public',
+		resultType        => 'complete',
+		_meta             => { (META-SERVER-INFO) => { name => 'fake-server', version => '2.0' } },
+	};
+}
+
+sub initialize-result(Str:D $version = LEGACY-PROTOCOL-VERSION) {
+	{
+		protocolVersion => $version,
+		capabilities    => { tools => {}, logging => {} },
+		serverInfo      => { name => 'old-server', version => '1.0' },
+		instructions    => 'the old ways',
+	};
+}
+
+# A transport scripted for the legacy dance: the probe fails however the caller
+# says, and initialize answers.
+sub legacy-wire($probe) {
+	my $wire = MCP::Client::Test::FakeTransport.new;
+	$wire.script('server/discover', $probe);
+	$wire.script('initialize', { result => initialize-result() });
+	$wire;
+}
+
+subtest 'modern: a DiscoverResult we overlap with settles the era' => {
+	plan 9;
+
+	my $wire = MCP::Client::Test::FakeTransport.new;
+	$wire.script('server/discover', { result => discover-result() });
+	my $client = MCP::Client.new(transport => $wire);
+
+	is $client.era, 'modern', 'era is modern';
+	is $client.protocol-version, MODERN-PROTOCOL-VERSION, 'the negotiated version';
+	is-deeply $client.server-info, { name => 'fake-server', version => '2.0' },
+		'serverInfo comes out of the result _meta';
+	is-deeply $client.capabilities, { tools => {} }, 'capabilities are kept';
+	is $client.instructions, 'use the tools', 'instructions are kept';
+	is-deeply $client.supported-versions, (MODERN-PROTOCOL-VERSION,), 'supported versions';
+	is-deeply $wire.sent-methods, ('server/discover',), 'the probe was the only traffic';
+	is $wire.notified-methods.elems, 0, 'a modern server gets no initialized notification';
+
+	my %probe = $wire.requests-for('server/discover')[0];
+	is %probe<params><_meta>{META-PROTOCOL-VERSION}, MODERN-PROTOCOL-VERSION,
+		'the probe itself is a modern request';
+};
+
+subtest 'legacy: -32601 on the probe means the server never heard of discover' => {
+	plan 8;
+
+	my $wire = legacy-wire({ error => { code => METHOD_NOT_FOUND, message => 'Method not found' } });
+	my $client = MCP::Client.new(transport => $wire, client-name => 'test-agent');
+
+	is $client.era, 'legacy', 'era is legacy';
+	is $client.protocol-version, LEGACY-PROTOCOL-VERSION, 'the legacy version is in force';
+	is-deeply $client.server-info, { name => 'old-server', version => '1.0' },
+		'serverInfo comes off the initialize result';
+	is $client.instructions, 'the old ways', 'instructions come off it too';
+	is-deeply $client.supported-versions, (),
+		'a legacy server names one version, not a list, so there is no list to report';
+
+	# The whole handshake, in order and in full.
+	is-deeply $wire.sent-methods, ('server/discover', 'initialize'),
+		'probe first, then initialize';
+	is-deeply $wire.requests-for('initialize')[0]<params>, {
+		protocolVersion => LEGACY-PROTOCOL-VERSION,
+		capabilities    => {},
+		clientInfo      => { name => 'test-agent', version => '0.1.0' },
+	}, 'initialize carries exactly the three legacy params';
+	is-deeply $wire.notified-methods, ('notifications/initialized',),
+		'and the handshake is closed with notifications/initialized';
+};
+
+subtest 'legacy: a probe that never comes back' => {
+	plan 3;
+
+	my $wire = legacy-wire({ timeout => 5 });
+	my $client = MCP::Client.new(transport => $wire);
+
+	is $client.era, 'legacy', 'a timed-out probe is read as a legacy server';
+	is-deeply $wire.sent-methods, ('server/discover', 'initialize'), 'and it falls back';
+	is $wire.timeouts[0], 5, 'the probe used the short probe budget, not the request timeout';
+};
+
+subtest 'legacy: the probe budget is configurable and separate' => {
+	plan 2;
+
+	my $wire = legacy-wire({ timeout => 1 });
+	my $client = MCP::Client.new(transport => $wire, probe-timeout => 1, request-timeout => 90);
+
+	is $client.era, 'legacy', 'era decided';
+	is-deeply ($wire.timeouts[0], $wire.timeouts[1]), (1, 90),
+		'the probe gets probe-timeout and the handshake gets request-timeout';
+};
+
+subtest 'legacy: an answer that is not a DiscoverResult' => {
+	plan 4;
+
+	for (
+		{ result => { hello => 'there' } }         => 'a result with no supportedVersions',
+		{ result => { supportedVersions => 'no' } } => 'a supportedVersions that is not a list',
+		{ raw => 'not an object at all' }           => 'a result that is not an object',
+		{ raw => Any }                              => 'a null result',
+	) -> $case {
+		my $wire = legacy-wire($case.key);
+		my $client = MCP::Client.new(transport => $wire);
+		is $client.era, 'legacy', $case.value ~ ' falls back';
+	}
+};
+
+subtest 'legacy: an empty supportedVersions is a refusal, not an answer' => {
+	plan 2;
+
+	# This is exactly what MCP::Server answers when it is configured for the
+	# legacy era only: discover exists, and reports no modern versions at all.
+	my $wire = legacy-wire({ result => discover-result(versions => ()) });
+	my $client = MCP::Client.new(transport => $wire);
+
+	is $client.era, 'legacy', 'no modern versions offered means no modern conversation';
+	is-deeply $wire.sent-methods, ('server/discover', 'initialize'), 'so we handshake';
+};
+
+subtest 'legacy: a disjoint supportedVersions' => {
+	plan 2;
+
+	my $wire = legacy-wire({ result => discover-result(versions => ('2030-01-01',)) });
+	my $client = MCP::Client.new(transport => $wire);
+
+	is $client.era, 'legacy', 'a version we cannot speak is no better than none';
+	is-deeply $wire.sent-methods, ('server/discover', 'initialize'), 'so we handshake';
+};
+
+subtest 'modern: -32022 with a version we speak is retried, not abandoned' => {
+	plan 6;
+
+	my $wire = MCP::Client::Test::FakeTransport.new;
+	$wire.script('server/discover',
+		{ error => {
+			code => UNSUPPORTED_PROTOCOL_VERSION,
+			message => 'Unsupported protocol version',
+			data => { supported => [MODERN-PROTOCOL-VERSION, LEGACY-PROTOCOL-VERSION],
+				requested => '2027-05-05' },
+		} },
+		{ result => discover-result() },
+	);
+
+	# A client that prefers a version this server has never heard of.
+	my $client = MCP::Client.new(
+		transport => $wire, protocol-versions => ('2027-05-05', MODERN-PROTOCOL-VERSION),
+	);
+
+	is $client.era, 'modern', 'an error only a modern server can send settles the era';
+	is $client.protocol-version, MODERN-PROTOCOL-VERSION, 'at the version we both speak';
+	is $wire.requests-for('server/discover').elems, 2, 'the probe ran twice';
+	is $wire.requests-for('server/discover')[0]<params><_meta>{META-PROTOCOL-VERSION},
+		'2027-05-05', 'the first probe asked for our preferred version';
+	is $wire.requests-for('server/discover')[1]<params><_meta>{META-PROTOCOL-VERSION},
+		MODERN-PROTOCOL-VERSION, 'the second asked for theirs';
+	# The DiscoverResult that finally came back is authoritative about what the
+	# server speaks; the error's supported list only got us as far as asking.
+	is-deeply $client.supported-versions, (MODERN-PROTOCOL-VERSION,),
+		'the versions reported are the ones the successful probe named';
+};
+
+subtest 'legacy: -32022 offering only legacy versions falls back' => {
+	plan 3;
+
+	my $wire = legacy-wire({ error => {
+		code => UNSUPPORTED_PROTOCOL_VERSION,
+		message => 'Unsupported protocol version',
+		data => { supported => [LEGACY-PROTOCOL-VERSION], requested => MODERN-PROTOCOL-VERSION },
+	} });
+	my $client = MCP::Client.new(transport => $wire);
+
+	is $client.era, 'legacy',
+		'a modern-aware server that speaks only the old version gets the old handshake';
+	is-deeply $wire.sent-methods, ('server/discover', 'initialize'), 'one probe, one handshake';
+	is $wire.requests-for('server/discover').elems, 1, 'the probe is not retried pointlessly';
+};
+
+subtest 'modern: -32020 and -32021 settle the era without a discovery document' => {
+	plan 4;
+
+	for (HEADER_MISMATCH, MISSING_REQUIRED_CLIENT_CAPABILITY) -> $code {
+		my $wire = MCP::Client::Test::FakeTransport.new;
+		$wire.script('server/discover', { error => { code => $code, message => 'no' } });
+		$wire.script('tools/list', { result => { tools => [] } });
+		my $client = MCP::Client.new(transport => $wire);
+
+		is $client.era, 'modern', "$code proves a modern peer";
+		is-deeply $client.capabilities, {},
+			"$code leaves us knowing nothing else about it";
+	}
+};
+
+subtest 'neither era: the failures that are not fallbacks' => {
+	plan 6;
+
+	my $wire = MCP::Client::Test::FakeTransport.new;
+	$wire.script('server/discover', { error => {
+		code => UNSUPPORTED_PROTOCOL_VERSION, message => 'no',
+		data => { supported => ['2030-01-01'] },
+	} });
+	throws-like { MCP::Client.new(transport => $wire).era },
+		X::MCP::Client::UnsupportedVersion,
+		'a modern server offering nothing we speak, and no legacy, is unusable';
+	is $wire.requests-for('initialize').elems, 0, 'and we do not try to handshake with it';
+
+	# A dead wire is not evidence about the protocol era.
+	for (
+		X::MCP::Client::ServerGone.new(exit-code => 127, stderr-tail => 'no such file')
+			=> 'a server that never started',
+		X::MCP::Client::TransportClosed.new => 'a closed transport',
+	) -> $case {
+		my $dead = legacy-wire({ throw => $case.key });
+		throws-like { MCP::Client.new(transport => $dead).era }, $case.key.WHAT,
+			$case.value ~ ' is raised, not read as an era';
+		is $dead.requests-for('initialize').elems, 0,
+			$case.value ~ ' does not provoke a handshake';
+	}
+};
+
+subtest 'legacy: a handshake that answers with a version we do not speak' => {
+	plan 2;
+
+	my $wire = MCP::Client::Test::FakeTransport.new;
+	$wire.script('server/discover', { error => { code => METHOD_NOT_FOUND, message => 'no' } });
+	$wire.script('initialize', { result => initialize-result('2024-11-05') });
+
+	throws-like { MCP::Client.new(transport => $wire).era },
+		X::MCP::Client::UnsupportedVersion,
+		'a server that downgrades us past 2025-11-25 is refused';
+
+	my $broken = MCP::Client::Test::FakeTransport.new;
+	$broken.script('server/discover', { error => { code => METHOD_NOT_FOUND, message => 'no' } });
+	$broken.script('initialize', { result => { capabilities => {} } });
+	throws-like { MCP::Client.new(transport => $broken).era },
+		X::MCP::Client::UnsupportedVersion,
+		'so is one that names no version at all';
+};
+
+subtest 'the verdict is cached for the life of the connection' => {
+	plan 4;
+
+	my $wire = MCP::Client::Test::FakeTransport.new;
+	$wire.script('server/discover', { result => discover-result() });
+	$wire.script('tools/list', { result => { tools => [] } });
+	$wire.script('ping', { result => {} });
+	my $client = MCP::Client.new(transport => $wire);
+
+	is $client.era, 'modern', 'first call probes';
+	$client.era;
+	$client.server-info;
+	$client.list-tools;
+	$client.ping;
+	is $wire.requests-for('server/discover').elems, 1,
+		'nothing afterwards probes again -- the era is a property of the server';
+
+	my $racy = MCP::Client::Test::FakeTransport.new;
+	$racy.script('server/discover', { result => discover-result() });
+	my $concurrent = MCP::Client.new(transport => $racy);
+	my @eras = await (^8).map({ $concurrent.era-async });
+	is-deeply @eras.unique.List, ('modern',), 'eight concurrent first calls all agree';
+	is $racy.requests-for('server/discover').elems, 1, 'and between them they probe once';
+};
+
+subtest 'every modern request carries _meta; no legacy request does' => {
+	plan 8;
+
+	my $wire = MCP::Client::Test::FakeTransport.new;
+	$wire.script('server/discover', { result => discover-result() });
+	$wire.script('tools/list', { result => { tools => [] } });
+	$wire.script('resources/list', { result => { resources => [] } });
+	$wire.script('tools/call', { result => { content => [] } });
+
+	my $client = MCP::Client.new(
+		transport => $wire, client-name => 'agent', log-level => 'info',
+		on-elicit => -> %r { { action => 'decline' } },
+	);
+	$client.list-tools;
+	$client.list-resources;
+	$client.call-tool('x', {});
+
+	is $wire.requests.elems, 4, 'four requests went out';
+	my $stamped = $wire.requests.grep({
+		(.<params><_meta>{META-PROTOCOL-VERSION} // '') eq MODERN-PROTOCOL-VERSION
+	}).elems;
+	is $stamped, 4, 'every single one is stamped with the protocol version';
+
+	my %last = $wire.requests-for('tools/call')[0];
+	is-deeply %last<params><_meta>{META-CLIENT-INFO},
+		{ name => 'agent', version => '0.1.0' }, 'and with clientInfo';
+	is-deeply %last<params><_meta>{META-CLIENT-CAPABILITIES},
+		{ elicitation => { form => {} } }, 'and with the capabilities we derived';
+	is %last<params><_meta>{META-LOG-LEVEL}, 'info', 'and with the log level we asked for';
+
+	my $old = legacy-wire({ error => { code => METHOD_NOT_FOUND, message => 'no' } });
+	$old.script('tools/list', { result => { tools => [] } });
+	my $legacy = MCP::Client.new(transport => $old);
+	$legacy.list-tools;
+
+	is $old.requests.elems, 3, 'the legacy client probed, handshook and listed';
+	nok $old.requests-for('initialize')[0]<params><_meta>:exists,
+		'the handshake carries no _meta';
+	nok $old.requests-for('tools/list')[0]<params>:exists,
+		'and neither does a request with no parameters of its own';
+};
+
+subtest 'client capabilities are derived from the hooks that are wired' => {
+	plan 6;
+
+	sub caps-for(*%hooks) {
+		my $wire = MCP::Client::Test::FakeTransport.new;
+		$wire.script('server/discover', { result => discover-result() });
+		my $client = MCP::Client.new(transport => $wire, |%hooks);
+		$client.era;
+		$wire.requests-for('server/discover')[0]<params><_meta>{META-CLIENT-CAPABILITIES};
+	}
+
+	is-deeply caps-for(), {}, 'no hooks declares nothing -- and nothing may then be asked of us';
+	is-deeply caps-for(on-elicit => -> %r { {} }), { elicitation => { form => {} } },
+		'an elicitation hook declares form-mode elicitation';
+	is-deeply caps-for(on-sample => -> %r { {} }), { sampling => {} },
+		'a sampling hook declares sampling';
+	is-deeply caps-for(on-list-roots => -> %r { {} }), { roots => {} },
+		'a roots hook declares roots';
+	is-deeply caps-for(on-elicit => -> %r { {} }, on-sample => -> %r { {} },
+		on-list-roots => -> %r { {} }),
+		{ elicitation => { form => {} }, sampling => {}, roots => {} },
+		'all three together';
+
+	# The legacy handshake declares the same three keys.
+	my $old = legacy-wire({ error => { code => METHOD_NOT_FOUND, message => 'no' } });
+	my $legacy = MCP::Client.new(transport => $old, on-sample => -> %r { {} });
+	$legacy.era;
+	is-deeply $old.requests-for('initialize')[0]<params><capabilities>, { sampling => {} },
+		'and initialize declares them the same way';
+};
+
+subtest 'capabilities can be overridden when a hook can do more than we assume' => {
+	plan 2;
+
+	my $wire = MCP::Client::Test::FakeTransport.new;
+	$wire.script('server/discover', { result => discover-result() });
+	my $client = MCP::Client.new(
+		transport => $wire,
+		on-elicit => -> %r { {} },
+		client-capabilities => { elicitation => { form => {}, url => {} } },
+	);
+	$client.era;
+
+	is-deeply $wire.requests-for('server/discover')[0]<params><_meta>{META-CLIENT-CAPABILITIES},
+		{ elicitation => { form => {}, url => {} } }, 'the override is sent verbatim';
+	is-deeply $client.declared-capabilities, { elicitation => { form => {}, url => {} } },
+		'and is what the client reports declaring';
+};
+
+subtest 'a client refuses configurations it cannot honour' => {
+	plan 8;
+
+	my $wire = MCP::Client::Test::FakeTransport.new;
+
+	throws-like { MCP::Client.new(transport => $wire, protocol-versions => (LEGACY-PROTOCOL-VERSION,)) },
+		X::MCP::Client::UnsupportedVersion,
+		'2025-11-25 cannot be a modern version: it is a handshake, not a stamp';
+	throws-like { MCP::Client.new(transport => $wire,
+			protocol-versions => (MODERN-PROTOCOL-VERSION, LEGACY-PROTOCOL-VERSION)) },
+		X::MCP::Client::UnsupportedVersion, 'not even as a second choice';
+	throws-like { MCP::Client.new(transport => $wire, protocol-versions => ()) },
+		X::MCP::Client, 'nor can the list be empty';
+	throws-like { MCP::Client.new(transport => $wire, log-level => 'chatty') },
+		X::MCP::Client, 'an RFC 5424 level outside the register is refused';
+	throws-like { MCP::Client.new(transport => $wire, max-input-rounds => 0) },
+		X::MCP::Client, 'a zero round budget would make every MRTR call impossible';
+	throws-like { MCP::Client.new(transport => $wire, request-timeout => -1) },
+		X::MCP::Client, 'a negative timeout is a typo';
+
+	# A hook name typo must not become a client that silently never elicits.
+	throws-like { MCP::Client.new(transport => $wire, on-elict => -> %r { {} }) },
+		X::MCP::Client, 'an unknown option is refused rather than ignored';
+	throws-like { MCP::Client.new(transport => $wire, on-elict => -> %r { {} }) },
+		X::MCP::Client, message => /'on-elict'/, 'and the message names it';
+};
+
+subtest 'a closed client stops talking' => {
+	plan 5;
+
+	my $wire = MCP::Client::Test::FakeTransport.new;
+	$wire.script('server/discover', { result => discover-result() });
+	my $client = MCP::Client.new(transport => $wire);
+	$client.era;
+
+	ok $client.alive, 'alive before';
+	$client.close;
+	nok $client.alive, 'not alive after';
+	is $wire.closes, 1, 'the transport was closed';
+
+	$client.close;
+	is $wire.closes, 1, 'closing twice closes the transport once';
+
+	throws-like { $client.list-tools }, X::MCP::Client::TransportClosed,
+		'and requests afterwards fail rather than hang';
+};
+
+subtest 'notifications reach the Supply and the log hook' => {
+	plan 6;
+
+	my @tapped;
+	my @logged;
+	my @warnings;
+
+	my $wire = MCP::Client::Test::FakeTransport.new;
+	$wire.script('server/discover', { result => discover-result() });
+	$wire.script('tools/call', {
+		notify => [
+			{ method => 'notifications/message',
+				params => { level => 'info', data => 'working on it' } },
+			{ method => 'notifications/progress', params => { progress => 1, total => 2 } },
+		],
+		result => { content => [] },
+	});
+
+	my $client = MCP::Client.new(
+		transport => $wire,
+		on-log    => -> %params { @logged.push(%params) },
+		on-warn   => -> Str:D $m { @warnings.push($m) },
+	);
+	$client.notifications.tap(-> %note { @tapped.push(%note) });
+	$client.call-tool('t', {});
+
+	is @tapped.elems, 2, 'both notifications reached the Supply';
+	is-deeply @tapped.map({ $_<method> }).List,
+		('notifications/message', 'notifications/progress'), 'in the order they arrived';
+	is @logged.elems, 1, 'only the log message reached on-log';
+	is-deeply @logged[0], { level => 'info', data => 'working on it' },
+		'which is called with the notification params';
+	is @warnings.elems, 0, 'and nothing needed warning about';
+
+	# A tap that arrives late sees only what comes after it: this is a live
+	# Supply, not a replay of the connection's history.
+	my @late;
+	$client.notifications.tap(-> %note { @late.push(%note) });
+	is @late.elems, 0, 'a late tap does not receive the backlog';
+};
+
+subtest 'a log hook that throws does not take the request with it' => {
+	plan 3;
+
+	my @warnings;
+	my $wire = MCP::Client::Test::FakeTransport.new;
+	$wire.script('server/discover', { result => discover-result() });
+	$wire.script('tools/call', {
+		notify => [{ method => 'notifications/message', params => { level => 'error' } },],
+		result => { content => [] },
+	});
+
+	my $client = MCP::Client.new(
+		transport => $wire,
+		on-log    => -> %params { die 'the log window is on fire' },
+		on-warn   => -> Str:D $m { @warnings.push($m) },
+	);
+
+	lives-ok { $client.call-tool('t', {}) }, 'the call completes anyway';
+	is @warnings.elems, 1, 'the failure was reported once';
+	ok @warnings[0].contains('the log window is on fire'), 'and quotes the reason';
+};
+
+subtest 'the connect constructors' => {
+	plan 6;
+
+	my $wire = MCP::Client::Test::FakeTransport.new;
+	$wire.script('server/discover', { result => discover-result() });
+
+	my $client = MCP::Client.connect-stdio(transport => $wire, client-name => 'escape-hatch');
+	isa-ok $client, MCP::Client, 'connect-stdio accepts a ready-made transport';
+	is $client.client-name, 'escape-hatch', 'and passes the other options through';
+	is $client.era, 'modern', 'and what it built talks to servers';
+
+	my $other = MCP::Client::Test::FakeTransport.new;
+	$other.script('server/discover', { result => discover-result() });
+	is MCP::Client.connect-http(transport => $other, max-input-rounds => 2).max-input-rounds, 2,
+		'connect-http takes one too';
+
+	throws-like { MCP::Client.connect-stdio }, X::MCP::Client, message => /'command'/,
+		'connect-stdio with neither a command nor a transport says which it wanted';
+	throws-like { MCP::Client.connect-http }, X::MCP::Client, message => /'url'/,
+		'and connect-http says the same about a url';
+};
+
+subtest 'transport options travel with the connect constructors' => {
+	plan 5;
+
+	# The spawned child ignores EOF on stdin, so close() must escalate to the
+	# kill; a short kill-grace reaching the transport is what keeps this subtest
+	# fast, and the construction not throwing is what proves the options were
+	# peeled off before MCP::Client.new's unknown-option guard saw them.
+	my $client = MCP::Client.connect-stdio(
+		command      => $*EXECUTABLE.absolute,
+		args         => ['-e', 'sleep 600'],
+		kill-grace   => 0.5,
+		stderr-lines => 5,
+		on-stderr    => -> Str:D $ { },
+		client-name  => 'peeled',
+	);
+	isa-ok $client, MCP::Client,
+		'connect-stdio accepts transport options alongside client options';
+	is $client.client-name, 'peeled', 'and the client options still land';
+	lives-ok { $client.close }, 'close reaps the child through the short grace';
+
+	my $wire = MCP::Client::Test::FakeTransport.new;
+	throws-like
+		{ MCP::Client.connect-stdio(transport => $wire, kill-grace => 2) },
+		X::MCP::Client, message => /'kill-grace'/,
+		'a ready-made transport refuses stranded stdio options by name';
+	throws-like
+		{ MCP::Client.connect-http(transport => $wire, persistent => True) },
+		X::MCP::Client, message => /'persistent'/,
+		'and stranded HTTP options are refused the same way';
+};
+
+subtest 'results are cached exactly as far as the server allows' => {
+	plan 8;
+
+	my $wire = MCP::Client::Test::FakeTransport.new;
+	$wire.script('server/discover', { result => discover-result() });
+	$wire.script('tools/list',
+		{ result => { tools => [{ name => 'a' },], ttlMs => 60_000, cacheScope => 'public' } },
+		{ result => { tools => [{ name => 'b' },], ttlMs => 60_000, cacheScope => 'public' } },
+	);
+	my $client = MCP::Client.new(transport => $wire);
+
+	is $client.list-tools[0]<name>, 'a', 'the first call fetches';
+	is $client.list-tools[0]<name>, 'a', 'the second is served from the cache';
+	is $wire.requests-for('tools/list').elems, 1, 'so only one request went out';
+	is $client.list-tools(:refresh)[0]<name>, 'b', ':refresh goes back to the server';
+	is $wire.requests-for('tools/list').elems, 2, 'which is a second request';
+
+	# No ttlMs is not an oversight: it is a server declining to promise that its
+	# answer will still be true in a moment.
+	my $unpromised = MCP::Client::Test::FakeTransport.new;
+	$unpromised.script('server/discover', { result => discover-result() });
+	$unpromised.script('resources/list',
+		{ result => { resources => [] } }, { result => { resources => [] } });
+	my $strict = MCP::Client.new(transport => $unpromised);
+	$strict.list-resources;
+	$strict.list-resources;
+	is $unpromised.requests-for('resources/list').elems, 2,
+		'a result with no ttlMs is fetched again every time';
+
+	# The legacy era has no cache metadata at all, so nothing legitimises reuse.
+	my $old = legacy-wire({ error => { code => METHOD_NOT_FOUND, message => 'no' } });
+	$old.script('tools/list',
+		{ result => { tools => [], ttlMs => 60_000, cacheScope => 'public' } },
+		{ result => { tools => [], ttlMs => 60_000, cacheScope => 'public' } },
+	);
+	my $legacy = MCP::Client.new(transport => $old);
+	$legacy.list-tools;
+	$legacy.list-tools;
+	is $old.requests-for('tools/list').elems, 2,
+		'a legacy server\'s answers are never cached, ttlMs or no ttlMs';
+
+	# Closing drops the cache: the next connection has made none of the same
+	# promises, even to the same server.
+	$client.close;
+	is $client.cache.elems, 0, 'close empties the cache';
+};
+
+subtest 'ping answers a Bool, because a modern server may not have one' => {
+	plan 3;
+
+	my $wire = MCP::Client::Test::FakeTransport.new;
+	$wire.script('server/discover', { result => discover-result() });
+	$wire.script('ping',
+		{ result => {} },
+		{ error => { code => METHOD_NOT_FOUND, message => 'Method not found: ping' } },
+		{ error => { code => INTERNAL_ERROR, message => 'everything is on fire' } },
+	);
+	my $client = MCP::Client.new(transport => $wire);
+
+	ok $client.ping, 'a server that answers is up';
+	# 2026-07-28 removed ping outright, so "no such method" is a healthy answer
+	# from a strictly modern server, not a failure worth throwing over.
+	nok $client.ping, 'a server that does not implement ping is not an error';
+	throws-like { $client.ping }, X::MCP::Client::Protocol,
+		'but any other error still is';
+};

@@ -1,0 +1,303 @@
+use Test;
+use lib 'lib', 't/lib';
+use MCP::Server;
+use MCP::Server::Protocol;
+use MCP::Client;
+use MCP::Client::Exceptions;
+use MCP::Client::Protocol;
+use MCP::Client::Test::InProcessTransport;
+use MCP::Client::Test::TestKit;
+
+# The first test that puts the client in front of real server code. Everything
+# up to now has been scripted: this file is where the shapes MCP::Client assumes
+# meet the shapes MCP::Server actually produces, with no wire in between to blur
+# a mismatch into a serialisation bug.
+
+plan 10;
+
+# A fresh server, kit and client for every subtest: the client caches the era
+# and the catalog listings, so sharing one between subtests would make later
+# assertions depend on earlier ones.
+sub fixture(*%opts) {
+	my $kit = MCP::Client::Test::TestKit.new(slow-ms => 20);
+	my $server = MCP::Server.new(
+		name => 'contract-server', version => '1.2.3', instructions => 'Use the tools',
+	);
+	$server.plug($kit);
+
+	my $wire = MCP::Client::Test::InProcessTransport.new(:$server);
+	my $client = MCP::Client.new(
+		transport => $wire,
+		client-name => 'contract-test',
+		# A warning hook that records rather than prints: a test that papers over
+		# something should say so in its own output, not in the harness's.
+		on-warn => -> Str:D $m { diag "client warning: $m" },
+		|%opts,
+	);
+
+	($client, $wire, $kit);
+}
+
+subtest 'discover: what a modern server says about itself' => {
+	plan 8;
+
+	my ($client, $wire) = fixture();
+
+	is $client.era, 'modern', 'a server that answers server/discover is modern';
+	is $client.protocol-version, MODERN-PROTOCOL-VERSION, 'at the version we both speak';
+	is-deeply $client.supported-versions, (MODERN-PROTOCOL-VERSION,),
+		'and it named that version in supportedVersions';
+	is-deeply $client.capabilities.keys.sort.List, <prompts resources tools>.List,
+		'the capabilities cover every catalog the kit registered something in';
+	is $client.instructions, 'Use the tools', 'the instructions come through';
+	is-deeply $client.server-info, { name => 'contract-server', version => '1.2.3' },
+		'and serverInfo out of the result _meta';
+
+	is-deeply $wire.sent-methods, ('server/discover',),
+		'the probe is the only traffic the era machine needs';
+	is $wire.notifications.elems, 0,
+		'a modern server is never sent notifications/initialized';
+};
+
+subtest 'the catalogs, in the order the server sorts them into' => {
+	plan 9;
+
+	my ($client, $wire) = fixture();
+
+	my @tools = $client.list-tools;
+	is-deeply @tools.map({ $_<name> }).List, <dying echo noisy slow>.List,
+		'tools come back sorted by name, not in hash order';
+	my %echo = @tools.first({ $_<name> eq 'echo' });
+	is %echo<description>, 'Return the text it was given', 'each tool carries its description';
+	is %echo<inputSchema><type>, 'object', 'and a JSON Schema for its arguments';
+	is-deeply %echo<inputSchema><required>.List, ('text',),
+		'with the required arguments named';
+
+	my @resources = $client.list-resources;
+	is-deeply @resources.map({ $_<uri> }).List, ('test://cached', 'test://volatile'),
+		'resources are sorted by URI';
+	is @resources.first({ $_<uri> eq 'test://cached' })<mimeType>, 'text/plain',
+		'and carry their mime type';
+
+	my @prompts = $client.list-prompts;
+	is-deeply @prompts.map({ $_<name> }).List, ('greeting',), 'the prompt catalog';
+	is-deeply @prompts[0]<arguments>[0]<name>, 'name', 'with its declared arguments';
+
+	is-deeply $wire.sent-methods.grep({ $_ ne 'server/discover' }).List,
+		<tools/list resources/list prompts/list>.List,
+		'one request per catalog, and no re-probing between them';
+};
+
+subtest 'calling a tool' => {
+	plan 6;
+
+	my ($client, $wire, $kit) = fixture();
+
+	my %echoed = $client.call-tool('echo', { text => 'hello there' });
+	is-deeply %echoed<content>.List, ({ type => 'text', text => 'hello there' },).List,
+		'a tool result is a list of content blocks';
+	nok %echoed<isError>:exists, 'and says nothing about errors when there were none';
+	is $kit.count-of('echo'), 1, 'the handler ran exactly once';
+
+	# A tool that fails is a *result*, not an exception: the text is what an LLM
+	# needs to read in order to try something else.
+	my %failed;
+	lives-ok { %failed = $client.call-tool('dying', { reason => 'the well ran dry' }) },
+		'a tool that throws does not throw at the caller';
+	ok %failed<isError>, 'it comes back flagged as an error';
+	is %failed<content>[0]<text>, 'the well ran dry', 'carrying what the tool said';
+};
+
+subtest 'results carry nothing but the result' => {
+	plan 7;
+
+	# The user-facing shape, pinned: MCP::Client strips the protocol envelope
+	# (resultType, _meta, ttlMs, cacheScope, requestState, inputRequests) off the
+	# three methods that return a result rather than a catalog, because by the
+	# time the caller sees it the era machine, the cache and the round-trip loop
+	# have all already acted on it.
+	my ($client) = fixture();
+
+	is-deeply $client.call-tool('echo', { text => 'x' }).keys.sort.List, ('content',),
+		'a tool result is exactly { content }';
+	is-deeply $client.call-tool('dying', {}).keys.sort.List, ('content', 'isError'),
+		'or exactly { content, isError } when the tool failed';
+	is-deeply $client.read-resource('test://volatile').keys.sort.List, ('contents',),
+		'a resource read is exactly { contents } -- ttlMs and cacheScope are the cache\'s';
+	is-deeply $client.get-prompt('greeting', { name => 'Ada' }).keys.sort.List, ('messages',),
+		'a prompt is exactly { messages }';
+
+	my %prompt = $client.get-prompt('greeting', { name => 'Ada' });
+	is %prompt<messages>[0]<role>, 'user', 'whose messages have a role';
+	is %prompt<messages>[0]<content><text>, 'Hello, Ada!', 'and rendered content';
+
+	# The one place the envelope is still visible on purpose: discover is the
+	# era machine's own document, not a typed result.
+	ok $client.discover<_meta>{META-SERVER-INFO}:exists,
+		'the discovery document keeps its _meta, which is where serverInfo lives';
+};
+
+subtest 'ttlMs decides what may be read from the cache' => {
+	plan 8;
+
+	my ($client, $wire, $kit) = fixture();
+
+	my %first = $client.read-resource('test://cached');
+	my %second = $client.read-resource('test://cached');
+	is %second<contents>[0]<text>, 'cached body', 'the second read answers with the same body';
+	is $wire.count-for('resources/read'), 1, 'and never reached the transport';
+	is $kit.count-of('read:cached'), 1, 'let alone the handler';
+
+	$client.read-resource('test://cached', :refresh);
+	is $wire.count-for('resources/read'), 2, ':refresh goes back to the server';
+	is $kit.count-of('read:cached'), 2, 'and the handler runs again';
+
+	# A resource with no ttlMs is a server declining to promise anything, and the
+	# client believes it: every read is a read.
+	$client.read-resource('test://volatile');
+	$client.read-resource('test://volatile');
+	is $kit.count-of('read:volatile'), 2, 'an uncacheable resource is read every time';
+
+	# The catalogs carry the server-wide discovery TTL, so they cache too.
+	$client.list-tools;
+	$client.list-tools;
+	is $wire.count-for('tools/list'), 1, 'a catalog listing is cached as far as ttlMs allows';
+
+	$client.close;
+	is $client.cache.elems, 0, 'and closing the connection drops the lot';
+};
+
+subtest 'log notifications are opt-in, per request' => {
+	plan 7;
+
+	my @logged;
+	my @tapped;
+	my ($client, $wire, $kit) = fixture(
+		log-level => 'info',
+		on-log => -> %params { @logged.push(%params) },
+	);
+	$client.notifications.tap(-> %note { @tapped.push(%note) });
+
+	$client.call-tool('noisy', { text => 'working on it' });
+	is @logged.elems, 1, 'a client that asked for logs gets them';
+	is-deeply @logged[0], { level => 'info', logger => 'test-kit', data => 'working on it' },
+		'with the notification params verbatim';
+	is @tapped.elems, 1, 'and the same notification reaches the Supply';
+	is @tapped[0]<method>, 'notifications/message', 'tagged with its method';
+
+	# Below the threshold the client asked for: the server filters at source, so
+	# nothing crosses the wire at all.
+	$client.call-tool('noisy', { level => 'debug', text => 'chatter' });
+	is @logged.elems, 1, 'a message below the requested level is never sent';
+
+	# 2026-07-28 removed logging/setLevel: a request that carries no _meta
+	# logLevel MUST NOT be logged for, so an on-log hook without a log-level
+	# never fires however loud the tool is.
+	my @quiet;
+	my ($silent, $, $quiet-kit) = fixture(on-log => -> %params { @quiet.push(%params) });
+	$silent.call-tool('noisy', { level => 'error', text => 'nobody asked' });
+	is $quiet-kit.count-of('noisy'), 1, 'the tool ran';
+	is @quiet.elems, 0, 'and logged nothing, because the request never opted in';
+};
+
+subtest 'the error codes a modern server answers with' => {
+	plan 8;
+
+	my ($client, $wire) = fixture();
+
+	# -32602 INVALID_PARAMS is the modern code for "no such thing", on all three
+	# catalogs: 2026-07-28 folded the legacy -32002 resource-not-found onto it.
+	for (
+		{ $client.call-tool('nope', {}) }                 => 'an unknown tool',
+		{ $client.read-resource('mem://nope') }           => 'an unknown resource',
+		{ $client.get-prompt('nope', {}) }                => 'an unknown prompt',
+	) -> $case {
+		my $thrown;
+		{
+			CATCH { default { $thrown = $_ } }
+			$case.key.();
+		}
+		isa-ok $thrown, X::MCP::Client::Protocol, $case.value ~ ' is a protocol error';
+		is $thrown.code, INVALID_PARAMS, $case.value ~ ' answers -32602';
+	}
+
+	# ping is one of the three methods the modern era removed, so -32601 here is
+	# a healthy answer rather than a failure -- which is why ping returns a Bool.
+	nok $client.ping, 'ping on a modern server is answered "no such method"';
+
+	my $raw = await-quietly($wire, build-request(
+		9_001, 'ping', {}, era => 'modern', protocol-version => MODERN-PROTOCOL-VERSION,
+	));
+	is $raw.code, METHOD_NOT_FOUND, 'and the code underneath that Bool is -32601';
+};
+
+subtest 'a legacy request through the in-process seam fails cleanly' => {
+	plan 4;
+
+	# handle-modern-request *forces* the modern era -- it is the seam a
+	# request/response transport uses, and those are modern-only -- so this
+	# transport cannot serve a legacy client. It fails as a modern server fails,
+	# with a typed error and no hanging, which is exactly what a client pushed
+	# down the legacy path needs in order to give up rather than wait.
+	my ($client, $wire) = fixture();
+
+	my $handshake = await-quietly($wire, build-request(
+		1, 'initialize',
+		{ protocolVersion => LEGACY-PROTOCOL-VERSION, capabilities => {}, clientInfo => {} },
+		era => 'legacy',
+	));
+	isa-ok $handshake, X::MCP::Client::Protocol, 'initialize is refused';
+	is $handshake.code, METHOD_NOT_FOUND,
+		'with -32601: the modern era removed the handshake outright';
+
+	my $listing = await-quietly($wire, build-request(2, 'tools/list', {}, era => 'legacy'));
+	isa-ok $listing, X::MCP::Client::Protocol, 'and an unstamped request is refused too';
+	is $listing.code, UNSUPPORTED_PROTOCOL_VERSION,
+		'with -32022, because a request with no _meta names no version';
+};
+
+subtest 'several calls in flight at once' => {
+	plan 4;
+
+	my ($client, $wire, $kit) = fixture();
+	$client.era;   # probe once, up front, so the burst below races nothing
+
+	my @answers = await (
+		$client.call-tool-async('echo', { text => 'one' }),
+		$client.call-tool-async('slow', { ms => 30 }),
+		$client.call-tool-async('echo', { text => 'two' }),
+		$client.call-tool-async('dying', {}),
+	);
+
+	is @answers.elems, 4, 'every call came back';
+	is @answers[0]<content>[0]<text>, 'one', 'and each with its own answer';
+	is @answers[2]<content>[0]<text>, 'two', 'correlated by id, not by arrival order';
+	ok @answers[3]<isError>, 'including the one that failed';
+};
+
+subtest 'closing' => {
+	plan 4;
+
+	my ($client, $wire) = fixture();
+	$client.era;
+
+	ok $client.alive, 'alive while connected';
+	$client.close;
+	nok $client.alive, 'not afterwards';
+	is $wire.closes, 1, 'the transport was closed exactly once';
+	throws-like { $client.list-tools }, X::MCP::Client::TransportClosed,
+		'and a later call fails rather than reaching a server nobody is watching';
+};
+
+# Send one raw message through a transport and hand back whatever it failed
+# with. Used for the requests MCP::Client's typed API cannot express, which is
+# the whole point of them: nothing in the typed API sends a legacy message to a
+# modern-only seam.
+sub await-quietly($wire, %msg) {
+	my $thrown;
+	{
+		CATCH { default { $thrown = $_ } }
+		await $wire.request(%msg, timeout => 10);
+	}
+	$thrown;
+}

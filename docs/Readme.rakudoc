@@ -258,6 +258,7 @@ on-elicit           | (unset)            | Serve elicitation/create; declares th
 on-sample           | (unset)            | Serve sampling/createMessage; declares the capability
 on-list-roots       | (unset)            | Serve roots/list; declares the capability
 on-log              | (unset)            | Called with the params of each notifications/message
+on-progress         | (unset)            | Called as a bridge tool call reports progress; asks for it too
 on-warn             | note to $*ERR      | One-line diagnostics; shared with the transport
 log-level           | (unset)            | Ask a modern server for logs at this severity
 client-capabilities | derived from hooks | Override the derivation
@@ -448,6 +449,43 @@ C<notifications/message> for a request that did not carry one — so an
 C<on-log> hook without a C<log-level> will never fire. On a legacy server
 the level is a session setting, sent with C<logging/setLevel>, which this
 client leaves to the caller.
+
+=head3 Progress
+
+Progress is opt-in the same way, from this end: a request carries a
+C<progressToken> when the caller wants to be kept posted, and a server
+must not report on one that did not. C<:&on-progress> is both halves of
+that for the LLM bridge — wiring it is what attaches a token to every
+tool call the bridge runs, and it is where the reports come back:
+
+=begin code :lang<raku>
+my $mcp = MCP::Client.connect-stdio(
+    command     => 'server',
+    on-progress => -> %p {
+        $ui.progress(%p<tool-call-id>, %p<progress>, %p<total>, %p<message>);
+    },
+);
+=end code
+
+The payload is C<< { tool-call-id, progress, total?, message? } >>.
+C<tool-call-id> is the id of the call the model made — the join key back
+to the tool card it belongs on — and the two optional members are there
+only when the server sent them. The token itself is minted per call
+rather than being the call id, which a retried call would reuse, and it
+is forgotten the moment the call answers: a report that arrives late, or
+one quoting a token this client did not mint, is dropped rather than
+attributed to the wrong tool.
+
+Like C<on-log>, the hook fires B<on the client's reader thread>, ahead of
+the answer it belongs to. Treat it as a leaf — hand the payload to a
+queue or a store and return — because work done there delays every
+message behind it on the connection, and calling back into the client
+from it deadlocks on the request in flight.
+
+Outside the bridge, C<call-tool> takes a C<:$progress-token> of your own
+and the notifications arrive on C<notifications> like any other. Both
+eras spell the token the same way, so a legacy server reports progress
+too.
 
 =head3 Liveness and shutdown
 
@@ -657,6 +695,12 @@ the reason as its C<content>. A model that can read what went wrong can
 try something else; an exception thrown into the middle of a tool round
 cannot be recovered from at all.
 
+The calls also run B<inside the method>, not when the caller first reads
+the answers: what comes back is a real C<List>, so a batch that has
+returned is a batch that has already happened. Tools have side effects,
+and a lazily-reified batch would run them on whatever thread eventually
+looked at the result — or, for a run that was cancelled, never.
+
 =head3 The Registry
 
 An agent with more than one tool source has two problems: two servers may
@@ -777,6 +821,23 @@ my $mcp = MCP::Client.connect-stdio(
 $policy = MCP::Client::Policy.new(:provider($mcp), :&on-ask, roots => { fs => '/srv' });
 
 $policy.grants;   # plain data: persist it, hand it back next session as `grants`
+=end code
+
+C<&on-grant> is told when that list changes: it is handed the whole set
+(already copied) the moment an C<always-> answer adds one, so a host does
+not have to poll C<.grants> or infer it from an answer it watched go
+past. It fires while the call that provoked the grant is still being
+decided, which is what lets an engine mirror the grant into a session in
+time for the next call in the same batch — and, for the same reason, it
+is as much of a leaf as C<&on-ask> is. A hook that throws is swallowed:
+the grant is already made, and a failed listener is no reason to refuse
+the call.
+
+=begin code :lang<raku>
+my $policy = MCP::Client::Policy.new(
+    :$provider, :&on-ask,
+    on-grant => -> @grants { spurt 'grants.json', to-json(@grants) },
+);
 =end code
 
 Wire C<on-elicit> B<only> when there is somebody to ask — setting it is
@@ -944,13 +1005,13 @@ prove6 -I. t                                   # against installed dependencies,
 prove6 -Ilib -It/lib -I../MCP-Server/lib t/    # against a sibling MCP-Server checkout
 =end code
 
-Fifteen files, from the protocol units up: a scripted transport double
+Sixteen files, from the protocol units up: a scripted transport double
 for the era machine and the round-trip loop, an in-process transport that
 puts the client in front of a live C<MCP::Server> with no wire between
 them, a real child process for the stdio transport (including one that
 kills itself mid-request), and a live HTTP server on a random port.
 
-Three of them are cross-checks rather than unit tests. C<t/13> is a
+Four of them are cross-checks rather than unit tests. C<t/13> is a
 golden-parity test: the same toolkit behind a local C<MCP::Server> and
 behind an C<MCP::Client> must produce identical bridge output, which is
 what makes "interchangeable" a claim rather than a hope. C<t/14> puts a
@@ -959,7 +1020,18 @@ through C<elicit-hook>, and re-runs C<t/13>'s argument shapes through an
 allow-everything policy to pin the two argument parsers together.
 C<t/15> runs the multi round-trip loop against an C<MCP::Server> that
 really does elicit — the client half of the contract, checked against the
-server half rather than against a script.
+server half rather than against a script. C<t/16> does the same for
+progress, against a server whose tools really do report it, and pins the
+other half of "when does a tool call happen": that a batch has finished
+running by the time C<execute-tool-calls> returns.
+
+The fixtures under C<t/lib> are reusable, and are meant to be: C<t/lib> on
+the include path gives you C<MCP::Client::Test::FakeTransport> (scripted
+answers, and notifications you can push at a client whenever you like),
+C<MCP::Client::Test::InProcessTransport> (a live C<MCP::Server>, no wire),
+C<MCP::Client::Test::TestKit> (one tool of every shape) and
+C<MCP::Client::Test::ProgressKit> (tools that report progress, for testing
+anything built on the C<on-progress> hook).
 
 The example is runnable too, and needs no network and no API key:
 

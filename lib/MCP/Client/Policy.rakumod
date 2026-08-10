@@ -201,6 +201,22 @@ my $policy = MCP::Client::Policy.new(
 );
 =end code
 
+C<&on-grant> says B<when> to do that, rather than leaving a host to poll
+C<.grants> or to guess that an C<always-> answer it saw go past has landed. It
+is handed the whole list, already copied, the moment the grant is made — before
+the call that provoked it has even been decided, so an engine that mirrors
+grants into a session sees them in time for the next call in the same batch:
+
+=begin code :lang<raku>
+my $policy = MCP::Client::Policy.new(
+	:$provider, :&on-ask,
+	on-grant => -> @grants { $session.remember-grants(@grants) },
+);
+=end code
+
+Like C<&on-ask>, it is a leaf: it runs on the thread deciding the call, so
+collect what you need and return.
+
 Stacked, with a rule set at each layer — the outer policy speaks the model's
 names, the inner one speaks the server's:
 
@@ -230,10 +246,31 @@ unit class MCP::Client::Policy;
 # Everything .new accepts. Named rather than inferred so that a typo -- `rule`
 # for `rules`, `root` for `roots` -- is an error at construction instead of a
 # policy that silently has no rules and therefore asks about everything.
-my constant OPTIONS = <provider rules grants roots path-params on-ask filter-tools ask-lock>.Set;
+my constant OPTIONS =
+	<provider rules grants roots path-params on-ask on-grant filter-tools ask-lock>.Set;
 
 has $.provider is required;
 has &.on-ask;
+
+#| Called with the whole grant list, as C<.grants> renders it, every time an
+#| C<always-allow> or C<always-deny> answer adds one — so a host that persists
+#| grants, or mirrors them into a session log, hears about it the moment the
+#| human says "always" rather than after the batch:
+#|
+#|   on-grant => -> @grants { spurt 'grants.json', to-json(@grants) },
+#|
+#| The list is a fresh plain-data deep copy, safe to keep and to edit. It is
+#| the grants B<including> the new one, in the order they were made, because a
+#| consumer almost always wants the whole set rather than a diff to apply.
+#|
+#| Called after the policy's own lock is released and outside C<&.on-ask>'s, but
+#| still on the thread that is deciding the call — so it is a B<leaf>, exactly as
+#| C<&.on-ask> is. Do not re-enter the policy from it (dispatching a tool call,
+#| asking another question): the call it belongs to has not been decided yet, and
+#| the batch behind it is waiting. A hook that throws is swallowed — a grant that
+#| has been made cannot be un-made by a listener that fell over.
+has &.on-grant;
+
 has Bool:D $.filter-tools = True;
 
 #| The lock every question is asked under. One human, one question at a time —
@@ -249,7 +286,7 @@ has      %!path-params;
 
 submethod TWEAK(
 	:$provider, :$rules, :$grants, :$roots, :$path-params,
-	:&on-ask, :$filter-tools, :$ask-lock,
+	:&on-ask, :&on-grant, :$filter-tools, :$ask-lock,
 	*%unknown
 ) {
 	my @unknown = %unknown.keys.grep({ !OPTIONS{$_} }).sort;
@@ -576,7 +613,23 @@ method !remember($answer, %request, Str:D $decision --> Hash:D) {
 
 	return %( ok => False, :$why ) if $why.defined;
 
-	$!lock.protect: { @!grants.push: %rule };
+	my @snapshot;
+	$!lock.protect: {
+		@!grants.push: %rule;
+		# Copied under the lock so the snapshot is of the list as it stood when
+		# this grant landed, whatever another thread's batch does next.
+		@snapshot = @!grants.map({ plain-copy($_) });
+	}
+
+	# Outside the lock, and after it: the hook is somebody else's code, and one
+	# that took a while (writing grants.json, say) would otherwise hold every
+	# other batch's decisions up behind it. A hook that throws changes nothing --
+	# the grant is already made, and refusing the call over a failed listener
+	# would be a worse answer than a call that went through unannounced.
+	if &!on-grant.defined {
+		CATCH { default { } }
+		&!on-grant(@snapshot.List);
+	}
 
 	%( ok => True, rule => %rule );
 }

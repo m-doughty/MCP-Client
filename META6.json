@@ -6,8 +6,8 @@
   "build-depends": [
   ],
   "depends": [
-    "MCP::Server:auth<zef:apogee>",
-    "JSON::Fast:ver<0.19>:auth<cpan:TIMOTIMO>",
+    "MCP::Server:ver<0.5.0+>:auth<zef:apogee>",
+    "JSON::Fast:ver<0.19+>:auth<cpan:TIMOTIMO>",
     "Cro::HTTP:ver<0.8.11+>:auth<zef:cro>:api<0>",
     "MIME::Base64:ver<1.2.5+>:auth<zef:raku-community-modules>"
   ],
@@ -42,5 +42,5 @@
   ],
   "test-depends": [
   ],
-  "version": "0.2.0"
+  "version": "0.3.0"
 }

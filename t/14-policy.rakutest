@@ -20,7 +20,7 @@ use MCP::Client::Test::TestKit;
 #
 #   prove6 -Ilib -I../MCP-Server/lib t/14-policy.rakutest
 
-plan 12;
+plan 13;
 
 constant TIMEOUT = 30;
 
@@ -460,6 +460,86 @@ subtest 'grants: what "always" remembers, and what it cannot override' => {
 	my %out = $bad.execute-tool-calls([call('1', 'write'),])[0];
 	ok %out<is_error> && !$bad.grants.elems,
 		'and a rule that will not validate is refused rather than remembered';
+};
+
+subtest 'on-grant: told the moment a grant is made, and told everything' => {
+	plan 10;
+
+	# A host that persists grants, or mirrors them into a session, needs to know
+	# when the list changed. Polling .grants after a batch is too late for the
+	# call that provoked it and too coarse for the ones after it, so the hook
+	# fires while the answer is still being acted on.
+	my @snapshots;
+	my @asked;
+	my $fs = provider();
+	my $policy = policy-over($fs,
+		rules => [{ tool => 'write', decision => 'ask' },],
+		roots => { '' => '/srv' },
+		on-ask => -> %request {
+			@asked.push(%request<tool>);
+			{ action => 'always-allow' };
+		},
+		on-grant => -> @grants { @snapshots.push(@grants) },
+	);
+
+	my @out = $policy.execute-tool-calls([
+		call('1', 'write', '{"path":"scratch/a"}'),
+		call('2', 'write', '{"path":"scratch/b"}'),
+	]);
+
+	is-deeply @out.map({ $_<is_error> }).List, (False, False), 'both calls went through';
+	is @asked.elems, 1, 'on one question, as before';
+	is @snapshots.elems, 1, 'and the grant hook fired once, for the one grant';
+	is-deeply @snapshots[0].List,
+		({ tool => 'write', decision => 'allow', under => '/srv/scratch' },),
+		'handed the whole list, with the new rule on it';
+	is-deeply @snapshots[0].List, $policy.grants.List,
+		'which is the same list .grants renders';
+
+	# Plain data, and nobody else's: a host that edits what it was handed must
+	# not be editing the policy's own state.
+	@snapshots[0][0]<tool> = 'vandalised';
+	is $policy.grants[0]<tool>, 'write', 'the snapshot is a copy, not a window';
+
+	# An answer that decides one call and remembers nothing is not a grant.
+	my @once;
+	my $transient = policy-over(provider(),
+		rules => [{ tool => 'write', decision => 'ask' },],
+		on-ask => -> %request { { action => 'allow-once' } },
+		on-grant => -> @grants { @once.push(@grants) },
+	);
+	$transient.execute-tool-calls([call('1', 'write', '{"path":"x"}'),]);
+	is @once.elems, 0, 'allow-once leaves no grant, so the hook stays quiet';
+
+	# Neither is one the engine refused to remember.
+	my @bad;
+	my $unusable = policy-over(provider(),
+		on-ask => -> %request {
+			{ action => 'always-allow', rule => { tool => 'w*', under => '/a/../b' } };
+		},
+		on-grant => -> @grants { @bad.push(@grants) },
+	);
+	ok $unusable.execute-tool-calls([call('1', 'write'),])[0]<is_error>
+		&& !@bad.elems,
+		'a rule that will not validate is neither remembered nor announced';
+
+	# A listener that falls over cannot un-make a grant, and must not turn a
+	# decided call into a refusal.
+	my @after;
+	my $brittle = policy-over(provider(),
+		rules => [{ tool => 'write', decision => 'ask' },],
+		on-ask => -> %request { { action => 'always-allow' } },
+		on-grant => -> @grants { die 'the grant listener fell over' },
+	);
+	my @survived;
+	lives-ok {
+		@survived = $brittle.execute-tool-calls([
+			call('1', 'write', '{"path":"x"}'),
+			call('2', 'write', '{"path":"y"}'),
+		]);
+	}, 'a hook that throws does not throw at the caller';
+	ok !@survived[0]<is_error> && !@survived[1]<is_error> && $brittle.grants.elems == 1,
+		'the call it interrupted still went through, and the grant still stands';
 };
 
 subtest 'headless: nobody to ask is an answer, not a hang' => {

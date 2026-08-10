@@ -1,0 +1,421 @@
+use Test;
+use lib 'lib', 't/lib';
+use MCP::Server;
+use MCP::Server::Protocol;
+use MCP::Client;
+use MCP::Client::Protocol;
+use MCP::Client::Test::FakeTransport;
+use MCP::Client::Test::InProcessTransport;
+use MCP::Client::Test::ProgressKit;
+use MCP::Client::Test::TestKit;
+
+# Two things live here, and they are neighbours for a reason: both are about
+# *when* a tool call happens.
+#
+# The first is that a batch of tool calls runs inside execute-tool-calls and not
+# at whatever point the caller happens to read the answers. A lazy result is a
+# side effect with no schedule -- it runs on somebody else's thread, or after the
+# run that asked for it was cancelled, or never.
+#
+# The second is progress: a long call saying how it is getting on, correlated
+# back to the call the model made. Both halves are pinned against a real
+# MCP::Server through the in-process transport, and the awkward wire shapes (a
+# report for a token nobody minted, a report with no progress in it, a hook that
+# throws) against the scripted one.
+
+plan 9;
+
+sub modern-wire(--> MCP::Client::Test::FakeTransport:D) {
+	my $wire = MCP::Client::Test::FakeTransport.new;
+	$wire.script('server/discover', { result => {
+		supportedVersions => [MODERN-PROTOCOL-VERSION],
+		capabilities      => { tools => {} },
+	} });
+	$wire;
+}
+
+#| A live server with the progress toolkit on it, and a client in front of it.
+#| Notifications are delivered on the transport's dispatch thread, so the
+#| collector is locked rather than trusted.
+#|
+#| C<:$no-hook> builds the client with no C<on-progress> at all, which is the
+#| "nobody is listening" case; C<:&on-progress> substitutes a hook of the
+#| caller's, for the one that misbehaves.
+sub progress-pair(Bool:D :$no-hook = False, :&on-progress, *%opts) {
+	my $kit = MCP::Client::Test::ProgressKit.new;
+	my $server = MCP::Server.new(name => 'progress-server', version => '1.0.0');
+	$server.plug($kit);
+
+	my $lock = Lock.new;
+	my @seen;
+	my @warnings;
+
+	my %client-opts = %opts;
+	unless $no-hook {
+		%client-opts<on-progress> = &on-progress
+			// -> %payload { $lock.protect: { @seen.push(%payload) } };
+	}
+
+	my $wire = MCP::Client::Test::InProcessTransport.new(:$server);
+	my $client = MCP::Client.new(
+		transport => $wire,
+		on-warn => -> Str:D $m { $lock.protect: { @warnings.push($m) } },
+		|%client-opts,
+	);
+
+	my &seen = -> { $lock.protect: { @seen.map({ $_.Hash }).List } };
+	my &warnings = -> { $lock.protect: { @warnings.List } };
+
+	($client, $wire, $kit, &seen, &warnings);
+}
+
+sub call(Str:D $id, Str:D $name, %arguments = {}) {
+	%( id => $id, function => %( name => $name, arguments => %arguments ) );
+}
+
+#| The progress token on one outbound request, or an undefined value when it
+#| carried none.
+sub token-of(%msg) {
+	my %params = (%msg<params> // {}).Hash;
+	my %meta = %params<_meta> ~~ Associative ?? %params<_meta>.Hash !! {};
+	%meta{META-PROGRESS-TOKEN};
+}
+
+subtest 'the calls run inside execute-tool-calls, not when the caller looks' => {
+	plan 5;
+
+	my $kit = MCP::Client::Test::TestKit.new;
+	my $server = MCP::Server.new(name => 'eager-server', version => '1.0.0');
+	$server.plug($kit);
+	my $client = MCP::Client.new(
+		transport => MCP::Client::Test::InProcessTransport.new(:$server),
+		on-warn => -> Str:D $m { diag "client warning: $m" },
+	);
+
+	# Bound, not assigned into an array: assigning to @results would reify the
+	# sequence itself and hide the very thing this subtest is about.
+	my $results = $client.execute-tool-calls([
+		call('1', 'echo', %( text => 'one' )),
+		call('2', 'echo', %( text => 'two' )),
+	]);
+
+	is $kit.count-of('echo'), 2,
+		'both tools had run before anything read the result';
+	nok $results.is-lazy, 'and what came back is a real List, not a lazy sequence';
+
+	is $results.elems, 2, 'with one answer per call';
+	is-deeply $results.map({ $_<content> }).List, ('one', 'two'),
+		'in the order the calls were made';
+	is $kit.count-of('echo'), 2, 'and reading them ran nothing a second time';
+
+	$client.close;
+};
+
+subtest 'progress reaches the hook, tagged with the call that caused it' => {
+	plan 7;
+
+	my ($client, $wire, $kit, &seen) = progress-pair();
+
+	my @results = $client.execute-tool-calls([
+		call('call_abc', 'march', %( steps => 3 )),
+	]);
+
+	my @progress = seen();
+	is @progress.elems, 3, 'one payload per report';
+	is-deeply @progress.map({ $_<tool-call-id> }).unique.List, ('call_abc',),
+		'each tagged with the id of the call the model made';
+	# Num, not Int: progress is a number in the protocol and a UI dividing it by
+	# the total should not have to wonder which it got.
+	is-deeply @progress.map({ $_<progress> }).List, (1e0, 2e0, 3e0), 'counting up';
+	is-deeply @progress.map({ $_<total> }).unique.List, (3e0,), 'carrying the total';
+	is @progress[1]<message>, 'step 2', 'and the message the server wrote';
+	is-deeply @progress[0].keys.sort.List, <message progress tool-call-id total>.List,
+		'and nothing else: the payload is the four documented members';
+
+	is @results[0]<content>, 'step done: 3 of 3',
+		'the server saw all three go out, and the call answered as normal';
+
+	$client.close;
+};
+
+subtest 'asking for progress is what wiring the hook does' => {
+	plan 5;
+
+	# No hook: no token on the wire, so a well-behaved server does not do the
+	# work of reporting to nobody.
+	my ($quiet, $quiet-wire) = progress-pair(:no-hook);
+	my @quiet-results = $quiet.execute-tool-calls([call(q{1}, q{march}, %( steps => 3 )),]);
+
+	nok token-of($quiet-wire.requests-for('tools/call')[0]).defined,
+		'with no hook wired the request carries no progressToken';
+	is @quiet-results[0]<content>, 'step done: 0 of 3',
+		'and the server was told there was nobody to report to';
+	$quiet.close;
+
+	my ($loud, $loud-wire) = progress-pair();
+	$loud.execute-tool-calls([call(q{1}, q{march}, %( steps => 1 )),]);
+
+	my $token = token-of($loud-wire.requests-for('tools/call')[0]);
+	ok $token ~~ Str:D && $token.chars, 'with one wired, every call carries a token';
+	isnt $token, '1', 'which is not the call id -- a retried call would reuse that';
+	nok token-of($loud-wire.requests-for('tools/list')[0]).defined,
+		'and only tool calls carry one: nothing else can report progress';
+
+	$loud.close;
+};
+
+subtest 'silence and strays' => {
+	plan 4;
+
+	my ($client, $wire, $kit, &seen, &warnings) = progress-pair();
+
+	# A server that was given a token and had nothing to say is the normal case,
+	# not a fault: the hook simply never fires.
+	my @quiet = $client.execute-tool-calls([call(q{1}, q{silent}),]);
+	is @quiet[0]<content>, 'nothing to report', 'a call that reports nothing still answers';
+	is seen().elems, 0, 'and leaves the hook cold';
+
+	# A report quoting a token this client never minted is what a late report
+	# from a call that has already answered looks like. There is no operation to
+	# attribute it to, so it is dropped -- and dropped quietly, since a server
+	# racing its own answer is normal.
+	my @stray = $client.execute-tool-calls([call(q{2}, q{stray}),]);
+	is @stray[0]<content>, 'reported to nobody', 'a stray report does not disturb the call';
+	is seen().elems, 0, 'and is dropped rather than pinned on the call in flight';
+
+	$client.close;
+};
+
+subtest 'a token belongs to one call, and only while it is in flight' => {
+	plan 7;
+
+	# Scripted rather than live: this needs the token in hand, and a report
+	# pushed at the client after the call it belongs to has answered.
+	my $wire = modern-wire();
+	$wire.script('tools/list', { result => { tools => [
+		{ name => 'march', description => 'go', inputSchema => { type => 'object', properties => {} } },
+	] } });
+
+	my @tokens;
+	my &capture = -> %msg {
+		@tokens.push(token-of(%msg));
+		{ result => { content => [{ type => 'text', text => 'done' },] } };
+	};
+	$wire.script('tools/call', { respond => &capture }, { respond => &capture });
+
+	my @seen;
+	my $client = MCP::Client.new(
+		transport => $wire,
+		on-progress => -> %payload { @seen.push(%payload) },
+	);
+
+	$client.execute-tool-calls([call('a', 'march'), call('b', 'march')]);
+
+	is @tokens.elems, 2, 'two calls, two tokens';
+	ok @tokens.all ~~ Str:D, 'both real';
+	isnt @tokens[0], @tokens[1],
+		'and different: two calls of the same tool must not share a correlation id';
+
+	# Both calls have answered by now, so both registrations are gone.
+	$wire.emit-notification({
+		jsonrpc => '2.0', method => 'notifications/progress',
+		params => { progressToken => @tokens[0], progress => 9 },
+	});
+	is @seen.elems, 0, 'a report that arrives after its call has answered is dropped';
+
+	$wire.emit-notification({
+		jsonrpc => '2.0', method => 'notifications/progress',
+		params => { progressToken => 'never-minted', progress => 1 },
+	});
+	is @seen.elems, 0, 'and so is one for a token this client never minted';
+
+	# A call that never answers must give its token up too: the registration is
+	# dropped on the way out of the call however it ends, or a server that timed
+	# out and then reported would be attributed to whatever ran next.
+	$wire.script('tools/call', { respond => -> %msg {
+		@tokens.push(token-of(%msg));
+		%( timeout => 0.5 );
+	} });
+	my @timed-out = $client.execute-tool-calls([call(q{c}, q{march}),]);
+	ok @timed-out[0]<is_error>, 'a call that timed out is an error result, as ever';
+
+	$wire.emit-notification({
+		jsonrpc => '2.0', method => 'notifications/progress',
+		params => { progressToken => @tokens[2], progress => 1 },
+	});
+	is @seen.elems, 0, 'and its token is forgotten just the same';
+
+	$client.close;
+};
+
+subtest 'what the hook is handed, and what is dropped on the way' => {
+	plan 7;
+
+	# One call, held open by a responder that pushes every shape of report at the
+	# client while its token is still registered.
+	my $wire = modern-wire();
+	$wire.script('tools/list', { result => { tools => [
+		{ name => 'march', inputSchema => { type => 'object', properties => {} } },
+	] } });
+
+	my @seen;
+	my @warned;
+	my $client = MCP::Client.new(
+		transport => $wire,
+		on-progress => -> %payload { @seen.push(%payload) },
+		on-warn => -> Str:D $m { @warned.push($m) },
+	);
+
+	my @notes;
+	$client.notifications.tap: -> %note { @notes.push(%note) };
+
+	$wire.script('tools/call', { respond => -> %msg {
+		my $token = token-of(%msg);
+		my @reports = (
+			{ progressToken => $token, progress => 1, total => 4, message => 'both' },
+			{ progressToken => $token, progress => 2 },
+			{ progressToken => $token, progress => 2.5, message => 'no total' },
+			# Malformed, one way each: no progress at all, a progress that is not a
+			# number, a report with no token on it.
+			{ progressToken => $token, total => 4 },
+			{ progressToken => $token, progress => 'nearly there' },
+			{ progress => 3 },
+		);
+		# %( ) rather than { }: braces in that position are a block, and what
+		# came out of it would be a list of Pairs rather than a notification.
+		%(
+			notify => @reports.map({
+				%( jsonrpc => '2.0', method => 'notifications/progress', params => $_ )
+			}).Array,
+			result => { content => [{ type => 'text', text => 'done' },] },
+		);
+	} });
+
+	$client.execute-tool-calls([call(q{a}, q{march}),]);
+
+	is @seen.elems, 3, 'only the reports that say something reach the hook';
+	is-deeply @seen[0], %(
+		tool-call-id => 'a', progress => 1e0, total => 4e0, message => 'both',
+	), 'a full report arrives with all four members';
+	is-deeply @seen[1].keys.sort.List, ('progress', 'tool-call-id').List,
+		'an optional member the server left out is left out here too';
+	is-deeply @seen[2].keys.sort.List, ('message', 'progress', 'tool-call-id').List,
+		'each optional member travels on its own';
+	is @seen[2]<progress>, 2.5, 'and a fractional progress is not rounded away';
+
+	is @notes.grep({ $_<method> eq 'notifications/progress' }).elems, 6,
+		'every report still reaches the notifications Supply, malformed or not';
+	is @warned.elems, 0, 'and a malformed one is dropped without a diagnostic';
+
+	$client.close;
+};
+
+subtest 'a hook that throws is a hook that throws, not a broken call' => {
+	plan 4;
+
+	my ($client, $wire, $kit, $unused-seen, &warnings) = progress-pair(
+		on-progress => -> %payload {
+			die 'the progress hook fell over' if %payload<progress> == 1;
+		},
+	);
+
+	my @results;
+	lives-ok {
+		@results = $client.execute-tool-calls([call(q{1}, q{march}, %( steps => 2 )),]);
+	}, 'a hook that throws does not throw at the caller';
+
+	is @results[0]<content>, 'step done: 2 of 2', 'the call answers as if nothing happened';
+	is warnings().grep({ .contains('on-progress hook threw') }).elems, 1,
+		'the failure is reported through on-warn, once';
+	like warnings()[0], /'the progress hook fell over'/, 'saying what the hook said';
+
+	$client.close;
+};
+
+subtest 'call-tool takes a token of your own' => {
+	plan 5;
+
+	my $wire = modern-wire();
+	$wire.script('tools/call', { result => { content => [{ type => 'text', text => 'done' },] } });
+
+	my @seen;
+	my $client = MCP::Client.new(transport => $wire);
+	$client.notifications.tap: -> %note { @seen.push(%note) };
+
+	$client.call-tool('march', {}, progress-token => 'mine-1');
+	is token-of($wire.requests-for('tools/call')[0]), 'mine-1',
+		'the caller\'s token goes out on the request';
+
+	# The bridge's hook has nothing to do with it: these notifications are the
+	# caller's to read off the Supply.
+	$wire.script('tools/call', { respond => -> %msg {
+		{
+			notify => [{
+				jsonrpc => '2.0', method => 'notifications/progress',
+				params => { progressToken => token-of(%msg), progress => 1 },
+			},],
+			result => { content => [{ type => 'text', text => 'done' },] },
+		};
+	} });
+	$client.call-tool('march', {}, progress-token => 'mine-2');
+	is @seen.grep({ $_<method> eq 'notifications/progress' }).elems, 1,
+		'and its reports arrive on the notifications Supply';
+
+	$wire.script('tools/call', { result => { content => [] } });
+	$client.call-tool('march', {});
+	nok token-of($wire.requests-for('tools/call')[2]).defined,
+		'a call made without one carries no _meta token';
+
+	$wire.script('tools/call', { result => { content => [] } });
+	$client.call-tool('march', {}, progress-token => '');
+	nok token-of($wire.requests-for('tools/call')[3]).defined,
+		'and neither does an empty one: a token nobody can quote is not a token';
+
+	# The retries of a multi round-trip call are the same call, so they carry the
+	# same token -- a server that parked mid-call keeps reporting under it.
+	$wire.script('tools/call',
+		{ result => { resultType => RESULT-TYPE-INPUT-REQUIRED, requestState => 'blob' } },
+		{ result => { content => [] } },
+	);
+	$client.call-tool('march', {}, progress-token => 'mine-3');
+	is-deeply $wire.requests-for('tools/call')[4, 5].map({ token-of($_) }).List,
+		('mine-3', 'mine-3'), 'every round of a multi round-trip call quotes the same token';
+
+	$client.close;
+};
+
+subtest 'progress survives the shapes a batch can take' => {
+	plan 4;
+
+	my ($client, $wire, $kit, &seen) = progress-pair();
+
+	# Reports from several calls in one batch, interleaved with calls that report
+	# nothing and calls that fail: every payload still names its own call.
+	my @results = $client.execute-tool-calls([
+		call('one', 'march', %( steps => 2 )),
+		call('two', 'silent'),
+		call('three', 'nope'),
+		call('four', 'march', %( steps => 1 )),
+	]);
+
+	is-deeply @results.map({ $_<is_error> }).List, (False, False, True, False),
+		'the batch behaves exactly as it did before progress existed';
+
+	my @progress = seen();
+	is-deeply @progress.map({ $_<tool-call-id> }).List, <one one four>.List,
+		'and every report is attributed to the call that made it';
+	is-deeply @progress.map({ $_<progress> }).List, (1e0, 2e0, 1e0),
+		'each call counting from one on its own account';
+
+	# The call with no id at all is the degenerate case the bridge already
+	# answers against an empty id; progress follows it there rather than
+	# inventing one.
+	seen();
+	my @anonymous = $client.execute-tool-calls([
+		%( function => %( name => 'march', arguments => %( steps => 1 ) ) ),
+	]);
+	is seen().tail<tool-call-id>, '',
+		'a call with no id reports under the empty id it is answered against';
+
+	$client.close;
+};

@@ -2,6 +2,20 @@ Revision history for MCP::Client
 
 {{$NEXT}}
 
+0.3.0  2026-08-10T20:02:51+01:00
+    - execute-tool-calls is now eager: it dispatches the calls itself rather
+      than deferring them to the caller's reification of the returned Seq,
+      which could otherwise run a tool on the consumer's own thread instead
+      of MCP::Client's.
+    - Progress support: call-tool takes :progress-token, and when
+      &.on-progress is wired an automatic per-call token is generated when
+      the caller does not supply one. Inbound notifications/progress
+      notifications are routed straight to the hook.
+    - MCP::Client::Policy gains &.on-grant, fired the moment a grant is
+      remembered rather than left for a caller to poll for.
+    - Dependency pins corrected: MCP::Server ver<0.5.0+> (was 0.4.0+) and
+      JSON::Fast ver<0.19+> (was exactly 0.19).
+
 0.2.0  2026-08-09T19:47:09+01:00
     - Initial release: a client for talking to third-party MCP servers over
       stdio or Streamable HTTP, speaking both the 2025-11-25 ("legacy") and

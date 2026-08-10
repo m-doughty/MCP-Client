@@ -184,6 +184,37 @@ C<_meta> level, and a server B<MUST NOT> emit C<notifications/message> for a
 request that did not carry one — so an C<on-log> hook without a C<log-level>
 will simply never fire.
 
+=head2 Progress
+
+A long tool call can say how it is getting on. Progress is opt-in from this
+end — a request carries a C<progressToken> when the caller wants to be kept
+posted, and a server may not report on one that did not — so C<:&on-progress>
+both asks for it and receives it, for every call the LLM bridge runs:
+
+=begin code :lang<raku>
+my $mcp = MCP::Client.connect-stdio(
+	command     => 'server',
+	on-progress => -> %p {
+		$ui.progress(%p<tool-call-id>, %p<progress>, %p<total>, %p<message>);
+	},
+);
+=end code
+
+The payload is C<< { tool-call-id, progress, total?, message? } >>:
+C<tool-call-id> is the id of the call the model made, which is what ties the
+line to the tool card it belongs on, and C<total> and C<message> are there only
+when the server sent them. The bridge mints a fresh token per call — not the
+call id, which a retried call would reuse — and forgets it the moment the call
+answers, so a report that arrives late, or one quoting a token from somewhere
+else, is dropped rather than attributed to the wrong tool.
+
+B<The hook fires on the reader thread>, ahead of the answer it belongs to.
+Treat it as a leaf: push the payload somewhere and return. See C<:&on-progress>
+for the full contract.
+
+Outside the bridge, C<call-tool> takes a C<:$progress-token> of your own and
+the notifications arrive on C<notifications> like any other.
+
 =end pod
 
 use JSON::Fast;
@@ -254,6 +285,27 @@ has &.on-list-roots;
 #| sends. A shortcut for tapping C<notifications> and filtering.
 has &.on-log;
 
+#| Called as a tool call the LLM bridge is running reports progress:
+#|
+#|   { tool-call-id => 'call_abc', progress => 3e0, total => 10e0, message => 'file 3' }
+#|
+#| C<tool-call-id> is the id of the call the model made, so a UI can put the
+#| line on the right card; C<total> and C<message> are present only when the
+#| server sent them. Wiring this hook is also what B<asks> for progress: the
+#| bridge attaches a progress token to a tool call only when somebody is
+#| listening, since a server told to report progress does the work of reporting
+#| it. (C<call-tool> can be given a C<:$progress-token> of your own, in which
+#| case the notifications arrive on C<notifications> and this hook is not
+#| involved.)
+#|
+#| B<It fires on the client's reader thread>, in front of the answer to the call
+#| it belongs to, so treat it as a leaf: hand the payload to a queue or a store
+#| and return. Work done here delays every message behind it on the connection,
+#| and calling back into this client from it will deadlock on the in-flight
+#| request. A hook that throws is reported through C<:&on-warn> and does not
+#| disturb the call.
+has &.on-progress;
+
 #| Called with a one-line diagnostic when the client papers over something the
 #| caller might want to know about — an input hook that threw, a notification
 #| subscriber that died. Defaults to writing to C<$*ERR>.
@@ -277,6 +329,14 @@ has MCP::Client::Cache:D $.cache = MCP::Client::Cache.new;
 has Lock     $!lock .= new;
 has Lock     $!probe-lock .= new;
 has Int      $!next-id = 0;
+
+# progress token => the id of the tool call it was minted for, for as long as
+# that call is in flight. Its own lock: the reader thread reads this table for
+# every notifications/progress that arrives, and must not queue behind an era
+# probe or an id being minted to do it.
+has Lock     $!progress-lock .= new;
+has          %!progress-calls;
+has Int      $!next-progress = 0;
 has Bool     $!closed = False;
 has Str      $!era;
 has Str      $!negotiated-version;
@@ -733,9 +793,27 @@ method list-tools(Bool :$refresh = False, Real :$timeout --> List:D) {
 #| Multi round-trips are handled transparently: if the server needs input
 #| first, the hooks are consulted and the call is retried until it completes or
 #| the round budget runs out.
-method call-tool(Str:D $name, %arguments = {}, Real :$timeout, Promise :$cancelled --> Hash:D) {
+#|
+#| C<:$progress-token> asks the server to report progress on this call, which it
+#| does by sending C<notifications/progress> quoting the token back. The
+#| notifications arrive on C<notifications> like any other; correlating them
+#| with the call is what the token is for, and the token is yours to choose. A
+#| server is never obliged to report anything, and one that reports after the
+#| call has answered is not misbehaving either — the retries of a multi
+#| round-trip call all carry the same token.
+method call-tool(
+	Str:D $name, %arguments = {},
+	Real :$timeout, Promise :$cancelled, Str :$progress-token
+	--> Hash:D
+) {
 	self!ensure-era;
 	my %params = name => $name, arguments => %arguments.Hash;
+	# Into the parameters' own _meta rather than through a stamp of its own:
+	# build-request keeps whatever _meta the caller put there and adds the
+	# protocol keys beside it. Both eras spell progressToken the same way — it
+	# predates the 2026-07-28 namespacing — so this reaches a legacy server too.
+	%params<_meta> = %( (META-PROGRESS-TOKEN) => $progress-token )
+		if $progress-token.defined && $progress-token.chars;
 	strip-envelope(self!request-with-input('tools/call', %params, :$timeout, :$cancelled));
 }
 
@@ -875,6 +953,13 @@ method tools-for-llm(--> List) {
 #| tool that reported C<isError>, a timeout, a server that died, a multi
 #| round-trip loop that never converged — comes back as an entry with
 #| C<is_error> set and the reason in C<content>.
+#|
+#| The calls run B<here>, before this returns: the results are a real List and
+#| not a lazy sequence a caller might reify somewhere else, or after cancelling
+#| the run they belonged to, or never.
+#|
+#| With C<:&on-progress> wired, each call carries a progress token of its own
+#| and the server's reports on it reach that hook tagged with the call's id.
 method execute-tool-calls(@tool-calls --> List) {
 	# Fetched once for the whole batch: an unknown tool is answered here rather
 	# than by the server, which saves a round trip and — because the server's
@@ -882,7 +967,17 @@ method execute-tool-calls(@tool-calls --> List) {
 	# could not fetch (closed connection, dead server) means no name can be
 	# ruled out, so the call goes out and fails on its own merits.
 	my $known = self!known-tool-names;
-	@tool-calls.map(-> $call { self!execute-one($call, $known) }).list;
+
+	# Assigned to an array rather than returned as a `.map(...).list`: a Seq's
+	# .list is still lazy, so the calls would go out at whatever point the caller
+	# first looked at the answers — on another thread, after the run they belong
+	# to was cancelled, or never at all. Tools have side effects. They run here,
+	# inside the method that was asked to run them, and by the time this returns
+	# every one of them has finished. MCP::Server's bridge is eager for the same
+	# reason, and t/13 pins the two together.
+	my @results = @tool-calls.map(-> $call { self!execute-one($call, $known) });
+
+	@results.List;
 }
 
 method !known-tool-names(--> Any) {
@@ -951,7 +1046,7 @@ method !execute-one($call, $known --> Hash:D) {
 		}
 		else {
 			try {
-				my %result = self.call-tool($fn-name, %arguments);
+				my %result = self!call-with-progress($fn-name, %arguments, $call-id);
 				$content = result-to-text(%result);
 				# isError is a *result*, not a failure: the text is what the
 				# model needs in order to try something else.
@@ -972,6 +1067,47 @@ method !execute-one($call, $known --> Hash:D) {
 		content => ~($content // ''),
 		is_error => $is-error,
 	};
+}
+
+# One tool call, with a progress token minted for exactly as long as the call is
+# in flight, so a notifications/progress can be attributed to the call the model
+# made. The registration is dropped on the way out however the call ends —
+# answered, failed, timed out, thrown — because a token that outlived its call
+# would put a late notification on a tool that has already been answered.
+method !call-with-progress($name, %arguments, $call-id --> Hash:D) {
+	my $token = self!register-progress($call-id);
+	LEAVE self!unregister-progress($token);
+
+	self.call-tool(
+		$name, %arguments,
+		|($token.defined ?? (progress-token => $token) !! ()),
+	);
+}
+
+# The token for one bridge call, or an undefined Str when nobody is listening.
+# Wiring &.on-progress is what asks a server for progress: reporting it is work
+# the server does on our behalf, and asking for notifications that would be
+# dropped on arrival is asking for nothing useful. The same rule the client's
+# capabilities follow -- the hooks are the declaration.
+method !register-progress($call-id --> Str) {
+	return Str without &!on-progress;
+
+	$!progress-lock.protect: {
+		# A counter, because a retry of the same tool call must not reuse the
+		# token of the attempt before it -- which is exactly what using the call
+		# id as the token would do -- plus 64 bits of randomness, so a server
+		# cannot attach progress to a call it is not serving by guessing at what
+		# we minted.
+		my $token = 'prog-' ~ ++$!next-progress ~ '-'
+			~ (^2).map({ (2 ** 32).rand.Int.fmt('%08x') }).join;
+		%!progress-calls{$token} = ~($call-id // '');
+		$token;
+	}
+}
+
+method !unregister-progress(Str $token --> Nil) {
+	return without $token;
+	$!progress-lock.protect: { %!progress-calls{$token}:delete };
 }
 
 # A tool result rendered as the string a model reads. The local bridge has it
@@ -1268,11 +1404,53 @@ method !receive-notification(%note --> Nil) {
 		$!notifications.emit(%note);
 	}
 
+	my $method = %note<method> ~~ Str:D ?? %note<method> !! '';
+	my %params = %note<params> ~~ Associative ?? %note<params>.Hash !! {};
+
+	if $method eq 'notifications/progress' {
+		self!deliver-progress(%params);
+		return;
+	}
+
 	return without &!on-log;
-	return unless (%note<method> ~~ Str:D) && %note<method> eq 'notifications/message';
+	return unless $method eq 'notifications/message';
 
 	CATCH { default { self!warn('on-log hook threw: ' ~ .message.lines.head) } }
-	&!on-log(%note<params> ~~ Associative ?? %note<params>.Hash !! {});
+	&!on-log(%params);
+}
+
+# One notifications/progress, turned into the payload &.on-progress is
+# documented to take. Everything about it is best-effort: this runs on the
+# reader thread, in front of every answer still on the wire, and there is
+# nothing a malformed progress report is worth interrupting.
+method !deliver-progress(%params --> Nil) {
+	return without &!on-progress;
+
+	# Spelled out rather than taken from META-PROGRESS-TOKEN: that constant names
+	# the key inside a request's _meta, and this is a top-level member of
+	# ProgressNotificationParams. The two strings agree, the two fields do not.
+	my $token = %params<progressToken>;
+	return unless $token.defined;
+
+	# An unknown token is a report for a call that has already been answered, or
+	# one this client never made. Neither has an operation to attribute it to, so
+	# it is dropped in silence rather than guessed at or warned about -- a server
+	# racing its own answer is normal, not a fault.
+	my $call-id = $!progress-lock.protect: { %!progress-calls{$token.Str} };
+	return without $call-id;
+
+	# progress is the one member ProgressNotificationParams requires besides the
+	# token, and it is a number. Without it there is nothing to report.
+	my $progress = %params<progress>;
+	return unless $progress ~~ Real:D && $progress !~~ Bool;
+
+	my %payload = tool-call-id => $call-id, progress => $progress.Num;
+	%payload<total> = %params<total>.Num
+		if %params<total> ~~ Real:D && %params<total> !~~ Bool;
+	%payload<message> = %params<message> if %params<message> ~~ Str:D;
+
+	CATCH { default { self!warn('on-progress hook threw: ' ~ .message.lines.head) } }
+	&!on-progress(%payload);
 }
 
 method !warn(Str:D $message --> Nil) {

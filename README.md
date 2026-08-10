@@ -187,7 +187,7 @@ Both `connect-*` methods take every option `MCP::Client.new` does, and pass the 
 <th>Option</th> <th>Default</th> <th>What it does</th>
 </tr></thead>
 <tbody>
-<tr> <td>client-name</td> <td>raku-mcp-client</td> <td>Reported to the server as clientInfo; diagnostics only</td> </tr> <tr> <td>client-version</td> <td>0.1.0</td> <td>Ditto</td> </tr> <tr> <td>protocol-versions</td> <td>(2026-07-28,)</td> <td>Modern versions to offer, best first</td> </tr> <tr> <td>request-timeout</td> <td>60</td> <td>Seconds an ordinary request may take; 0 disables the budget</td> </tr> <tr> <td>probe-timeout</td> <td>5</td> <td>Seconds the era probe may take</td> </tr> <tr> <td>max-input-rounds</td> <td>8</td> <td>Multi round-trip retries before giving up</td> </tr> <tr> <td>on-elicit</td> <td>(unset)</td> <td>Serve elicitation/create; declares the capability</td> </tr> <tr> <td>on-sample</td> <td>(unset)</td> <td>Serve sampling/createMessage; declares the capability</td> </tr> <tr> <td>on-list-roots</td> <td>(unset)</td> <td>Serve roots/list; declares the capability</td> </tr> <tr> <td>on-log</td> <td>(unset)</td> <td>Called with the params of each notifications/message</td> </tr> <tr> <td>on-warn</td> <td>note to $*ERR</td> <td>One-line diagnostics; shared with the transport</td> </tr> <tr> <td>log-level</td> <td>(unset)</td> <td>Ask a modern server for logs at this severity</td> </tr> <tr> <td>client-capabilities</td> <td>derived from hooks</td> <td>Override the derivation</td> </tr> <tr> <td>cache</td> <td>a fresh one</td> <td>Share a cache, or inject one with a virtual clock</td> </tr>
+<tr> <td>client-name</td> <td>raku-mcp-client</td> <td>Reported to the server as clientInfo; diagnostics only</td> </tr> <tr> <td>client-version</td> <td>0.1.0</td> <td>Ditto</td> </tr> <tr> <td>protocol-versions</td> <td>(2026-07-28,)</td> <td>Modern versions to offer, best first</td> </tr> <tr> <td>request-timeout</td> <td>60</td> <td>Seconds an ordinary request may take; 0 disables the budget</td> </tr> <tr> <td>probe-timeout</td> <td>5</td> <td>Seconds the era probe may take</td> </tr> <tr> <td>max-input-rounds</td> <td>8</td> <td>Multi round-trip retries before giving up</td> </tr> <tr> <td>on-elicit</td> <td>(unset)</td> <td>Serve elicitation/create; declares the capability</td> </tr> <tr> <td>on-sample</td> <td>(unset)</td> <td>Serve sampling/createMessage; declares the capability</td> </tr> <tr> <td>on-list-roots</td> <td>(unset)</td> <td>Serve roots/list; declares the capability</td> </tr> <tr> <td>on-log</td> <td>(unset)</td> <td>Called with the params of each notifications/message</td> </tr> <tr> <td>on-progress</td> <td>(unset)</td> <td>Called as a bridge tool call reports progress; asks for it too</td> </tr> <tr> <td>on-warn</td> <td>note to $*ERR</td> <td>One-line diagnostics; shared with the transport</td> </tr> <tr> <td>log-level</td> <td>(unset)</td> <td>Ask a modern server for logs at this severity</td> </tr> <tr> <td>client-capabilities</td> <td>derived from hooks</td> <td>Override the derivation</td> </tr> <tr> <td>cache</td> <td>a fresh one</td> <td>Share a cache, or inject one with a virtual clock</td> </tr>
 </tbody>
 </table>
 
@@ -328,6 +328,25 @@ $mcp.notifications.tap: -> %note { $ui.progress(%note) };
 ```
 
 **Set `:$log-level` if you want log notifications from a modern server at all.** 2026-07-28 removed `logging/setLevel` in favour of a per-request `_meta` level, and a server **must not** emit `notifications/message` for a request that did not carry one — so an `on-log` hook without a `log-level` will never fire. On a legacy server the level is a session setting, sent with `logging/setLevel`, which this client leaves to the caller.
+
+### Progress
+
+Progress is opt-in the same way, from this end: a request carries a `progressToken` when the caller wants to be kept posted, and a server must not report on one that did not. `:&on-progress` is both halves of that for the LLM bridge — wiring it is what attaches a token to every tool call the bridge runs, and it is where the reports come back:
+
+```raku
+my $mcp = MCP::Client.connect-stdio(
+    command     => 'server',
+    on-progress => -> %p {
+        $ui.progress(%p<tool-call-id>, %p<progress>, %p<total>, %p<message>);
+    },
+);
+```
+
+The payload is `{ tool-call-id, progress, total?, message? } `. `tool-call-id` is the id of the call the model made — the join key back to the tool card it belongs on — and the two optional members are there only when the server sent them. The token itself is minted per call rather than being the call id, which a retried call would reuse, and it is forgotten the moment the call answers: a report that arrives late, or one quoting a token this client did not mint, is dropped rather than attributed to the wrong tool.
+
+Like `on-log`, the hook fires **on the client's reader thread**, ahead of the answer it belongs to. Treat it as a leaf — hand the payload to a queue or a store and return — because work done there delays every message behind it on the connection, and calling back into the client from it deadlocks on the request in flight.
+
+Outside the bridge, `call-tool` takes a `:$progress-token` of your own and the notifications arrive on `notifications` like any other. Both eras spell the token the same way, so a legacy server reports progress too.
 
 ### Liveness and shutdown
 
@@ -479,6 +498,8 @@ Arguments may be a hash or the JSON string most APIs actually send; both are acc
 
 **`execute-tool-calls` never throws.** A malformed call, arguments that are not a JSON object, a tool the server does not have, a tool that reported `isError`, a timeout, an exhausted multi round-trip loop, a connection that has died — each becomes an entry with `is_error` set and the reason as its `content`. A model that can read what went wrong can try something else; an exception thrown into the middle of a tool round cannot be recovered from at all.
 
+The calls also run **inside the method**, not when the caller first reads the answers: what comes back is a real `List`, so a batch that has returned is a batch that has already happened. Tools have side effects, and a lazily-reified batch would run them on whatever thread eventually looked at the result — or, for a run that was cancelled, never.
+
 ### The Registry
 
 An agent with more than one tool source has two problems: two servers may both call their tool `search`, and the model must be told which one it is talking to. [MCP::Client::Registry](lib/MCP/Client/Registry.rakumod) gives every provider a prefix, rewrites the names it publishes to `{prefix}{sep}{name}`, and routes each call back to whichever provider owns the prefix it was made under.
@@ -551,6 +572,15 @@ my $mcp = MCP::Client.connect-stdio(
 $policy = MCP::Client::Policy.new(:provider($mcp), :&on-ask, roots => { fs => '/srv' });
 
 $policy.grants;   # plain data: persist it, hand it back next session as `grants`
+```
+
+`&on-grant` is told when that list changes: it is handed the whole set (already copied) the moment an `always-` answer adds one, so a host does not have to poll `.grants` or infer it from an answer it watched go past. It fires while the call that provoked the grant is still being decided, which is what lets an engine mirror the grant into a session in time for the next call in the same batch — and, for the same reason, it is as much of a leaf as `&on-ask` is. A hook that throws is swallowed: the grant is already made, and a failed listener is no reason to refuse the call.
+
+```raku
+my $policy = MCP::Client::Policy.new(
+    :$provider, :&on-ask,
+    on-grant => -> @grants { spurt 'grants.json', to-json(@grants) },
+);
 ```
 
 Wire `on-elicit` **only** when there is somebody to ask — setting it is what declares the elicitation capability, and a server told it may ask will ask. `.interactive` is the guard. Headless, every `ask` outcome is an `is_error` result saying there was nobody to ask, which is a refusal the model can read rather than a hang.
@@ -677,9 +707,11 @@ prove6 -I. t                                   # against installed dependencies,
 prove6 -Ilib -It/lib -I../MCP-Server/lib t/    # against a sibling MCP-Server checkout
 ```
 
-Fifteen files, from the protocol units up: a scripted transport double for the era machine and the round-trip loop, an in-process transport that puts the client in front of a live `MCP::Server` with no wire between them, a real child process for the stdio transport (including one that kills itself mid-request), and a live HTTP server on a random port.
+Sixteen files, from the protocol units up: a scripted transport double for the era machine and the round-trip loop, an in-process transport that puts the client in front of a live `MCP::Server` with no wire between them, a real child process for the stdio transport (including one that kills itself mid-request), and a live HTTP server on a random port.
 
-Three of them are cross-checks rather than unit tests. `t/13` is a golden-parity test: the same toolkit behind a local `MCP::Server` and behind an `MCP::Client` must produce identical bridge output, which is what makes "interchangeable" a claim rather than a hope. `t/14` puts a policy over that same live server, including a real elicitation answered through `elicit-hook`, and re-runs `t/13`'s argument shapes through an allow-everything policy to pin the two argument parsers together. `t/15` runs the multi round-trip loop against an `MCP::Server` that really does elicit — the client half of the contract, checked against the server half rather than against a script.
+Four of them are cross-checks rather than unit tests. `t/13` is a golden-parity test: the same toolkit behind a local `MCP::Server` and behind an `MCP::Client` must produce identical bridge output, which is what makes "interchangeable" a claim rather than a hope. `t/14` puts a policy over that same live server, including a real elicitation answered through `elicit-hook`, and re-runs `t/13`'s argument shapes through an allow-everything policy to pin the two argument parsers together. `t/15` runs the multi round-trip loop against an `MCP::Server` that really does elicit — the client half of the contract, checked against the server half rather than against a script. `t/16` does the same for progress, against a server whose tools really do report it, and pins the other half of "when does a tool call happen": that a batch has finished running by the time `execute-tool-calls` returns.
+
+The fixtures under `t/lib` are reusable, and are meant to be: `t/lib` on the include path gives you `MCP::Client::Test::FakeTransport` (scripted answers, and notifications you can push at a client whenever you like), `MCP::Client::Test::InProcessTransport` (a live `MCP::Server`, no wire), `MCP::Client::Test::TestKit` (one tool of every shape) and `MCP::Client::Test::ProgressKit` (tools that report progress, for testing anything built on the `on-progress` hook).
 
 The example is runnable too, and needs no network and no API key:
 

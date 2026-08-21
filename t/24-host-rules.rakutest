@@ -1,0 +1,399 @@
+use Test;
+use lib 'lib', 't/lib';
+use JSON::Fast;
+use MCP::Client::Exceptions;
+use MCP::Client::Policy;
+use MCP::Client::Policy::Rules;
+
+# Host-scoped rules: the half of the permission engine that can see which
+# website a call is about. Without it, one "always allow" on a documentation
+# page is consent to the entire web for the rest of the session -- which is
+# nobody's idea of what they clicked. So the shape here is t/17's: prove the
+# schema refuses every pattern that would match nothing or too much (subtest 1),
+# prove the URL parse and the match say exactly what they should (2-3), prove
+# evaluate() is wrong in the safe direction about every unreadable shape (4-6),
+# then prove the seam carries it to the human and back (7-8).
+#
+#   prove6 -Ilib -I../MCP-Server/lib t/24-host-rules.rakutest
+
+plan 8;
+
+# === Helpers ===
+
+# The pure engine, called with plain data. A web pack names its target `url`,
+# which the engine knows about without being configured.
+sub ev(@rules, Str:D $tool, %args, *%opts) {
+	evaluate(@rules, $tool, %args, |%opts);
+}
+
+sub decision(@rules, Str:D $tool, %args, *%opts) {
+	ev(@rules, $tool, %args, |%opts)<decision>;
+}
+
+# A minimal duck-typed provider, as in t/17, so the catalogue and ask seams can
+# be exercised end to end.
+my class Provider {
+	has Str:D @.tool-names;
+	method tools-for-llm(--> List) {
+		@!tool-names.map(-> $n {
+			%( type => 'function', function => %( name => $n, description => "does $n",
+				parameters => %( type => 'object', properties => %() ) ) );
+		}).List;
+	}
+	method execute-tool-calls(@calls --> List) {
+		@calls.map(-> $c {
+			%( role => 'tool', tool_call_id => ($c<id> // ''), content => 'ok', is_error => False );
+		}).List;
+	}
+}
+
+sub call(Str:D $id, Str:D $name, %arguments) {
+	%( id => $id, function => %( name => $name, arguments => %arguments ) );
+}
+
+# === 1. The schema refuses what it should ===
+
+subtest 'the schema accepts a host and refuses every pattern that could not mean one thing' => {
+	lives-ok { validate-rule({ tool => 'web_fetch', decision => 'allow', host => 'docs.raku.org' }) },
+		'an exact host validates';
+	lives-ok { validate-rule({ tool => 'web_*', decision => 'allow', host => '*.raku.org' }) },
+		'a suffix glob validates';
+
+	my %norm = validate-rule({
+		tool => 'web_fetch', decision => 'deny', host => 'Evil.COM',
+		note => 'known malware host', severity => 'danger',
+	});
+	is %norm<host>, 'Evil.COM', 'the host survives normalisation as the human wrote it';
+	is %norm<note>, 'known malware host', 'alongside the note';
+	is %norm<severity>, 'danger', 'and the severity';
+
+	# A host narrows any rule, and stacks with the other narrowers.
+	lives-ok {
+		validate-rule({ tool => 'web_fetch', decision => 'ask', host => '*.example.com',
+			under => '/srv', check => 'reaches-config' });
+	}, 'a host stacks with the other narrowers';
+
+	throws-like { validate-rule({ tool => 'web_fetch', decision => 'allow', host => '*' }) },
+		X::MCP::Client, message => /host/, 'a bare star is refused';
+	throws-like { validate-rule({ tool => 'web_fetch', decision => 'allow', host => '*.' }) },
+		X::MCP::Client, 'a star with nothing under it is refused';
+	throws-like { validate-rule({ tool => 'web_fetch', decision => 'allow', host => 'ev*.com' }) },
+		X::MCP::Client, 'an infix star is refused';
+	throws-like { validate-rule({ tool => 'web_fetch', decision => 'allow', host => '*.raku.*' }) },
+		X::MCP::Client, 'a trailing star is refused: the glob is a prefix, not a suffix';
+	throws-like { validate-rule({ tool => 'web_fetch', decision => 'allow', host => '?.raku.org' }) },
+		X::MCP::Client, 'a single-character wildcard is refused';
+	throws-like { validate-rule({ tool => 'web_fetch', decision => 'allow', host => '' }) },
+		X::MCP::Client, 'an empty host is refused';
+	throws-like { validate-rule({ tool => 'web_fetch', decision => 'allow', host => '.raku.org' }) },
+		X::MCP::Client, 'a leading dot is refused: it is a glob written by someone who meant one';
+	throws-like { validate-rule({ tool => 'web_fetch', decision => 'allow', host => 'raku.org.' }) },
+		X::MCP::Client, 'a trailing root dot is refused: it is the same site spelled twice';
+	throws-like { validate-rule({ tool => 'web_fetch', decision => 'allow', host => 'https://raku.org' }) },
+		X::MCP::Client, 'a URL is refused where a host was meant';
+	throws-like { validate-rule({ tool => 'web_fetch', decision => 'allow', host => 'raku.org/docs' }) },
+		X::MCP::Client, 'a path is refused';
+	throws-like { validate-rule({ tool => 'web_fetch', decision => 'allow', host => 'raku.org:443' }) },
+		X::MCP::Client, 'a port is refused: a rule is about a site, not a socket';
+	throws-like { validate-rule({ tool => 'web_fetch', decision => 'allow', host => '[::1]' }) },
+		X::MCP::Client, 'a bracketed IPv6 literal is refused: brackets are URL syntax';
+	throws-like { validate-rule({ tool => 'web_fetch', decision => 'allow', host => 42 }) },
+		X::MCP::Client, 'a host that is not a string is refused';
+	throws-like { validate-rule({ tool => 'web_fetch', decision => 'allow', hosts => 'raku.org' }) },
+		X::MCP::Client, message => /'unknown member'/, 'a near-miss member name is still refused';
+	throws-like { validate-rule({ tool => 'web_fetch', decision => 'allow', dir => '/x' }) },
+		X::MCP::Client, 'and so is every other unknown member';
+
+	# An unbracketed IPv6 literal is what the URL parse hands back, so a rule
+	# must be able to name one.
+	lives-ok { validate-rule({ tool => 'web_fetch', decision => 'deny', host => '::1' }) },
+		'an unbracketed IPv6 literal validates, because that is what a URL yields';
+};
+
+# === 2. The URL parse, and everything it refuses to guess at ===
+
+subtest 'url-host reads exactly the URLs it will vouch for' => {
+	is url-host('https://docs.raku.org/lang.html'), 'docs.raku.org', 'a plain https URL';
+	is url-host('http://docs.raku.org'), 'docs.raku.org', 'http, and no path at all';
+	is url-host('HTTPS://DOCS.RAKU.ORG/x'), 'docs.raku.org', 'the scheme and the host both fold';
+	is url-host('https://raku.org:8443/x'), 'raku.org', 'a port is dropped';
+	is url-host('https://raku.org:/x'), 'raku.org', 'an empty port is dropped too';
+	is url-host('https://raku.org?q=1'), 'raku.org', 'a query ends the authority';
+	is url-host('https://raku.org#frag'), 'raku.org', 'so does a fragment';
+	is url-host('https://raku.org./x'), 'raku.org', 'the root dot is dropped, so it cannot walk past a rule';
+	is url-host('http://[::1]:8080/x'), '::1', 'an IPv6 literal loses its brackets and keeps its colons';
+	is url-host('http://[2001:DB8::1]/'), '2001:db8::1', 'and folds like any other host';
+
+	nok url-host('https://user@evil.com#@good.com').defined,
+		'userinfo is unreadable, not skipped past: two readers disagree about this URL';
+	nok url-host('https://docs.raku.org@evil.com/').defined,
+		'including the shape that reads as a trusted host to a human';
+	nok url-host('ftp://raku.org/x').defined, 'a non-http scheme is not a website this engine knows';
+	nok url-host('file:///etc/passwd').defined, 'nor is a file URL';
+	nok url-host('javascript:alert(1)').defined, 'nor a scheme with no authority at all';
+	nok url-host('//raku.org/x').defined, 'a scheme-relative reference names no scheme';
+	nok url-host('/lang.html').defined, 'a relative reference names no host';
+	nok url-host('docs.raku.org').defined, 'a bare host is not an absolute URL';
+	nok url-host('https://').defined, 'a URL with an empty authority';
+	nok url-host('').defined, 'the empty string';
+	nok url-host('https://ev%69l.com/').defined, 'a percent-encoded authority is not decoded and guessed at';
+	nok url-host('https://good.com\\evil.com/').defined, 'a backslash makes it unreadable';
+	nok url-host("https://raku.org\n/x").defined, 'and so does a control character';
+	nok url-host('https://raku.org:80a/').defined, 'a port that is not digits';
+	nok url-host('https://[::1/').defined, 'an unclosed bracket';
+	nok url-host('https://::1/').defined, 'an unbracketed IPv6 literal: where the port begins is a guess';
+	nok url-host('https://[::1]junk/').defined, 'anything but a port after the brackets';
+	nok url-host(42).defined, 'a value that is not a string';
+	nok url-host(['https://raku.org/']).defined, 'nor a list containing one';
+	nok url-host(Str).defined, 'nor an undefined one';
+};
+
+# === 3. Matching is on the dot boundary, and case-blind ===
+
+subtest 'a host pattern matches its site and nothing that merely looks like it' => {
+	ok match-host('docs.raku.org', 'docs.raku.org'), 'an exact host matches itself';
+	ok match-host('docs.raku.org', 'DOCS.Raku.ORG'), 'ignoring case';
+	ok match-host('DOCS.RAKU.ORG', 'docs.raku.org'), 'from either side';
+	nok match-host('docs.raku.org', 'raku.org'), 'an exact host does not match its parent';
+	nok match-host('raku.org', 'docs.raku.org'), 'nor its children';
+
+	ok match-host('*.raku.org', 'docs.raku.org'), 'a suffix glob matches a subdomain';
+	ok match-host('*.raku.org', 'a.b.raku.org'), 'however deep';
+	ok match-host('*.RAKU.org', 'A.B.raku.ORG'), 'ignoring case';
+	nok match-host('*.raku.org', 'raku.org'), 'but not the site itself: it is a subdomain glob';
+	nok match-host('*.raku.org', 'evilraku.org'),
+		'and not a host that merely ends in the same letters -- the dot boundary is the point';
+	nok match-host('*.raku.org', 'raku.org.evil.com'), 'nor one that hides it in the middle';
+	nok match-host('*.raku.org', 'org'), 'nor a shorter host';
+
+	ok match-host('::1', '::1'), 'an IPv6 literal matches itself';
+	nok match-host('*.raku.org', Str), 'an undefined host matches nothing';
+	nok match-host(Str, 'raku.org'), 'and so does an undefined pattern';
+};
+
+# === 4. The tri-state, failing closed in both directions ===
+
+subtest 'an allow needs a host it could read; a deny or ask fires on anything it could not' => {
+	my @allow = { tool => 'web_fetch', decision => 'allow', host => '*.raku.org' },;
+	my @deny  = { tool => 'web_fetch', decision => 'deny',  host => '*.raku.org' },;
+	my @ask   = { tool => 'web_fetch', decision => 'ask',   host => '*.raku.org' },;
+
+	is decision(@allow, 'web_fetch', %( url => 'https://docs.raku.org/x' )), 'allow',
+		'a matching url is allowed';
+	is decision(@allow, 'web_fetch', %( url => 'https://raku.org/x' )), 'ask',
+		'a readable url that does not match leaves the allow silent (no rule -> ask)';
+	is decision(@deny, 'web_fetch', %( url => 'https://raku.org/x' )), 'ask',
+		'and leaves the deny silent too: it definitely does not speak about this site';
+
+	# Every shape the engine cannot read: absent, empty, not a string, not a URL
+	# it will vouch for.
+	my @unreadable =
+		%( ),                                             # no url at all
+		%( url => '' ),                                   # the empty string
+		%( url => 'notes.txt' ),                          # a relative reference
+		%( url => 'javascript:alert(1)' ),                # a scheme with no authority
+		%( url => 'ftp://docs.raku.org/x' ),              # a scheme this engine will not claim
+		%( url => 'https://user@evil.com#@good.com' ),    # userinfo
+		%( url => ['https://docs.raku.org/'] ),           # a url that is not a string
+		%( url => 42 ),                                   # nor even a stringy one
+	;
+
+	for @unreadable -> %args {
+		my $what = %args<url>:exists ?? "url {%args<url>.gist}" !! 'no url';
+		is decision(@allow, 'web_fetch', %args), 'ask', "the allow does not fire on $what";
+
+		my %d = ev(@deny, 'web_fetch', %args);
+		is %d<decision>, 'deny', "the deny does fire on $what";
+		is %d<reason>, 'unevaluable-path', "saying it did so on something it could not evaluate ($what)";
+
+		is decision(@ask, 'web_fetch', %args), 'ask', "and the ask fires on $what";
+	}
+
+	# Arguments that would not parse at all reach the engine as the undefined
+	# sentinel: unreadable in the same way, and not an exemption either.
+	is evaluate(@allow, 'web_fetch', Any)<decision>, 'ask',
+		'an unreadable argument object leaves the allow silent';
+	is evaluate(@deny, 'web_fetch', Any)<decision>, 'deny',
+		'and fires the deny';
+
+	# The reason distinguishes a real match from an unreadable one, so a prompt
+	# can explain which of the two it is about.
+	is ev(@deny, 'web_fetch', %( url => 'https://docs.raku.org/x' ))<reason>, 'rule',
+		'a deny that really matched says so';
+};
+
+# === 5. Precedence and specificity are undisturbed ===
+
+subtest 'a host allow does not beat an ask, and the host rule is the one reported' => {
+	# deny > ask > allow, whatever the narrowers say.
+	my @mixed =
+		{ tool => 'web_fetch', decision => 'allow', host => 'docs.raku.org' },
+		{ tool => 'web_fetch', decision => 'ask' },
+	;
+	is decision(@mixed, 'web_fetch', %( url => 'https://docs.raku.org/x' )), 'ask',
+		'a blanket ask outranks a host-scoped allow';
+
+	my @all-three =
+		{ tool => 'web_fetch', decision => 'allow', host => 'docs.raku.org' },
+		{ tool => 'web_fetch', decision => 'ask',   host => '*.raku.org' },
+		{ tool => 'web_*',     decision => 'deny',  host => 'docs.raku.org' },
+	;
+	is decision(@all-three, 'web_fetch', %( url => 'https://docs.raku.org/x' )), 'deny',
+		'and a deny outranks both';
+
+	# Order-independence: the same rules, read the other way round.
+	is decision(@all-three.reverse, 'web_fetch', %( url => 'https://docs.raku.org/x' )), 'deny',
+		'whichever half of the file was read first';
+
+	# Two rules that agree: the narrower one is the one a prompt is told about.
+	my @agreeing =
+		{ tool => 'web_fetch', decision => 'deny' },
+		{ tool => 'web_fetch', decision => 'deny', host => 'evil.com' },
+	;
+	my %v = ev(@agreeing, 'web_fetch', %( url => 'https://evil.com/x' ));
+	is %v<decision>, 'deny', 'a blanket deny and a host deny agree';
+	is %v<rule><host>, 'evil.com', 'and the host rule is the one reported';
+
+	# An exact host is more concrete than the glob that covers it.
+	my @both =
+		{ tool => 'web_fetch', decision => 'deny', host => '*.raku.org' },
+		{ tool => 'web_fetch', decision => 'deny', host => 'docs.raku.org' },
+	;
+	is ev(@both, 'web_fetch', %( url => 'https://docs.raku.org/x' ))<rule><host>, 'docs.raku.org',
+		'an exact host beats the glob that contains it';
+};
+
+# === 6. host ANDs with the other narrowers, and under can never fire on a web tool ===
+
+subtest 'host ANDs with the other narrowers, and an under on a web rule only fails closed' => {
+	# A tool that carries both a url and a path argument: both predicates must
+	# hold for the rule to fire.
+	my %pp = ( 'web_save' => ['path'] );
+	my @both = { tool => 'web_save', decision => 'deny', host => 'evil.com', under => '/srv' },;
+
+	is decision(@both, 'web_save', %( url => 'https://evil.com/x', path => '/srv/a' ), path-params => %pp),
+		'deny', 'both conditions true fires the deny';
+	is decision(@both, 'web_save', %( url => 'https://good.com/x', path => '/srv/a' ), path-params => %pp),
+		'ask', 'the host failing spares it';
+	is decision(@both, 'web_save', %( url => 'https://evil.com/x', path => '/tmp/a' ), path-params => %pp),
+		'ask', 'the path failing spares it';
+
+	# A web tool names no locations, so a path predicate on it is forever
+	# unknown -- which is exactly why `under` is the wrong narrower to reach for.
+	my @allow-under = { tool => 'web_fetch', decision => 'allow', host => '*.raku.org', under => '/srv' },;
+	is decision(@allow-under, 'web_fetch', %( url => 'https://docs.raku.org/x' )), 'ask',
+		'an under on an allow for a web tool can never fire, however right the host is';
+
+	my @deny-under = { tool => 'web_fetch', decision => 'deny', under => '/srv' },;
+	my %d = ev(@deny-under, 'web_fetch', %( url => 'https://docs.raku.org/x' ));
+	is %d<decision>, 'deny', 'while an under on a deny fires on every call the tool ever makes';
+	is %d<reason>, 'unevaluable-path', 'because it could not be ruled out';
+
+	# And a url is never read as a path: no path predicate is measured against it.
+	is-deeply ev(@allow-under, 'web_fetch', %( url => 'https://docs.raku.org/x' ))<paths>.List, ().List,
+		'a url is not a location argument -- it is nowhere in the call\'s paths';
+};
+
+# === 7. The suggestion a human is offered ===
+
+subtest 'a call that named a site is offered that site, and never more' => {
+	is-deeply ev((), 'web_fetch', %( url => 'https://Docs.Raku.org/lang.html' ))<suggestion>,
+		{ tool => 'web_fetch', host => 'docs.raku.org' },
+		'the always-answer is scoped to the site, folded as a host is';
+
+	is-deeply ev((), 'web_fetch', %( url => 'http://[::1]:8080/x' ))<suggestion>,
+		{ tool => 'web_fetch', host => '::1' },
+		'including an IPv6 literal, with its brackets and port gone';
+
+	is-deeply ev((), 'web_fetch', %( url => 'not a url' ))<suggestion>, { tool => 'web_fetch' },
+		'a url that will not parse leaves the bare tool, which is the honest fallback';
+	is-deeply ev((), 'web_fetch', %( url => '' ))<suggestion>, { tool => 'web_fetch' },
+		'and so does an empty one';
+	is-deeply ev((), 'web_fetch', %( ))<suggestion>, { tool => 'web_fetch' },
+		'and so does a call with no url at all';
+	is-deeply evaluate((), 'web_fetch', Any)<suggestion>, { tool => 'web_fetch' },
+		'as does one whose arguments would not parse';
+
+	# A path-bearing call is untouched: a filesystem call is about a directory.
+	is-deeply ev((), 'fs_read', %( path => 'notes/today.md' ), roots => %( fs => '/srv/docs' ))<suggestion>,
+		{ tool => 'fs_read', under => '/srv/docs/notes' },
+		'a call with paths is still offered the directory they are in';
+
+	my %pp = ( 'web_save' => ['path'] );
+	is-deeply ev((), 'web_save', %( url => 'https://docs.raku.org/x', path => '/srv/a/b.html' ),
+			path-params => %pp)<suggestion>,
+		{ tool => 'web_save', under => '/srv/a' },
+		'and a call that names both is scoped by the directory, which is the narrower answer';
+
+	# suggest() itself, called as the layer beside the policy calls it.
+	is-deeply suggest('web_fetch', ().List, Str, host => 'docs.raku.org'),
+		{ tool => 'web_fetch', host => 'docs.raku.org' }, 'suggest takes the host directly';
+	is-deeply suggest('web_fetch', ().List, Str), { tool => 'web_fetch' },
+		'and without one is the bare tool it always was';
+};
+
+# === 8. The seam: catalogue, prompt, and what "always" remembers ===
+
+subtest 'a host-scoped deny keeps its tool, and a host-scoped grant is what always allow means' => {
+	my $prov = Provider.new(tool-names => <web_fetch fs_read>);
+
+	my $scoped = MCP::Client::Policy.new(provider => $prov,
+		rules => [{ tool => 'web_fetch', decision => 'deny', host => 'evil.com' },]);
+	my @scoped-names = $scoped.tools-for-llm.map({ $_<function><name> });
+	ok 'web_fetch' ∈ @scoped-names, 'a host-scoped deny keeps web_fetch in the catalogue';
+
+	my $blanket = MCP::Client::Policy.new(provider => $prov,
+		rules => [{ tool => 'web_fetch', decision => 'deny' },]);
+	ok 'web_fetch' ∉ $blanket.tools-for-llm.map({ $_<function><name> }),
+		'while a blanket deny still hides it';
+
+	# The refusal names the site, so a human reading the transcript can see what
+	# the rule was about.
+	my %refused = $scoped.execute-tool-calls([call('1', 'web_fetch', %( url => 'https://evil.com/x' )),])[0];
+	ok %refused<is_error>, 'the call is refused';
+	ok %refused<content>.contains("matched the rule 'deny web_fetch on evil.com'"),
+		'and the refusal reads the rule back with its host';
+
+	# "Always allow" remembers the site, not the tool.
+	my @asked;
+	my $policy = MCP::Client::Policy.new(
+		provider => $prov,
+		rules => [{ tool => 'web_fetch', decision => 'ask' },],
+		on-ask => -> %request { @asked.push(%request); %( action => 'always-allow' ) },
+	);
+
+	my @out = $policy.execute-tool-calls([
+		call('1', 'web_fetch', %( url => 'https://docs.raku.org/a' )),
+		call('2', 'web_fetch', %( url => 'https://docs.raku.org/b' )),
+	]);
+	is-deeply @out.map({ $_<is_error> }).List, (False, False), 'both calls went through';
+	is @asked.elems, 1, 'and the human was asked once: the grant covered the rest of the batch';
+	is-deeply @asked[0]<suggestion>, { tool => 'web_fetch', host => 'docs.raku.org' },
+		'the human was offered the site the call named';
+	is-deeply $policy.grants.List, ({ tool => 'web_fetch', decision => 'allow', host => 'docs.raku.org' },),
+		'and that is exactly what was remembered';
+
+	$policy.execute-tool-calls([call('3', 'web_fetch', %( url => 'https://evil.com/x' )),]);
+	is @asked.elems, 2, 'a different site is a different question';
+
+	$policy.execute-tool-calls([call('4', 'web_fetch', %( url => 'https://docs.raku.org/c' )),]);
+	is @asked.elems, 2, 'while the granted one is not asked about again';
+
+	# Plain data in, plain data out: a host grant survives being persisted.
+	my @round-tripped = from-json(to-json($policy.grants)).list;
+	is to-json(@round-tripped, :sorted-keys), to-json($policy.grants, :sorted-keys),
+		'the host grant is JSON-safe and unchanged';
+
+	my @reasked;
+	my $reloaded = MCP::Client::Policy.new(
+		provider => $prov,
+		rules => [{ tool => 'web_fetch', decision => 'ask' },],
+		grants => @round-tripped,
+		on-ask => -> %request { @reasked.push(%request); %( action => 'deny-once' ) },
+	);
+	my %again = $reloaded.execute-tool-calls([call('5', 'web_fetch', %( url => 'https://docs.raku.org/d' )),])[0];
+	nok %again<is_error>, 'a reloaded grant still allows the site it was made for';
+	is @reasked.elems, 0, 'without asking again';
+	ok $reloaded.execute-tool-calls([call('6', 'web_fetch', %( url => 'https://other.com/d' )),])[0]<is_error>,
+		'and still does not cover any other';
+};

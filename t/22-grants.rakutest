@@ -1,0 +1,659 @@
+use Test;
+use lib 'lib', 't/lib';
+use JSON::Fast;
+use MCP::Client::Exceptions;
+use MCP::Client::Policy;
+use MCP::Client::Policy::Grants;
+
+# The shared grant book: what makes a fleet of agents share one human's answers
+# instead of asking the same question once per agent. Two properties carry it.
+# First, it is LIVE -- a policy reads the book on every decision, so a grant made
+# a moment ago through another policy is in force for the next call here rather
+# than at the next start-up. Second, it widens NOTHING: a grant is still only
+# consulted once the static rules have said `ask`, so a book full of allows
+# cannot vote a deny rule away.
+#
+# So: the book on its own (1-3), one policy with a book (4-5), two policies
+# sharing one (6-7), the plural answer a coarse UI gives (8-9), the sabotage --
+# every way a shared grant might be hoped to overrule something it must not (10)
+# -- and then the two places the book is consulted other than at the front of a
+# decision: from inside the ask-lock, once a queued call has finally reached the
+# question (11, 13), and by a host that asks the human itself (12).
+#
+#   prove6 -Ilib t/22-grants.rakutest
+
+plan 13;
+
+constant TIMEOUT = 30;
+
+# === Doubles ===
+
+# The t/14 provider, kept to what this file needs: which calls arrived, in which
+# batches, and a well-formed answer for each.
+my class ScriptedProvider {
+	has Str:D $.label = 'fs';
+	has Str:D @.tool-names = <read write edit mkdir move delete>;
+
+	has Lock $!lock .= new;
+	has @!declared;
+	has @!batches;
+
+	submethod TWEAK {
+		@!declared = @!tool-names.map(-> $name {
+			%(
+				type => 'function',
+				function => %(
+					name => $name,
+					description => "$!label does $name",
+					parameters => %( type => 'object', properties => %() ),
+				),
+			);
+		});
+	}
+
+	#| Every call this provider saw, flattened, in order.
+	method seen(--> List:D) {
+		$!lock.protect: { @!batches.map(*.Slip).List };
+	}
+
+	method tools-for-llm(--> List) { @!declared.List }
+
+	method execute-tool-calls(@tool-calls --> List) {
+		$!lock.protect: { @!batches.push([@tool-calls]) };
+
+		@tool-calls.map(-> $tc {
+			%(
+				role => 'tool',
+				tool_call_id => ($tc<id> // ''),
+				content => "$!label:{$tc<function><name>}",
+				is_error => False,
+			);
+		}).List;
+	}
+}
+
+sub call(Str:D $id, Str:D $name, $arguments = %()) {
+	%( id => $id, function => %( name => $name, arguments => $arguments ) );
+}
+
+#| A policy that asks about writes, over a fresh provider, with '/srv' as the
+#| root every relative path is measured from.
+sub asking-policy(*%opts --> MCP::Client::Policy:D) {
+	MCP::Client::Policy.new(
+		provider => ScriptedProvider.new,
+		rules    => [{ tool => 'write', decision => 'ask' },],
+		roots    => { '' => '/srv' },
+		|%opts,
+	);
+}
+
+# === The book on its own ===
+
+subtest 'the book: what it keeps, and what it refuses to keep' => {
+	plan 9;
+
+	my $book = MCP::Client::Policy::Grants.new;
+	is $book.elems, 0, 'a new book is empty';
+	is-deeply $book.list, ().List, 'and lists nothing';
+
+	my @after = $book.add([
+		{ tool => 'write', decision => 'allow', under => '/srv/scratch' },
+		{ tool => 'edit', decision => 'allow', under => '/srv/scratch' },
+	]);
+	is @after.elems, 2, 'add answers the whole book, not the addition';
+	is-deeply @after.List, $book.list.List, 'which is what list renders';
+	is $book.elems, 2, 'and both rules are in it';
+
+	# Seeded from what a previous session remembered.
+	my $seeded = MCP::Client::Policy::Grants.new(
+		grants => [{ tool => 'write', decision => 'allow', under => '/srv' },],
+	);
+	is $seeded.elems, 1, 'a book can be built with grants already in it';
+
+	# All or nothing: a list with one bad rule in it leaves the book alone.
+	throws-like { $book.add([{ tool => 'move', decision => 'allow' }, { tool => 'x', decision => 'sideways' }]) },
+		X::MCP::Client, 'a rule that will not validate throws';
+	is $book.elems, 2, 'and none of that list was kept, not even the good one';
+
+	throws-like { MCP::Client::Policy::Grants.new(grants => 'a string') },
+		X::MCP::Client, 'and a book cannot be seeded with something that is not a rule list';
+};
+
+subtest 'the book: everything it hands out is a copy' => {
+	plan 3;
+
+	my $book = MCP::Client::Policy::Grants.new(
+		grants => [{ tool => 'write', decision => 'allow', under => '/srv/scratch' },],
+	);
+
+	my @snapshot = $book.list;
+	@snapshot[0]<tool> = 'vandalised';
+	@snapshot[0]<under> = '/';
+	is $book.list[0]<tool>, 'write', 'editing a snapshot does not edit the book';
+	is $book.list[0]<under>, '/srv/scratch', 'in any of its members';
+
+	# And what a caller hands IN is copied too: a rule the caller keeps editing
+	# must not turn into a different grant afterwards.
+	my %mine = tool => 'edit', decision => 'allow', under => '/srv/scratch';
+	$book.add([%mine,]);
+	%mine<under> = '/';
+	is $book.list[1]<under>, '/srv/scratch', 'and editing what you added does not either';
+};
+
+subtest 'the book: plain data, all the way to JSON and back' => {
+	plan 2;
+
+	my $book = MCP::Client::Policy::Grants.new;
+	$book.add([
+		{ tool => 'write', decision => 'allow', under => '/srv/scratch' },
+		{ tool => 'sh_run', decision => 'deny', command => 'git', args => ['push', '--force'] },
+	]);
+
+	# Compared as JSON rather than by is-deeply: a decoded `args` is an Array
+	# where the validator's is a List, which is the same data and not the point.
+	my @round-tripped = from-json(to-json($book.list)).list;
+	is to-json(@round-tripped, :sorted-keys), to-json($book.list, :sorted-keys),
+		'a book survives a JSON round trip unchanged';
+
+	my $reloaded = MCP::Client::Policy::Grants.new(grants => @round-tripped);
+	is-deeply $reloaded.list.List, $book.list.List,
+		'and can be handed straight back to a new one, which normalises it back';
+};
+
+# === One policy, with a book ===
+
+subtest 'a policy with a book writes its grants there' => {
+	plan 6;
+
+	my @asked;
+	my $book = MCP::Client::Policy::Grants.new;
+	my $policy = asking-policy(
+		grants-store => $book,
+		on-ask => -> %request { @asked.push(%request<tool>); { action => 'always-allow' } },
+	);
+
+	is $policy.grants-store, $book, 'the store is the object it was given, not a copy of it';
+
+	my @out = $policy.execute-tool-calls([
+		call('1', 'write', '{"path":"scratch/a"}'),
+		call('2', 'write', '{"path":"scratch/b"}'),
+	]);
+	is-deeply @out.map({ $_<is_error> }).List, (False, False), 'both writes went through';
+	is @asked.elems, 1, 'on one question, as an unshared policy would';
+
+	is-deeply $book.list.List, ({ tool => 'write', decision => 'allow', under => '/srv/scratch' },),
+		'and the grant landed in the book rather than in the policy';
+	is-deeply $policy.grants.List, $book.list.List,
+		'.grants renders the effective set, which here is the book';
+
+	# The instance grants come first, then the book: the order a session should
+	# persist and hand back.
+	my $mixed = asking-policy(
+		grants => [{ tool => 'edit', decision => 'allow' },],
+		grants-store => $book,
+	);
+	is-deeply $mixed.grants.List,
+		(
+			{ tool => 'edit', decision => 'allow' },
+			{ tool => 'write', decision => 'allow', under => '/srv/scratch' },
+		),
+		'a policy with both renders its own grants first and the book after them';
+};
+
+subtest 'a policy reads the book live, not at construction' => {
+	plan 4;
+
+	my @asked;
+	my $book = MCP::Client::Policy::Grants.new;
+	my $policy = asking-policy(
+		grants-store => $book,
+		on-ask => -> %request { @asked.push(%request<tool>); { action => 'deny-once' } },
+	);
+
+	ok $policy.execute-tool-calls([call('1', 'write', '{"path":"scratch/a"}'),])[0]<is_error>,
+		'with an empty book the human is asked, and this one said no';
+	is @asked.elems, 1, 'so the question was put';
+
+	# Somebody else -- a preset, a resumed session, another agent's answer --
+	# adds to the book after this policy was built.
+	$book.add([{ tool => 'write', decision => 'allow', under => '/srv/scratch' },]);
+
+	nok $policy.execute-tool-calls([call('2', 'write', '{"path":"scratch/b"}'),])[0]<is_error>,
+		'a grant added to the book afterwards decides the next call';
+	is @asked.elems, 1, 'without asking again';
+};
+
+# === Two policies, one book ===
+
+subtest 'the fleet: a grant made through one policy binds another' => {
+	plan 5;
+
+	my @asked;
+	my $book = MCP::Client::Policy::Grants.new;
+	my &ask = -> %request { @asked.push(%request<tool>); { action => 'always-allow' } };
+
+	my $first = asking-policy(grants-store => $book, on-ask => &ask);
+	my $second = asking-policy(grants-store => $book, on-ask => &ask);
+
+	nok $first.execute-tool-calls([call('1', 'write', '{"path":"scratch/a"}'),])[0]<is_error>,
+		'the first agent asks, and is allowed';
+	is @asked.elems, 1, 'one question';
+
+	nok $second.execute-tool-calls([call('2', 'write', '{"path":"scratch/b"}'),])[0]<is_error>,
+		'and the second agent, which never asked anything, is allowed too';
+	is @asked.elems, 1, 'still one question: the human answered for the whole session';
+
+	# A policy started AFTER the grant was made inherits it as well -- the
+	# tenth child of a fan-out is not a special case.
+	my $latecomer = asking-policy(grants-store => $book, on-ask => &ask);
+	nok $latecomer.execute-tool-calls([call('3', 'write', '{"path":"scratch/c"}'),])[0]<is_error>,
+		'as does one built after the answer was given';
+};
+
+subtest 'the fleet: on-grant hears the effective list, once per answer' => {
+	plan 5;
+
+	my @snapshots;
+	my $book = MCP::Client::Policy::Grants.new(
+		grants => [{ tool => 'edit', decision => 'allow', under => '/srv' },],
+	);
+	my $policy = asking-policy(
+		grants-store => $book,
+		on-ask => -> %request { { action => 'always-allow' } },
+		on-grant => -> @grants { @snapshots.push(@grants) },
+	);
+
+	$policy.execute-tool-calls([call('1', 'write', '{"path":"scratch/a"}'),]);
+
+	is @snapshots.elems, 1, 'the hook fired once';
+	is-deeply @snapshots[0].List,
+		(
+			{ tool => 'edit', decision => 'allow', under => '/srv' },
+			{ tool => 'write', decision => 'allow', under => '/srv/scratch' },
+		),
+		'handed the whole book, seeded rule and all -- what a session should persist';
+	is-deeply @snapshots[0].List, $policy.grants.List, 'which is what .grants renders';
+
+	@snapshots[0][0]<tool> = 'vandalised';
+	is $book.list[0]<tool>, 'edit', 'and the snapshot is a copy, not a window onto the book';
+
+	# A second policy sharing the book announces the whole book too, so a host
+	# persisting on-grant from any of them persists the same set.
+	my @from-child;
+	my $child = asking-policy(
+		grants-store => $book,
+		on-ask => -> %request { { action => 'always-allow', rule => { tool => 'move' } } },
+		on-grant => -> @grants { @from-child.push(@grants) },
+	);
+	$child.execute-tool-calls([call('1', 'write', '{"path":"live/x"}'),]);
+	is-deeply @from-child[0].map({ $_<tool> }).List, <edit write move>,
+		'a grant through the child announces everything the session has learned';
+};
+
+# === The plural answer ===
+
+subtest 'rules: several grants from one click' => {
+	plan 7;
+
+	my @asked;
+	my $book = MCP::Client::Policy::Grants.new;
+	my $policy = asking-policy(
+		grants-store => $book,
+		on-ask => -> %request {
+			@asked.push(%request<tool>);
+			{
+				action => 'always-allow',
+				rules => [
+					{ tool => 'write', under => '/srv' },
+					{ tool => 'edit', under => '/srv' },
+					{ tool => 'mkdir', under => '/srv' },
+					{ tool => 'move', under => '/srv' },
+				],
+			};
+		},
+	);
+
+	nok $policy.execute-tool-calls([call('1', 'write', '{"path":"scratch/a"}'),])[0]<is_error>,
+		'the call that provoked the answer goes through';
+	is $book.list.elems, 4, 'and all four rules are remembered';
+	is-deeply $book.list.map({ $_<tool> }).List, <write edit mkdir move>,
+		'in the order they were given';
+	is-deeply $book.list.map({ $_<decision> }).List, <allow allow allow allow>,
+		'each with the decision taken from the action rather than from the rule';
+
+	# The point of the coarse offer: the other three tools stop asking too.
+	my @rest = $policy.execute-tool-calls([
+		call('2', 'edit', '{"path":"src/app.raku"}'),
+		call('3', 'mkdir', '{"path":"src/new"}'),
+		call('4', 'move', '{"from":"src/a","to":"src/b"}'),
+	]);
+	is-deeply @rest.map({ $_<is_error> }).List, (False, False, False), 'all three go through';
+	is @asked.elems, 1, 'on the strength of the one question already answered';
+
+	# A tool the offer did not cover is still a question.
+	$policy.execute-tool-calls([call('5', 'delete', '{"path":"src/a"}'),]);
+	is @asked.elems, 2, 'and a tool the rules do not name is asked about as before';
+};
+
+subtest 'rules: the singular answer is unchanged, and a bad plural refuses' => {
+	plan 8;
+
+	# Back-compat: one rule, taken as written.
+	my $singular = asking-policy(
+		on-ask => -> %request { { action => 'always-allow', rule => { tool => 'w*' } } },
+	);
+	nok $singular.execute-tool-calls([call('1', 'write', '{"path":"scratch/a"}'),])[0]<is_error>,
+		'a singular rule still decides its call';
+	is-deeply $singular.grants.List, ({ tool => 'w*', decision => 'allow' },),
+		'and is still remembered exactly as it was given';
+
+	# And the bare suggestion default.
+	my $bare = asking-policy(on-ask => -> %request { { action => 'always-allow' } });
+	$bare.execute-tool-calls([call('1', 'write', '{"path":"scratch/a"}'),]);
+	is-deeply $bare.grants.List, ({ tool => 'write', decision => 'allow', under => '/srv/scratch' },),
+		'an answer naming neither still remembers the suggestion';
+
+	# All or nothing: one unusable rule refuses the call and remembers none.
+	my $broken = asking-policy(
+		on-ask => -> %request {
+			{
+				action => 'always-allow',
+				rules => [{ tool => 'write', under => '/srv' }, { tool => 'edit', under => '/a/../b' }],
+			};
+		},
+	);
+	my %out = $broken.execute-tool-calls([call('1', 'write', '{"path":"scratch/a"}'),])[0];
+	ok %out<is_error>, 'a list with one unusable rule in it refuses the call';
+	is $broken.grants.elems, 0, 'and remembers none of them, not even the good one';
+
+	my $empty = asking-policy(
+		on-ask => -> %request { { action => 'always-allow', rules => [] } },
+	);
+	my %none = $empty.execute-tool-calls([call('1', 'write', '{"path":"scratch/a"}'),])[0];
+	ok %none<is_error> && %none<content>.contains('empty'),
+		'an empty list of rules is a refusal that says so';
+
+	my $both = asking-policy(
+		on-ask => -> %request {
+			{ action => 'always-allow', rule => { tool => 'w*' }, rules => [{ tool => 'e*' },] };
+		},
+	);
+	ok $both.execute-tool-calls([call('1', 'write', '{"path":"scratch/a"}'),])[0]<is_error>,
+		'and so is an answer that names both a rule and a list of them';
+
+	# An always-DENY of several rules says, in words, everything it just refused.
+	my $refusing = asking-policy(
+		on-ask => -> %request {
+			{ action => 'always-deny', rules => [{ tool => 'write' }, { tool => 'edit' }] };
+		},
+	);
+	my %denied = $refusing.execute-tool-calls([call('1', 'write', '{"path":"scratch/a"}'),])[0];
+	ok %denied<is_error>
+		&& %denied<content>.contains("'deny write'")
+		&& %denied<content>.contains("'deny edit'"),
+		'a plural always-deny names every rule it has just started enforcing';
+};
+
+# === Sabotage ===
+
+subtest 'sabotage: a shared grant is not a way round anything' => {
+	plan 6;
+
+	# A static deny, with the whole session's book saying allow.
+	my $book = MCP::Client::Policy::Grants.new(
+		grants => [
+			{ tool => 'delete', decision => 'allow' },
+			{ tool => '*', decision => 'allow' },
+		],
+	);
+	my $fs = ScriptedProvider.new;
+	my $denying = MCP::Client::Policy.new(
+		provider => $fs,
+		rules => [{ tool => 'delete', decision => 'deny' },],
+		grants-store => $book,
+		on-ask => -> %request { { action => 'allow-once' } },
+	);
+	ok $denying.execute-tool-calls([call('1', 'delete', '{"path":"/srv/x"}'),])[0]<is_error>,
+		'a static deny beats a book full of allows';
+	is $fs.seen.elems, 0, 'and the provider is never troubled with the call';
+
+	# A deny that narrows by directory, with an allow grant over the whole root.
+	my $narrow = MCP::Client::Policy.new(
+		provider => ScriptedProvider.new,
+		rules => [{ tool => 'write', decision => 'deny', under => '/srv/live' },],
+		roots => { '' => '/srv' },
+		grants-store => MCP::Client::Policy::Grants.new(
+			grants => [{ tool => 'write', decision => 'allow', under => '/srv' },],
+		),
+		on-ask => -> %request { { action => 'allow-once' } },
+	);
+	ok $narrow.execute-tool-calls([call('1', 'write', '{"path":"live/x"}'),])[0]<is_error>,
+		'a deny that names a directory beats a grant over the directory above it';
+	nok $narrow.execute-tool-calls([call('2', 'write', '{"path":"scratch/x"}'),])[0]<is_error>,
+		'while the same grant still decides a call the deny does not cover';
+
+	# Between grants in one book, the precedence the rules use.
+	my $mixed = MCP::Client::Policy.new(
+		provider => ScriptedProvider.new,
+		grants-store => MCP::Client::Policy::Grants.new(
+			grants => [
+				{ tool => 'write', decision => 'allow' },
+				{ tool => 'w*', decision => 'deny' },
+			],
+		),
+	);
+	ok $mixed.execute-tool-calls([call('1', 'write'),])[0]<is_error>,
+		'a deny grant beats an allow grant, whoever put either in the book';
+
+	# And the option itself is checked: a caller who passed the grant LIST where
+	# the book goes is told which of the two this option wants.
+	throws-like {
+		MCP::Client::Policy.new(
+			provider => ScriptedProvider.new,
+			grants-store => [{ tool => 'write', decision => 'allow' },],
+		);
+	}, X::MCP::Client, 'and a grants-store that is not a book is refused at construction';
+};
+
+# === The queue ===
+
+subtest 'the fleet: a grant that lands while a call is queued decides it' => {
+	plan 10;
+
+	# The queue is where a fleet spends its time: one human, one question at a
+	# time, and every other agent waiting behind whoever asked first. What the
+	# waiters must not do is re-ask the question that was settled while they
+	# waited -- so the book is read again the moment the ask-lock is acquired, and
+	# a waiter it now decides never reaches the callback at all.
+	#
+	# The ordering is pinned by holding the shared ask-lock from this thread: the
+	# grant lands, as another agent's human has just this moment said "always",
+	# while the calls are parked on the lock. That is exactly the window the
+	# re-check exists for, and the only way to be inside it deliberately -- a live
+	# race between two agents cannot be timed from outside.
+	my $gate = Lock.new;
+	my $book = MCP::Client::Policy::Grants.new;
+	my @asked;
+	my @granted;
+	my &ask = -> %request { @asked.push(%request<tool>); { action => 'always-allow' } };
+
+	my $first = asking-policy(
+		grants-store => $book, ask-lock => $gate, on-ask => &ask,
+		on-grant => -> @grants { @granted.push(@grants) },
+	);
+	my $second = asking-policy(grants-store => $book, ask-lock => $gate, on-ask => &ask);
+
+	my ($one, $two);
+	$gate.protect: {
+		$one = start { $first.execute-tool-calls([call('1', 'write', '{"path":"scratch/a"}'),]) };
+		$two = start { $second.execute-tool-calls([call('2', 'write', '{"path":"scratch/b"}'),]) };
+
+		# Queueing is not directly observable -- there is nothing to await on the
+		# far side of a Lock -- so the two calls are given a moment to get as far
+		# as the question and park on it.
+		sleep 0.2;
+		is @asked.elems, 0, 'both calls are parked on the lock with the question unasked';
+
+		$book.add([{ tool => 'write', decision => 'allow', under => '/srv/scratch' },]);
+	}
+
+	await Promise.anyof(Promise.allof($one, $two), Promise.in(TIMEOUT));
+	die 'Timed out waiting for the queued calls to be decided'
+		if $one.status === Planned || $two.status === Planned;
+
+	nok $one.result[0]<is_error>, 'the first waiter is allowed by the grant it was waiting behind';
+	nok $two.result[0]<is_error>, 'and so is the second, on the same grant';
+	is @asked.elems, 0, 'neither of them put the question the human had already answered';
+	is-deeply $first.provider.seen.map({ $_<function><name> }).List, ('write',),
+		'the first call still reached the provider';
+	is-deeply $second.provider.seen.map({ $_<function><name> }).List, ('write',),
+		'as did the second: a silent decision is still a decision to forward';
+	is $book.list.elems, 1, 'the book is unchanged -- deciding by a grant is not an event';
+	is @granted.elems, 0, 'so on-grant is not told again about a grant it never made';
+
+	# The other branch. A deny grant that lands while a call waits refuses it in
+	# the words a deny RULE uses, not in the words of a human who has just said no
+	# -- because no human said anything about this call.
+	{
+		my $shut = Lock.new;
+		my $shutting = MCP::Client::Policy::Grants.new;
+		my @second-thoughts;
+		my $policy = asking-policy(
+			grants-store => $shutting, ask-lock => $shut,
+			on-ask => -> %request { @second-thoughts.push(%request<tool>); { action => 'allow-once' } },
+		);
+
+		my $work;
+		$shut.protect: {
+			$work = start { $policy.execute-tool-calls([call('1', 'write', '{"path":"scratch/a"}'),]) };
+			sleep 0.2;
+			$shutting.add([{ tool => 'write', decision => 'deny', under => '/srv/scratch' },]);
+		}
+
+		await Promise.anyof($work, Promise.in(TIMEOUT));
+		die 'Timed out waiting for the queued call to be refused' if $work.status === Planned;
+
+		my %out = $work.result[0];
+		ok %out<is_error> && %out<content>.contains("matched the rule 'deny write under /srv/scratch'"),
+			'a deny grant refuses the queued call in the same words a deny rule would';
+		is $policy.provider.seen.elems, 0, 'and the provider never sees it';
+	}
+};
+
+# === The book, asked by hand ===
+
+subtest 'grant-decision: the book, asked directly' => {
+	plan 9;
+
+	# A host with its own dialog -- its own lock, its own pane, its own idea of
+	# what a question looks like -- asks the human itself rather than through
+	# &on-ask, and needs the same check the policy makes before it opens that
+	# dialog. Otherwise the session's "always" is only honoured for the agents
+	# that happen to go through the callback.
+	my $policy = MCP::Client::Policy.new(
+		provider => ScriptedProvider.new,
+		rules => [{ tool => 'read', decision => 'allow' },],
+		roots => { '' => '/srv' },
+		grants-store => MCP::Client::Policy::Grants.new(
+			grants => [
+				{ tool => 'write', decision => 'allow', under => '/srv/scratch' },
+				{ tool => 'delete', decision => 'deny' },
+				{ tool => 'edit', decision => 'allow' },
+			],
+		),
+	);
+
+	my %allowed = $policy.grant-decision('write', '{"path":"scratch/a"}');
+	is %allowed<action>, 'allow-once',
+		'a grant that allows answers in the shape a callback may return verbatim';
+	is-deeply %allowed<rule>, { tool => 'write', decision => 'allow', under => '/srv/scratch' },
+		'and says which grant decided it, so a UI can say why it did not ask';
+
+	my %refused = $policy.grant-decision('delete', '{"path":"scratch/a"}');
+	is %refused<action>, 'deny-once', 'a grant that denies answers with the refusing action';
+	ok %refused<message>.contains("matched the rule 'deny delete'"),
+		'and carries the rule-shaped refusal the policy would have used itself';
+
+	# Nothing to say is the type object, not an empty hash: `with` is the test,
+	# and a host that forgot to make one gets no answer rather than a wrong one.
+	nok $policy.grant-decision('move', '{"path":"scratch/a"}').defined,
+		'a tool no grant names is not decided';
+	nok $policy.grant-decision('write', '{"path":"live/x"}').defined,
+		'nor is a call outside the directory the grant covers';
+
+	# Only the grants. A static allow decided its call before anything asked, so
+	# a host asking "has the human already said yes to this?" must not be told
+	# yes by a rule.
+	nok $policy.grant-decision('read', '{"path":"live/x"}').defined,
+		'and the static rules are not consulted at all';
+
+	# Arguments that will not parse are treated exactly as a real decision treats
+	# them: never a throw, and a path predicate that cannot be evaluated fails
+	# closed.
+	is $policy.grant-decision('edit', '{not json').<action>, 'allow-once',
+		'a grant naming a bare tool decides a call whose arguments cannot be read';
+	nok $policy.grant-decision('write', '{not json').defined,
+		'while one scoped to a directory cannot, and says so by saying nothing';
+};
+
+subtest 'the fleet: the human answers "always" once, with an agent already queued' => {
+	plan 6;
+
+	# The whole point, end to end and with nothing simulated: two agents want the
+	# same thing at the same moment, the second is already waiting on the lock
+	# when the first one's human says "always", and the human is not asked twice.
+	#
+	# This is deterministic rather than lucky. An "always" answer is written to
+	# the book while the ask-lock is still held, so the grant is visible to the
+	# waiter's re-check strictly before the waiter can wake -- the ordering that
+	# makes the first waiter in the queue as safe as the tenth. (And the gate
+	# below cannot produce a false pass: an agent that had NOT reached the lock
+	# yet would find the same grant at the front of its decision instead, and
+	# would not ask either.)
+	my $gate = Lock.new;
+	my $book = MCP::Client::Policy::Grants.new;
+
+	my $counter = Lock.new;
+	my $asks = 0;
+	my $entered = Promise.new;
+	my $release = Promise.new;
+
+	my &ask = -> %request {
+		my $first = $counter.protect: { ++$asks == 1 };
+		if $first {
+			# Inside the lock, with the question open: exactly where a human
+			# reading a dialog is, and exactly when the other agent arrives.
+			$entered.keep;
+			await Promise.anyof($release, Promise.in(TIMEOUT));
+		}
+		{ action => 'always-allow' };
+	};
+
+	my $first = asking-policy(grants-store => $book, ask-lock => $gate, on-ask => &ask);
+	my $second = asking-policy(grants-store => $book, ask-lock => $gate, on-ask => &ask);
+
+	my $one = start { $first.execute-tool-calls([call('1', 'write', '{"path":"scratch/a"}'),]) };
+	await Promise.anyof($entered, Promise.in(TIMEOUT));
+	die 'Timed out waiting for the first agent to reach the question' unless $entered;
+
+	my $two = start { $second.execute-tool-calls([call('2', 'write', '{"path":"scratch/b"}'),]) };
+
+	# Queueing is not directly observable -- there is nothing to await on the far
+	# side of a Lock -- so the second agent is given a moment to park on it before
+	# the human answers.
+	sleep 0.2;
+	$release.keep;
+
+	await Promise.anyof(Promise.allof($one, $two), Promise.in(TIMEOUT));
+	die 'Timed out waiting for the two agents to be decided'
+		if $one.status === Planned || $two.status === Planned;
+
+	is $asks, 1, 'the human was asked exactly once, with two agents wanting the answer';
+	nok $one.result[0]<is_error>, 'the agent that asked is allowed';
+	nok $two.result[0]<is_error>, 'and the agent that waited is allowed by the answer it waited for';
+	is $book.list.elems, 1, 'one question, one grant: the waiter remembered nothing of its own';
+	is-deeply $first.provider.seen.map({ $_<function><name> }).List, ('write',),
+		'the first call reached the provider';
+	is-deeply $second.provider.seen.map({ $_<function><name> }).List, ('write',),
+		'and so did the second';
+};

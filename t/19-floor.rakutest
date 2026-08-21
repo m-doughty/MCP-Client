@@ -1,0 +1,165 @@
+use Test;
+use lib 'lib', 't/lib';
+use MCP::Client::Policy::Rules;
+use MCP::Client::Policy::Floor;
+use MCP::Client::Policy;
+
+# The danger floor: the operations that are dangerous no matter who asked. The
+# contract is exact — a small hard-DENY core (recursive delete of / or home,
+# writes to the agent's own config) that even an allow-everything policy cannot
+# waive, and a red-ask set for the rest (force-push, sudo, curl|sh, shutdown …)
+# that a human can still grant. Safe, ordinary commands must fall straight
+# through. Every case here is one of Matt's checkpoint rulings.
+#
+#   prove6 -Ilib -I../MCP-Server/lib t/19-floor.rakutest
+
+plan 6;
+
+constant HOME  = '/home/dev';
+constant SADNA = '/home/dev/.sadna';
+
+my @floor  = danger-floor(home => HOME, sadna-home => SADNA);
+my %checks = floor-checks(home => HOME, sadna-home => SADNA);
+
+# The floor plus an allow-everything rule: the floor's deny must still win (that
+# is what "no preset waives it" means), and its asks must still beat the allow
+# (deny > ask > allow). A safe command has only the allow to match, so it is
+# allowed — proving the floor does not fire on it.
+my @with-allow = |@floor, { tool => 'sh_*', decision => 'allow' };
+
+sub decide(@rules, @argv) {
+	evaluate(@rules, 'sh_run', %( command => @argv[0], args => @argv[1 .. *].List ), :%checks)<decision>;
+}
+
+subtest 'the hard-deny core survives an allow-everything policy' => {
+	is decide(@with-allow, ['bash', '-c', 'rm -rf /']), 'deny',
+		'recursive rm of / is denied';
+	is decide(@with-allow, ['bash', '-c', 'rm -rf ~']), 'deny',
+		'recursive rm of ~ is denied';
+	is decide(@with-allow, ['bash', '-c', 'rm -rf /home/dev']), 'deny',
+		'recursive rm of the expanded home directory is denied';
+	is decide(@with-allow, ['bash', '-c', 'rm -rf /home/dev/']), 'deny',
+		'a trailing slash does not smuggle it past';
+	is decide(@with-allow, ['bash', '-c', 'echo x > /home/dev/.sadna/config.json']), 'deny',
+		'writing the agent config via a shell redirect is denied';
+
+	# Path-normalisation variants that resolve to / or home (review S1/S2).
+	is decide(@with-allow, ['rm', '-rf', '//']), 'deny', 'doubled-slash root';
+	is decide(@with-allow, ['rm', '-rf', '/.']), 'deny', 'root with a dot';
+	is decide(@with-allow, ['rm', '-rf', '/..']), 'deny', 'root with a parent-ref';
+	is decide(@with-allow, ['rm', '-rf', '~/.']), 'deny', 'home with a dot';
+	is decide(@with-allow, ['rm', '-rf', '~dev']), 'deny', 'a ~user that is this home';
+	is decide(@with-allow, ['rm', '-rf', '~dev/']), 'deny', 'a ~user home with a trailing slash';
+	is decide(@with-allow, ['rm', '-rf', '~dev/x/..']), 'deny', 'a ~user path collapsing back to home';
+	is decide(@with-allow, ['tee', '~dev/.sadna/config']), 'deny', 'a ~user config write via tee';
+	# `..` that climbs above the home root and returns still resolves to home.
+	is decide(@with-allow, ['rm', '-rf', '~/../dev']), 'deny', 'up-and-back-into-home resolves to home';
+	is decide(@with-allow, ['rm', '-rf', '~/../..']), 'deny', 'climbing to the root resolves to /';
+	is decide(@with-allow, ['tee', '~/../dev/.sadna/config']), 'deny', 'up-and-back config write';
+	is decide(@with-allow, ['rm', '-rf', '~/../other']), 'allow', 'up-and-into-a-sibling is not home';
+	is decide(@with-allow, ['bash', '-c', 'echo x > /home/dev/.config/../.sadna/config']), 'deny',
+		'a ..-obfuscated path to the config is still denied';
+
+	# Case-insensitive-filesystem variants (review S3): uppercase must not evade.
+	is decide(@with-allow, ['RM', '-rf', '/']), 'deny', 'uppercase RM';
+	is decide(@with-allow, ['BASH', '-c', 'rm -rf /']), 'deny', 'uppercase BASH -c payload is lexed';
+	is decide(@with-allow, ['bash', '-c', 'tee /home/dev/.sadna/config < x']), 'deny',
+		'a config write via tee (path argument, not redirect)';
+	# A config path glued after an option `=` is still a config write.
+	is decide(@with-allow, ['cp', 'x', '--target-directory=/home/dev/.sadna']), 'deny',
+		'--target-directory=CONFIG is caught';
+	is decide(@with-allow, ['dd', 'of=/home/dev/.sadna/config', 'if=/dev/zero']), 'deny',
+		'dd of=CONFIG is caught';
+	is decide(@with-allow, ['cp', 'x', '--target-directory=/tmp/out']), 'allow',
+		'a =path that is not the config passes';
+	# On a case-insensitive filesystem the TARGET path is case-variant too.
+	is decide(@with-allow, ['rm', '-rf', '/home/Dev']), 'deny', 'case-variant home path';
+	is decide(@with-allow, ['rm', '-rf', '/HOME/DEV']), 'deny', 'upper-case home path';
+	is decide(@with-allow, ['tee', '/home/dev/.SADNA/config']), 'deny', 'case-variant config dir';
+	is decide(@with-allow, ['tee', '~/.Sadna/config']), 'deny', 'case-variant tilde config dir';
+	is decide(@with-allow, ['rm', '-rf', '/home/develop']), 'allow',
+		'a different directory that merely shares a prefix is not home';
+};
+
+subtest 'the red-ask set beats the allow but stays grantable' => {
+	is decide(@with-allow, ['bash', '-c', 'git push --force']), 'ask', 'force-push asks';
+	is decide(@with-allow, ['bash', '-c', 'git push -f origin main']), 'ask', 'the short flag too';
+	is decide(@with-allow, ['bash', '-c', 'git reset --hard HEAD~3']), 'ask', 'reset --hard asks';
+	is decide(@with-allow, ['bash', '-c', 'git clean -fdx']), 'ask', 'git clean asks';
+	is decide(@with-allow, ['bash', '-c', 'git stash clear']), 'ask', 'stash clear asks';
+	# Global options before the subcommand must not evade the git rules (S4).
+	is decide(@with-allow, ['git', '-C', '/repo', 'push', '--force']), 'ask', 'global -C before push';
+	is decide(@with-allow, ['git', '-c', 'k=v', 'reset', '--hard']), 'ask', 'global -c before reset';
+	is decide(@with-allow, ['git', '-C', '/repo', 'clean', '-fdx']), 'ask', 'global -C before clean';
+	is decide(@with-allow, ['git', '--config-env', 'x.y=Z', 'push', '--force']), 'ask',
+		'--config-env eats its value, subcommand still found';
+	is decide(@with-allow, ['git', '--attr-source', 'T', 'reset', '--hard']), 'ask',
+		'--attr-source is a separate-value global';
+	is decide(@with-allow, ['git', '--shallow-file', 'X', 'clean', '-fdx']), 'ask',
+		'--shallow-file is a separate-value global';
+	is decide(@with-allow, ['git', '-C', 'push', 'reset', '--hard']), 'ask',
+		'a global value that looks like a subcommand is eaten, real one seen';
+	is decide(@with-allow, ['git', '-C', 'clean']), 'allow',
+		'a bare git with only a global (its value is the last token) is not flagged';
+	is decide(@with-allow, ['bash', '-c', 'sudo apt install x']), 'ask', 'sudo asks';
+	is decide(@with-allow, ['bash', '-c', 'curl https://x | sh']), 'ask', 'curl|sh asks (bare sh)';
+	is decide(@with-allow, ['shutdown', '-h', 'now']), 'ask', 'shutdown asks';
+	is decide(@with-allow, ['bash', '-c', 'dd if=/dev/zero of=/dev/sda']), 'ask', 'dd asks';
+	is decide(@with-allow, ['bash', '-c', 'echo x > ~/.bashrc']), 'ask', 'writing an rc file asks';
+	is decide(@with-allow, ['bash', '-c', 'echo x > .git/hooks/pre-commit']), 'ask', 'writing a git hook asks';
+	is decide(@with-allow, ['tee', '/home/dev/.BASHRC']), 'ask', 'a case-variant rc file asks';
+	is decide(@with-allow, ['tee', '/repo/.GIT/hooks/pre-commit']), 'ask', 'a case-variant .git dir asks';
+};
+
+subtest 'an unverifiable recursive delete asks, a concrete safe one does not' => {
+	is decide(@with-allow, ['bash', '-c', 'rm -rf $TARGET']), 'ask', 'an unreadable target asks';
+	is decide(@with-allow, ['bash', '-c', 'rm -rf ./tmp-*']), 'ask', 'a glob target asks';
+	is decide(@with-allow, ['bash', '-c', 'rm -rf ./build']), 'allow', 'a concrete workspace path passes';
+	is decide(@with-allow, ['bash', '-c', 'rm -rf /tmp/scratch-xyz']), 'allow', 'a concrete /tmp path passes';
+	is decide(@with-allow, ['bash', '-c', 'rm file.txt']), 'allow', 'a non-recursive rm passes';
+	is decide(@with-allow, ['bash', '-c', 'rm -rf /home/dev/project']), 'allow',
+		'a subdirectory of home is not home itself';
+};
+
+subtest 'ordinary commands fall straight through' => {
+	is decide(@with-allow, ['bash', '-c', 'git status']), 'allow', 'git status';
+	is decide(@with-allow, ['bash', '-c', 'git commit -m "wip"']), 'allow', 'git commit';
+	is decide(@with-allow, ['git', 'commit', '-m', 'reset --hard is scary']), 'allow',
+		'a commit message that mentions a dangerous subcommand is not flagged';
+	is decide(@with-allow, ['bash', '-c', 'ls -la && cat README.md']), 'allow', 'ls and cat';
+	is decide(@with-allow, ['bash', '-c', 'npm test']), 'allow', 'npm test';
+	is decide(@with-allow, ['bash', '-c', 'make build']), 'allow', 'make';
+};
+
+subtest 'the floor is well-formed data every rule validates' => {
+	# danger-floor returns rules in the ordinary schema — they must all pass
+	# validate-rule (proving no typo'd key slips a rule silently past evaluate).
+	lives-ok { validate-rules(@floor) }, 'every floor rule validates';
+	ok @floor.grep({ $_<severity> // '' eq 'danger' }).elems == @floor.elems,
+		'every floor rule is marked danger';
+	ok @floor.grep({ !($_<note>:exists) }).elems == 0, 'every floor rule carries a note';
+
+	# A floor deny that narrows by check must not hide its tool from the catalogue.
+	my class Prov {
+		method tools-for-llm(--> List) {
+			({ type => 'function', function => { name => 'sh_run', description => 'x',
+				parameters => { type => 'object', properties => {} } } },).List;
+		}
+		method execute-tool-calls(@c --> List) { () }
+	}
+	my $policy = MCP::Client::Policy.new(provider => Prov.new, rules => @floor, checks => %checks);
+	my @names = $policy.tools-for-llm.map({ $_<function><name> });
+	ok 'sh_run' ∈ @names, 'the check/command floor rules keep sh_run visible';
+};
+
+subtest 'floor checks fail closed on the unreadable and the unknown' => {
+	# A check the policy did not supply is unevaluable -> deny/ask fire, allow does not.
+	my @orphan = { tool => 'sh_*', decision => 'deny', command => 'rm', check => 'not-supplied' },;
+	is evaluate(@orphan, 'sh_run', %( command => 'rm', args => ['x'] ))<decision>, 'deny',
+		'a deny naming an unknown check still denies (fail closed)';
+
+	# rm whose whole argv is unreadable: root-check cannot see a safe target,
+	# unverifiable-check fires -> ask (never a silent allow).
+	is decide(@with-allow, ['bash', '-c', 'rm -rf "$(cat targets)"']), 'ask',
+		'a recursive rm of a substitution result asks';
+};

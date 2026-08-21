@@ -1,0 +1,482 @@
+use Test;
+use lib 'lib', 't/lib';
+use JSON::Fast;
+use MCP::Client::Exceptions;
+use MCP::Client::Policy;
+use MCP::Client::Reasons;
+use MCP::Client::Registry;
+
+# The reason layer: one optional `reason` parameter added to every tool the
+# model can see, and deleted again before any server sees a call. Two
+# properties carry the whole design, and every subtest here is about one of
+# them. First, it is INVISIBLE DOWNSTREAM -- what a server receives is what it
+# would have received without this layer in the stack, byte for byte wherever
+# nothing was stripped. Second, it is wrong in the SAFE direction: a tool with
+# a `reason` of its own is left completely alone in both directions, and a call
+# this layer never published a `reason` for is forwarded untouched, because
+# deleting a genuine argument is a silent corruption while an unexpected one is
+# the server's own validation problem.
+#
+# So: construction (1), the catalogue and the collision rule (2-3), the strip
+# and everything it must not touch (4-5), the augmented set tracking a refresh
+# (6), the never-throws contract (7), and finally the whole point -- stacked
+# under a policy, the human's prompt carries the reason the server never gets
+# (8).
+#
+#   prove6 -Ilib t/21-reasons.rakutest
+
+plan 8;
+
+constant WHY = 'One short sentence: why this call. Shown to the human reviewing the session.';
+
+# === Doubles ===
+
+# The t/20 provider, with the declarations supplied per test rather than
+# derived from names: this layer's whole job is rewriting schemas, so the
+# schemas have to be the variable. It keeps the call objects themselves so
+# "forwarded untouched" can be asserted by identity rather than inferred.
+my class ScriptedProvider {
+	has Str:D $.label = 'fs';
+	has @.declarations;
+	has Bool:D $.explode = False;
+	has Bool:D $.explode-listing = False;
+	has Int $.short;
+
+	has Lock $!lock .= new;
+	has @!batches;
+
+	#| The names of the calls in each batch this provider was handed, in order.
+	method batches(--> List:D) {
+		$!lock.protect: { @!batches.map({ $_.map({ name-of($_) // '?' }).List }).List };
+	}
+
+	#| Every call object this provider saw, flattened, in order.
+	method seen(--> List:D) {
+		$!lock.protect: { @!batches.map(*.Slip).List };
+	}
+
+	method tools-for-llm(--> List) {
+		die "the $!label provider cannot list its tools" if $!explode-listing;
+		@!declarations.List;
+	}
+
+	method execute-tool-calls(@tool-calls --> List) {
+		die "the $!label provider is not answering" if $!explode;
+
+		$!lock.protect: { @!batches.push([@tool-calls]) };
+
+		my @answers = @tool-calls.map(-> $tc {
+			%(
+				role => 'tool',
+				tool_call_id => id-of($tc),
+				content => "$!label:{name-of($tc) // 'unreadable'}",
+				is_error => False,
+			);
+		}).list;
+
+		$!short.defined ?? @answers.head($!short).List !! @answers.List;
+	}
+}
+
+my class HalfProvider {
+	method tools-for-llm(--> List) { () }
+}
+
+# === Helpers ===
+
+sub name-of($call) {
+	return Str unless $call ~~ Associative;
+	my $function = $call<function>;
+	$function ~~ Associative && $function<name> ~~ Str:D ?? $function<name> !! Str;
+}
+
+sub id-of($call) {
+	$call ~~ Associative ?? ($call<id> // '') !! '';
+}
+
+sub call(Str:D $id, Str:D $name, $arguments = %()) {
+	%( id => $id, function => %( name => $name, arguments => $arguments ) );
+}
+
+#| One tool declaration, as a server's catalogue renders it.
+sub decl(Str:D $name, :%properties, :@required --> Hash:D) {
+	my %parameters = type => 'object', properties => %properties;
+	%parameters<required> = @required.List if @required;
+
+	%(
+		type => 'function',
+		function => %(
+			name => $name,
+			description => "does $name",
+			parameters => %parameters,
+		),
+	);
+}
+
+#| The usual three: one with required arguments, one with none at all, and one
+#| that declares a `reason` of its own.
+sub declarations(--> List:D) {
+	(
+		decl('fs_read', properties => %( path => %( type => 'string' ) ), required => ['path',]),
+		decl('fs_ping'),
+		decl('note_add', properties => %( reason => %( type => 'string' ), text => %( type => 'string' ) )),
+	).List;
+}
+
+sub provider(*%opts --> ScriptedProvider:D) {
+	ScriptedProvider.new(declarations => [|declarations()], |%opts);
+}
+
+sub reasons-over($provider --> MCP::Client::Reasons:D) {
+	MCP::Client::Reasons.new(:$provider);
+}
+
+#| The arguments of a call as the provider that received it would read them:
+#| an object stays an object, a JSON string is parsed, and the empty string a
+#| model sends for a tool with no arguments is no arguments.
+sub args-of($call --> Hash:D) {
+	my $raw = $call ~~ Associative && $call<function> ~~ Associative
+		?? $call<function><arguments>
+		!! Any;
+
+	return %() without $raw;
+	return $raw.Hash if $raw ~~ Associative;
+	return %() if $raw.Str.trim eq '';
+
+	my $parsed = try from-json($raw.Str);
+	$parsed ~~ Associative ?? $parsed.Hash !! %();
+}
+
+sub tool-named(@tools, Str:D $name) {
+	@tools.first({ ($_<function><name> // '') eq $name });
+}
+
+# === 1. Construction ===
+
+subtest 'construction refuses what it could not honour' => {
+	plan 5;
+
+	throws-like { MCP::Client::Reasons.new(provider => provider(), providers => 'oops') },
+		X::MCP::Client,
+		message => /'unknown option'/,
+		'a mistyped option is an error rather than a layer that augments nothing';
+
+	throws-like { MCP::Client::Reasons.new(provider => HalfProvider.new) },
+		X::MCP::Client,
+		message => /'execute-tool-calls'/,
+		'half a provider is not a provider';
+
+	throws-like { MCP::Client::Reasons.new(provider => ScriptedProvider) },
+		X::MCP::Client,
+		message => /'type object'/,
+		'and neither is the type object of a whole one';
+
+	throws-like { MCP::Client::Reasons.new }, Exception,
+		'a reason layer over nothing is not buildable';
+
+	is reasons-over(provider()).augmented-tools.elems, 0,
+		'a fresh layer has augmented nothing: the set comes from a listing, not from construction';
+};
+
+# === 2. The catalogue ===
+
+subtest 'every readable tool gains an optional reason, and nothing else changes' => {
+	plan 11;
+
+	my $fs = provider();
+	my $reasons = reasons-over($fs);
+	my @out = $reasons.tools-for-llm;
+
+	is-deeply @out.map({ $_<function><name> }).List, <fs_read fs_ping note_add>.List,
+		'the catalogue keeps its tools, in order';
+
+	my $read = tool-named(@out, 'fs_read');
+	is $read<function><parameters><properties><reason><type>, 'string',
+		'a tool with arguments gains a reason string';
+	is $read<function><parameters><properties><reason><description>, WHY,
+		'described in the words the model is meant to act on';
+	is-deeply $read<function><parameters><required>.List, <path>.List,
+		'and the reason is NOT required: an omitted why must never cost a turn on a schema error';
+	is $read<function><parameters><properties><path><type>, 'string',
+		'the tool\'s own parameters are still there';
+	is $read<function><description>, 'does fs_read', 'and the rest of the declaration is untouched';
+
+	my $ping = tool-named(@out, 'fs_ping');
+	is-deeply $ping<function><parameters><properties>.keys.List, <reason>.List,
+		'a tool that takes no arguments gains one too -- a human wants the why of those as well';
+	nok $ping<function><parameters><required>:exists,
+		'and gains no required list of its own';
+
+	nok $fs.declarations[0]<function><parameters><properties><reason>:exists,
+		'the provider\'s own declaration was copied, not edited under it';
+
+	is-deeply reasons-over(ScriptedProvider.new(declarations => [])).tools-for-llm.List, ().List,
+		'an empty catalogue is an empty catalogue';
+
+	# A declaration this layer cannot read is not one it can extend either.
+	my $odd = ScriptedProvider.new(declarations => [
+		%( weird => 1 ),
+		%( type => 'function', function => %( name => 'no_schema' ) ),
+		%( type => 'function', function => %( name => 'bad_props', parameters => %( properties => 'nope' ) ) ),
+		'not even a hash',
+	]);
+	my $layer = reasons-over($odd);
+	my @through = $layer.tools-for-llm;
+	ok (@through.keys.grep({ @through[$_] === $odd.declarations[$_] }).elems == 4)
+			&& $layer.augmented-tools.elems == 0,
+		'unreadable declarations pass through as the very objects they were, and are not tracked';
+};
+
+# === 3. The collision rule ===
+
+subtest 'a tool with a reason of its own is left completely alone, both ways' => {
+	plan 7;
+
+	my $fs = provider();
+	my $reasons = reasons-over($fs);
+	my @out = $reasons.tools-for-llm;
+
+	my $note = tool-named(@out, 'note_add');
+	ok $note === $fs.declarations[2],
+		'its declaration is passed through as the very object it was';
+	nok $note<function><parameters><properties><reason><description>:exists,
+		'so its own reason parameter keeps its own (absent) description';
+	is-deeply $reasons.augmented-tools.List, <fs_ping fs_read>.List,
+		'and it is not in the augmented set (which is sorted, not the catalogue\'s order)';
+
+	# The direction that matters: its `reason` is a real argument.
+	my $sent = call('1', 'note_add', %( text => 'hi', reason => 'the server wants this' ));
+	$reasons.execute-tool-calls([$sent]);
+
+	ok $fs.seen[0] === $sent, 'a call to it is forwarded as the very object it came in as';
+	is args-of($fs.seen[0])<reason>, 'the server wants this',
+		'with its reason intact -- stripping it would corrupt every call to that tool';
+
+	# A schema naming `reason` in `required` without declaring it is odd, but
+	# its author plainly means something by the name.
+	my $odd = ScriptedProvider.new(declarations => [
+		decl('claim', properties => %( text => %( type => 'string' ) ), required => <reason text>.List),
+	]);
+	my $layer = reasons-over($odd);
+	my @listed = $layer.tools-for-llm;
+
+	ok @listed[0] === $odd.declarations[0],
+		'a schema that requires a reason it does not declare is left alone as well';
+	is-deeply $layer.augmented-tools.List, ().List, 'and is not tracked either';
+};
+
+# === 4. The strip ===
+
+subtest 'the reason never reaches the provider, whichever shape it arrived in' => {
+	plan 9;
+
+	my $fs = provider();
+	my $reasons = reasons-over($fs);
+	$reasons.tools-for-llm;
+
+	# The shape a model's function call actually travels as.
+	my @out = $reasons.execute-tool-calls([
+		call('1', 'fs_read', '{"path":"src/app.raku","reason":"Check the guard clause you asked about"}'),
+	]);
+
+	my %got = args-of($fs.seen[0]);
+	nok %got<reason>:exists, 'the provider is handed the call with no reason key at all';
+	is %got<path>, 'src/app.raku', 'and every other argument survives';
+	is $fs.seen[0]<function><arguments>.WHAT, Str,
+		'a JSON string is still a JSON string on the way down';
+	is $fs.seen[0]<id>, '1', 'the id is the caller\'s';
+	nok @out[0]<is_error>, 'and the call itself is unremarkable';
+
+	# The shape a caller that parsed the arguments itself hands on.
+	$reasons.execute-tool-calls([
+		call('2', 'fs_read', %( path => 'README.md', reason => 'Read it before editing' )),
+	]);
+	my %object = args-of($fs.seen[1]);
+	nok %object<reason>:exists, 'an object argument is stripped the same way';
+	is %object<path>, 'README.md', 'keeping the rest';
+	is $fs.seen[1]<function><arguments>.WHAT, Hash, 'and staying an object';
+
+	# A tool with no arguments of its own, called with only a reason.
+	$reasons.execute-tool-calls([call('3', 'fs_ping', '{"reason":"Say hello"}'),]);
+	is-deeply args-of($fs.seen[2]).List, ().List,
+		'a call that was nothing but a reason arrives as a call with no arguments';
+};
+
+# === 5. What must not be touched ===
+
+subtest 'everything else is forwarded as the very object it came in as' => {
+	plan 8;
+
+	my $fs = provider();
+	my $reasons = reasons-over($fs);
+	$reasons.tools-for-llm;
+
+	# A tool this layer has never seen listed: it did not put a reason there,
+	# so it has no business taking one away.
+	my $unknown = call('1', 'never_listed', '{"reason":"mine","x":1}');
+	my $no-reason = call('2', 'fs_read', %( path => 'a.txt' ));
+	my $empty = call('3', 'fs_ping', '');
+	my $blank = call('4', 'fs_ping', '   ');
+	my $unparseable = call('5', 'fs_read', '{"path": ');
+	my $not-object = call('6', 'fs_read', '["reason"]');
+	my $nameless = %( id => '7', function => %( arguments => '{"reason":"x"}' ) );
+
+	my @sent = $unknown, $no-reason, $empty, $blank, $unparseable, $not-object, $nameless;
+	my @out = $reasons.execute-tool-calls(@sent);
+
+	is $fs.seen.elems, 7, 'every call reached the provider';
+	ok (^7).map({ $fs.seen[$_] === @sent[$_] }).all.so,
+		'each as the very object the caller passed -- nothing was rebuilt';
+	is args-of($fs.seen[0])<reason>, 'mine',
+		'an unlisted tool keeps its reason: when in doubt, do not strip';
+	is $fs.seen[2]<function><arguments>, '',
+		'the empty string models send for a no-argument call is not normalised into "{}"';
+	is $fs.seen[4]<function><arguments>, '{"path": ',
+		'arguments that will not parse are the provider\'s problem to report, not this layer\'s to guess at';
+
+	is-deeply @out.map({ $_<tool_call_id> }).List, ('1', '2', '3', '4', '5', '6', '7'),
+		'the results come back in the caller\'s order, one per call';
+	is-deeply @out.map({ $_<content> }).List,
+		('fs:never_listed', 'fs:fs_read', 'fs:fs_ping', 'fs:fs_ping', 'fs:fs_read', 'fs:fs_read',
+			'fs:unreadable').List,
+		'with the provider\'s own answers, untouched';
+	nok @out.grep({ $_<is_error> }).elems,
+		'and none of them turned into an error on the way past';
+};
+
+# === 6. Refreshing the catalogue ===
+
+subtest 'the augmented set is the last listing\'s, and a refresh moves it' => {
+	plan 6;
+
+	my $fs = provider();
+	my $reasons = reasons-over($fs);
+
+	# Before any listing, nothing is augmented -- so nothing is stripped, which
+	# is the safe direction for a host that dispatches before it lists.
+	$reasons.execute-tool-calls([call('0', 'fs_read', %( path => 'a', reason => 'early' )),]);
+	is args-of($fs.seen[0])<reason>, 'early',
+		'a call made before the catalogue was ever listed is forwarded whole';
+
+	$reasons.tools-for-llm;
+	is-deeply $reasons.augmented-tools.List, <fs_ping fs_read>.List, 'the first listing sets the set';
+
+	# The downstream catalogue changes underneath: one tool gone, one arrived.
+	$fs.declarations = [
+		decl('fs_read', properties => %( path => %( type => 'string' ) )),
+		decl('task', properties => %( prompt => %( type => 'string' ) )),
+	];
+
+	my @out = $reasons.tools-for-llm;
+	is-deeply $reasons.augmented-tools.List, <fs_read task>.List,
+		'the second listing replaces it rather than accumulating';
+	ok tool-named(@out, 'task')<function><parameters><properties><reason>:exists,
+		'the newly published tool is augmented -- the task tool most of all, delegation being '
+			~ 'exactly the call a human wants the why of';
+
+	$reasons.execute-tool-calls([
+		call('1', 'task', %( prompt => 'go', reason => 'Split the work' )),
+		call('2', 'fs_ping', %( reason => 'still here?' )),
+	]);
+	nok args-of($fs.seen[1])<reason>:exists, 'a call to the new tool is stripped';
+	is args-of($fs.seen[2])<reason>, 'still here?',
+		'and one to the tool that vanished from the catalogue is not';
+};
+
+# === 7. Never throws ===
+
+subtest 'never throws, whatever the provider or the caller does' => {
+	plan 6;
+
+	my $dead = provider(explode => True);
+	my $reasons = reasons-over($dead);
+	$reasons.tools-for-llm;
+
+	my @out = $reasons.execute-tool-calls([
+		call('1', 'fs_read', %( path => 'a', reason => 'why' )),
+		call('2', 'fs_ping'),
+	]);
+	is @out.elems, 2, 'a provider that died still owes one result per call';
+	ok @out.all.<is_error>.so, 'each an error';
+	is-deeply @out.map({ $_<tool_call_id> }).List, ('1', '2'), 'at the caller\'s ids';
+	like @out[0]<content>, /'tool provider failed'/, 'saying whose fault it was';
+
+	# A provider that came up short must not leave a hole in the caller's list.
+	my $short = ScriptedProvider.new(declarations => [|declarations()], short => 1);
+	my @two = reasons-over($short).execute-tool-calls([call('1', 'fs_read'), call('2', 'fs_read')]);
+	ok @two[1]<is_error> && @two[1]<content>.contains('no result'),
+		'a missing answer is an error result, not a hole';
+
+	# The deliberate asymmetry: listing throws rather than publishing a shorter
+	# catalogue than the model was promised.
+	dies-ok { reasons-over(provider(explode-listing => True)).tools-for-llm },
+		'a provider that cannot list its tools takes the listing down with it';
+};
+
+# === 8. Under a policy, which is the whole point ===
+
+subtest 'stacked under a policy, the human sees the reason and the server does not' => {
+	plan 10;
+
+	my $fs = ScriptedProvider.new(declarations => [
+		decl('read', properties => %( path => %( type => 'string' ) )),
+		decl('write', properties => %( path => %( type => 'string' ), content => %( type => 'string' ) )),
+	]);
+
+	my $registry = MCP::Client::Registry.new;
+	$registry.add($fs, prefix => 'fs');
+
+	my $reasons = MCP::Client::Reasons.new(provider => $registry);
+
+	my @asked;
+	my $policy = MCP::Client::Policy.new(
+		provider => $reasons,
+		# `under` names a directory the policy locates through the same roots
+		# the server publishes under: the point of the rule here is that an
+		# extra `reason` argument does not disturb the location engine.
+		rules => [{ tool => 'fs_read', decision => 'allow', under => '/srv/docs' },],
+		roots => { fs => '/srv' },
+		on-ask => -> %request {
+			@asked.push: %request;
+			%( action => %request<arguments><path> eq 'notes.md' ?? 'always-allow' !! 'allow-once' );
+		},
+	);
+
+	# The catalogue the model is given: prefixed by the registry, augmented by
+	# the reason layer, filtered by the policy.
+	my @tools = $policy.tools-for-llm;
+	is-deeply @tools.map({ $_<function><name> }).List, <fs_read fs_write>.List,
+		'the model sees the registry\'s names';
+	is @tools[0]<function><parameters><properties><reason><description>, WHY,
+		'each carrying a reason it may fill in';
+	is-deeply $reasons.augmented-tools.List, <fs_read fs_write>.List,
+		'and the layer tracks them under the names it saw, which over a registry are prefixed';
+
+	# The ask: a call no rule matched, with the model's reason in it.
+	my @out = $policy.execute-tool-calls([
+		call('1', 'fs_write', '{"path":"notes.md","content":"x","reason":"Write up what we found"}'),
+	]);
+
+	is @asked.elems, 1, 'the write is asked about';
+	is @asked[0]<arguments><reason>, 'Write up what we found',
+		'and the prompt carries the model\'s reason -- the whole purpose of sitting under the policy';
+	is @asked[0]<call><function><arguments>.contains('reason'), True,
+		'the copy of the call it is given still has it too';
+
+	nok @out[0]<is_error>, 'the approved call goes through';
+	nok args-of($fs.seen[0])<reason>:exists,
+		'and the server receives it with no reason key, under its own unprefixed name';
+	is-deeply args-of($fs.seen[0]).sort.List, (content => 'x', path => 'notes.md').List,
+		'with everything the tool actually declared';
+
+	# The rest of the policy is unaffected by the extra argument: the grant the
+	# human left behind still fires, and a static allow with a path predicate
+	# still locates the path it is about.
+	$policy.execute-tool-calls([
+		call('2', 'fs_write', '{"path":"notes.md","content":"y","reason":"Finish it"}'),
+		call('3', 'fs_read', '{"path":"docs/readme.md","reason":"Check the wording"}'),
+	]);
+	is @asked.elems, 1,
+		'the always-allow grant answers the next write, and the allow rule the read, with no '
+			~ 'second question';
+};

@@ -1,0 +1,141 @@
+use Test;
+use lib 'lib', 't/lib';
+use MCP::Client::Policy::Rules;
+use MCP::Client::Policy::Commands;
+
+# The permanent evasion catalogue. Every entry is a way a model could try to run
+# a command a rule forbids while making the argv look like something it allows —
+# the published bypasses (Flatt Security's "8 ways", the Cursor `&&` chain, the
+# `$IFS` splitter, `${var@P}`, base64-to-sh) plus the structural ones the lexer
+# has to get right (quoted operators must NOT split, subshells and substitutions
+# must be seen into, an unbalanced quote is unreadable not empty).
+#
+# The invariant under test is one sentence: a rule that allows a benign program
+# never allows a call that also runs something else, and a rule that forbids a
+# dangerous program catches it however it was dressed up. Nothing here is about
+# a pretty decomposition — it is about the decision never coming out "allow" for
+# a call that smuggles a second command past the first.
+#
+#   prove6 -Ilib -I../MCP-Server/lib t/18-evasion.rakutest
+
+plan 4;
+
+# Build the arguments of an sh_run call from a literal argv.
+sub sh(@argv) {
+	%( command => @argv[0], args => @argv[1 .. *].List );
+}
+
+sub dec(@rules, @argv) {
+	evaluate(@rules, 'sh_run', sh(@argv))<decision>;
+}
+
+sub programs(@argv) {
+	decompose-argv(@argv).map({ $_<program> // '<unknown>' }).List;
+}
+
+# An allow rule for git, and a floor-style deny for rm: the two ends of the
+# invariant. `rm` also carries args-any so the catalogue exercises that path.
+my @allow-git = { tool => 'sh_run', decision => 'allow', command => 'git' },;
+my @deny-rm   = { tool => 'sh_run', decision => 'deny', command => 'rm' },;
+
+# Each entry hides `rm -rf /` (or another second command) behind a git call.
+my @hides-rm =
+	{ name => 'chain with &&',            argv => ['bash', '-c', 'git status && rm -rf /'] },
+	{ name => 'chain with ;',             argv => ['bash', '-c', 'git status; rm -rf /'] },
+	{ name => 'chain with ||',            argv => ['sh', '-c', 'git rev-parse || rm -rf /'] },
+	{ name => 'newline separator',        argv => ['bash', '-c', "git status\nrm -rf /"] },
+	{ name => 'IFS word-splitting',       argv => ['sh', '-c', 'git status && rm${IFS}-rf${IFS}/'] },
+	{ name => 'command substitution',     argv => ['bash', '-c', 'git $(rm -rf /)'] },
+	{ name => 'nested substitution',      argv => ['sh', '-c', 'echo $(git log $(rm -rf /))'] },
+	{ name => 'backtick substitution',    argv => ['bash', '-c', 'git `rm -rf /`'] },
+	{ name => 'subshell group',           argv => ['bash', '-c', '(git status; rm -rf /)'] },
+	{ name => 'process substitution',     argv => ['bash', '-c', 'diff <(rm -rf /) a'] },
+	{ name => 'nested sh -c',             argv => ['sh', '-c', 'git status && sh -c "rm -rf /"'] },
+	{ name => 'redirection then chain',   argv => ['bash', '-c', 'git status > out; rm -rf /'] },
+	{ name => 'brace expansion',          argv => ['bash', '-c', 'git status && rm{,x} -rf /'] },
+	# Substitution payloads that used to lex-fail and vanish (deep review find):
+	# ANSI-C quoting, locale quoting, and backticks inside a $(…) must not drop
+	# the command they carry.
+	{ name => 'ANSI-C quote in subst',    argv => ['bash', '-c', q{git $(rm -rf / $'x')}] },
+	{ name => 'locale quote in subst',    argv => ['bash', '-c', q{git $(rm $"x")}] },
+	{ name => 'backtick in subst',        argv => ['bash', '-c', 'git $(rm `x`)'] },
+	{ name => 'bare backtick',            argv => ['bash', '-c', 'git `rm -rf /`'] },
+	{ name => 'proc-sub with ANSI-C',     argv => ['bash', '-c', q{git >(rm -rf / $'x')}] },
+	# Execution-modifier builtins and control keywords must expose their command:
+	{ name => 'exec builtin',             argv => ['bash', '-c', 'git && exec rm -rf /'] },
+	{ name => 'eval string',              argv => ['bash', '-c', 'git && eval "rm -rf /"'] },
+	{ name => 'command builtin',          argv => ['bash', '-c', 'git && command rm -rf /'] },
+	{ name => 'negation keyword',         argv => ['bash', '-c', 'git && ! rm -rf /'] },
+	{ name => 'if keyword',               argv => ['bash', '-c', 'if rm -rf /; then git; fi'] },
+	{ name => 'busybox applet',           argv => ['busybox', 'rm', '-rf', '/'] },
+	{ name => 'eval as the whole argv',   argv => ['eval', 'rm -rf /'] },
+	# $"…" is a TRANSLATED double-quoted string — its $(…) still run — so it must
+	# not be treated as opaque (second review find: the first fix for $'…' wrongly
+	# swallowed these). And $'/$" are not quote-introducers inside real "…".
+	{ name => 'locale-quote substitution',argv => ['bash', '-c', q{git $"$(rm -rf /)"}] },
+	{ name => 'locale-quote backtick',    argv => ['bash', '-c', 'git $"`rm -rf /`"'] },
+	{ name => 'locale-quote embedded',    argv => ['bash', '-c', q{git $"a$(rm)b"}] },
+	{ name => 'ANSI-C inside dquotes',    argv => ['bash', '-c', q{git "$'$(rm)'"}] },
+	{ name => 'eval of a locale subst',   argv => ['bash', '-c', q{eval $"$(rm -rf /)"}] },
+;
+
+# Structural evasions that dissolve into something unreadable rather than a
+# named command: the engine must refuse to call them the benign program.
+my @unreadable =
+	{ name => 'env -S string',            argv => ['env', '-S', 'rm -rf /'] },
+	{ name => 'param transform @P',       argv => ['bash', '-c', '${payload@P}'] },
+	{ name => 'variable as program',      argv => ['sh', '-c', '$TOOL --version'] },
+	{ name => 'glob as program',          argv => ['sh', '-c', '/bin/r? -rf /'] },
+	{ name => 'unbalanced quote',         argv => ['bash', '-c', 'echo "unterminated'] },
+	{ name => 'base64 piped to sh',       argv => ['sh', '-c', 'echo cm0= | base64 -d | sh'] },
+;
+
+# Legitimate calls that only LOOK like they chain: the lexer must not over-split
+# them, or every quoted argument becomes a false refusal.
+my @benign =
+	{ name => 'operator inside quotes',   argv => ['bash', '-c', 'git commit -m "a && b || c"'], allow => @allow-git },
+	{ name => 'clustered -lc flag',       argv => ['bash', '-lc', 'git status'], allow => @allow-git },
+	{ name => 'wrapper then git',         argv => ['timeout', '30', 'git', 'push'], allow => @allow-git },
+	{ name => 'env assignment then git',  argv => ['env', 'GIT_PAGER=cat', 'git', 'log'], allow => @allow-git },
+	{ name => 'operator in single quotes',argv => ['sh', '-c', 'git grep "foo|bar"'], allow => @allow-git },
+	{ name => 'ANSI-C quote in git arg',  argv => ['bash', '-c', q{git commit -m $'a\nb'}], allow => @allow-git },
+	{ name => 'backtick-free git only',   argv => ['bash', '-c', 'git log --oneline'], allow => @allow-git },
+	{ name => 'locale-quote plain arg',   argv => ['bash', '-c', q{git commit -m $"a message"}], allow => @allow-git },
+;
+
+subtest 'a benign allow never leaks a smuggled command' => {
+	plan +@hides-rm;
+	for @hides-rm -> %e {
+		isnt dec(@allow-git, %e<argv>), 'allow',
+			"allow-git does not allow: {%e<name>}";
+	}
+};
+
+subtest 'a floor deny catches the dangerous command however it is hidden' => {
+	plan +@hides-rm;
+	for @hides-rm -> %e {
+		is dec(@deny-rm, %e<argv>), 'deny',
+			"deny-rm catches: {%e<name>}";
+	}
+};
+
+subtest 'an unreadable command is never mistaken for the benign one' => {
+	plan 2 * @unreadable;
+	for @unreadable -> %e {
+		isnt dec(@allow-git, %e<argv>), 'allow',
+			"allow-git does not allow: {%e<name>}";
+		# It should surface as unknown, or as a real second program — never as a
+		# clean single git.
+		my @progs = programs(%e<argv>);
+		ok (@progs.grep('<unknown>') || @progs.grep(* ne 'git')),
+			"decomposition of {%e<name>} is not a clean benign command";
+	}
+};
+
+subtest 'legitimate calls are still allowed — no over-refusal' => {
+	plan +@benign;
+	for @benign -> %e {
+		is dec(%e<allow>, %e<argv>), 'allow',
+			"still allowed: {%e<name>}";
+	}
+};

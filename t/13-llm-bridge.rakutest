@@ -175,7 +175,7 @@ subtest 'one result per call, in the caller\'s order, whatever happens' => {
 };
 
 subtest 'content blocks become the text a model reads' => {
-	plan 6;
+	plan 8;
 
 	# Client-only: these are shapes a *server* can answer with, and the local
 	# bridge never sees them because a local handler hands its answer straight
@@ -225,6 +225,12 @@ subtest 'content blocks become the text a model reads' => {
 
 	is @results[1]<content>, '{"structuredContent":{"ok":true}}',
 		'a result with no content array at all is rendered as JSON rather than lost';
+	is-deeply @results[1]<structured_content>, { ok => True },
+		'the remote bridge also preserves structuredContent as machine data';
+	is-deeply $server.execute-tool-calls([
+		%( id => 'local', function => %( name => 'structured', arguments => %() ) ),
+	])[0]<structured_content>, { ok => True },
+		'and the local bridge exposes the identical structured key';
 	is @results[2]<content>, '', 'and an empty result is empty';
 
 	is-deeply @results[3], %(

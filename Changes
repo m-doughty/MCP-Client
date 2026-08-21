@@ -2,6 +2,324 @@ Revision history for MCP::Client
 
 {{$NEXT}}
 
+0.5.0  2026-08-21T21:55:14+01:00
+    - execute-tool-calls reads the annotations a server publishes in its
+      tools/list catalog: a batch whose calls ALL name tools annotated
+      readOnlyHint + idempotentHint goes out on up to `tool-concurrency`
+      (default 4) in-flight requests instead of one at a time, and identical
+      calls in such a batch are ONE request whose answer is copied into each
+      slot that asked for it, under that slot's own tool_call_id. Any other
+      batch -- including one whose catalogue could not be fetched -- goes down
+      the connection one call at a time in model order, exactly as before, and
+      results are one per call in the caller's order either way. The scheduler
+      is MCP::Server::Batch, shared with MCP::Server's local bridge, so a
+      toolkit reached over MCP behaves like the same toolkit inside the
+      process. New `tool-annotations($name)` reports what a server said about
+      one of its tools; `tool-concurrency => 1` restores strict serial
+      execution.
+    - Leases now refuse hold-and-wait: an agent that already owns a lease gets
+      an immediate actionable refusal on contention and must reacquire the
+      complete working set atomically. The Table has an atomic waiter registry,
+      arbitrary-length cycle detection, cancellation cleanup, and a combined
+      status snapshot.
+    - Filesystem mutations pin their covering lease generations across provider
+      execution, deferring expiry and release until the call returns. `fs_mkdir`
+      joins the default enforced set.
+    - Structured tool results survive both local and remote LLM bridges under
+      `structured_content`. Leases consume FileSystem `sha256-v1` observations,
+      inject hidden conditional revisions into mutations, advance them on
+      success, and invalidate them on failure so stale writes fail closed.
+    - LOCK_ACQUIRE NOW WAITS, which amends the "acquisition never blocks"
+      rule this layer shipped with. A contended acquire polls the table
+      about once a second for up to `wait` seconds (a new optional tool
+      argument, DEFAULT 90, capped at the table's `default-ttl`) before
+      returning the refusal. The economics are the argument: fail-fast
+      contention does not remove the waiting, it moves it into the MODEL,
+      and every "try again" lap re-sends the entire conversation — two
+      agents sharing one file can spend hundreds of thousands of prompt
+      tokens taking turns at a lock that was free after four seconds,
+      where polling a hash in-process costs nothing. It is safe because
+      the wait is bounded twice (by `wait`, and by the TTL every lease
+      expires at — the cap ties one to the other, so a holder on the
+      default TTL always expires within a single full wait) and because the
+      composer refuses to wait while its holder owns any lease. The Table's
+      waiter graph rejects a cycle as defence in depth.
+      `wait: 0` is the old acquire to the byte, refusal wording included,
+      and the refusal at the end of a wait is the same standard
+      holder-and-held-for message it always was. Still no queue and no
+      fairness: a freed lease goes to whoever's poll lands first.
+    - New Leases options `on-wait-begin` / `on-wait-end`: plain closures
+      called around a wait that really begins — never for an immediate
+      grant, never for `wait: 0` — so a host that caps concurrency by
+      counting working agents can stop counting one parked on a lock. The
+      end hook fires on EVERY exit (grant, deadline, cancel, exception:
+      it is a LEAVE). Neither takes an argument, because a composer
+      belongs to one agent and carries its agent-id. Both are shielded: a
+      hook that throws must not turn a granted lock into an error the
+      model has to interpret.
+    - New Leases option `cancelled`: a thunk asked once per poll, which
+      ends a wait early with the standard refusal plus a sentence saying
+      the wait was cut short. It FAILS OPEN — a thunk that throws is read
+      as "not cancelled" — which is the deliberate opposite of
+      `concurrent`'s fail-closed rule: over-waiting costs seconds, while
+      a falsely abandoned acquire hands back a refusal for a lock that
+      was free and the agent then works without the lease it should have
+      had.
+    - New MCP::Client::Policy::Grants: the session grant book a fleet of agents
+      share. A grant belongs to the human, not to the policy that happened to
+      ask, so ten children with ten policies would otherwise ask the same
+      question ten times. It is a small lock-protected rule list — `add(@rules)`
+      (validated, all-or-nothing, answers the whole book), `list`, `elems` —
+      handed to any number of policies as the new `grants-store` option. The
+      doctrine is one session, one grant set.
+    - MCP::Client::Policy takes `grants-store`. With one wired, an `always-`
+      answer is written to the book rather than to the policy that asked, and
+      every policy reads the book on EVERY decision, so a grant is in force for
+      another agent's next call rather than at its next start-up. `.grants`
+      renders the EFFECTIVE set (this policy's own grants, then the book), which
+      is also what `&on-grant` is handed and what a session should persist —
+      seed a resumed session into the store rather than into `grants`, or a rule
+      is counted twice. Nothing is widened: grants are still consulted only once
+      the static rules have said `ask`, so no shared grant can overrule a deny
+      rule or the danger floor, and a deny grant still beats an allow grant.
+    - An `always-` answer may carry `rules` (a list) instead of `rule`, for the
+      coarse offers a UI makes when the suggestion is too fine-grained to help —
+      "allow edits and new directories under the workspace" is four rules and
+      one click. Each is validated exactly as a single rule is; the answer is
+      all or nothing (one unusable rule refuses that call and remembers none of
+      them), an empty list or an answer carrying both `rule` and `rules` is the
+      same kind of refusal, and `&on-grant` fires once per answer however many
+      rules it carried. Singular `rule` and the bare suggestion default are
+      unchanged. t/22 pins the book, the fleet, the plural answer, and the
+      sabotage cases where a shared grant must not be a way round a deny.
+    - MCP::Client::Policy rules can now narrow a tool match by the program a
+      call runs. A rule may carry `command` (a program basename, exact or a
+      trailing-'*' glob, matched against the normalised basename so `git`
+      matches `/usr/bin/git` and `C:\bin\git.EXE`), `args` (a leading argv
+      prefix the call must begin with) and `args-any` (a set, one of which
+      must appear anywhere in the argv). `command` and `under` on one rule
+      are ANDed. The tri-state fails closed exactly as the path predicate
+      does: an argv the engine cannot read to the end keeps a deny/ask firing
+      and stops an allow.
+    - Rules also carry optional `note` (why the rule exists) and `severity`
+      (`danger`), both surfaced on the ask request so a prompt can explain
+      and colour itself.
+    - New `command-params` policy option, mirroring `path-params`: names the
+      program/argv parameters per tool (default `command`/`args`).
+    - A deny that narrows by command/args no longer hides its tool from the
+      catalogue (only a blanket deny does) — the tool is still usable for the
+      calls the rule does not refuse.
+    - New MCP::Client::Policy::Commands: given a shell tool's literal argv, it
+      returns the commands the call effectively runs. It strips fixed wrappers
+      (env/timeout/nice/…), and when the program is a shell run with `-c` it
+      lexes the payload — honouring quotes, operators (`&&`/`||`/`;`/`|`/
+      newlines), subshells, redirections, command/process substitution and
+      parameter expansion — and returns each simple command, recursing through
+      nested shells and substitutions. So a command rule sees `rm` inside
+      `bash -c "git && rm -rf /"`, not just `bash`. Everything it cannot read
+      (a `$VAR`, a `$(…)`, a glob, an unbalanced quote, `env -S`) becomes an
+      unreadable command rather than a guess: an allow never fires on it, a
+      deny/ask always does. A permanent evasion regression suite (t/18) pins
+      the published bypasses.
+    - Rules can carry a `check` predicate (a string naming a policy-supplied
+      semantic check) and the policy takes a `checks` option (name → callable
+      returning yes/no/unknown per effective command). This is the seam the
+      danger floor's target analysis rides on; an unknown check name fails
+      closed. `~`/`~/…` are now kept as literal tokens by the decomposer so a
+      home-target check can see them (and `~/bin/rm` basenames to `rm`).
+    - New MCP::Client::Policy::Floor: `danger-floor(:$home, :$sadna-home)` +
+      `floor-checks(...)` — a fixed, auditable rule list for the operations
+      dangerous no matter who asked. Hard-DENY (no preset waives it): a
+      recursive delete of `/` or the home directory, and a write to the
+      agent's own config. Red-ask (grantable, `severity => danger`): git
+      force-push / reset --hard / clean / stash-clear, sudo/doas/su/pkexec,
+      shutdown/reboot, mkfs/dd/wipefs, a bare interpreter (curl|sh), and writes
+      to rc files / `.git`. Safe concrete commands fall straight through. t/19
+      pins the split. Adversarially reviewed and hardened: path normalisation
+      collapses `.`/`..`/`//` (so `rm -rf //`, `/.`, `~/.`, a `..`-obfuscated
+      config path are all caught), deny/ask command matching folds case (catches
+      `RM`/`BASH`/`SUDO` on a case-insensitive host; allow stays case-exact), and
+      the git dangers are a `check` that skips leading global options
+      (`git -C /repo push --force`; the valued-global list matches git 2.49 and
+      is version-coupled — a future git global that takes a value would need
+      adding). Path normalisation expands `~`/`~user` to home's absolute
+      segments before collapsing `..`, so `~/../home` (which the shell resolves
+      back to home) is caught. Target paths are compared case-folded in the
+      floor (the shell targets the local filesystem, case-insensitive on
+      macOS/Windows, so `/Users/Bob` IS home) — server-side fs_* `under` rules
+      stay case-exact. The write checks read redirect targets, positional args
+      AND the value glued after an `=` (so `cp --target-directory=CONFIG` and
+      dd `of=CONFIG` are caught). Deliberate residuals covered by the phase-6 OS
+      sandbox, not the lexical floor: a write whose target is an unreadable
+      `$VAR`, a purely relative path, a partially-globbed target, a glued short
+      flag with no `=` (`-t/path`), and `curl | python`-style RCE via a
+      non-shell interpreter.
+    - New MCP::Client::Leases + MCP::Client::Leases::Table: advisory, in-process
+      file leases for a pack of agents sharing one workspace, so the multi-step
+      read-modify-write window two agents can otherwise stomp on is protected.
+      (fs_edit's exact-match old-string is already single-call optimistic CAS;
+      the lease covers the window CAS cannot see.) The Table is the engine-owned
+      lease book — acquire is all-or-nothing and NEVER blocks, so deadlock is
+      structurally impossible; contention is a value, not an exception, naming
+      the holder and the age of their claim. Containment is the same lexical,
+      segment-wise path-under the permission engine uses, checked in BOTH
+      directions and failing closed on anything it cannot compare. Expiry is
+      lazy (no timer thread), a holder re-acquiring refreshes rather than
+      stacks, and release/release-holder/release-all cover explicit, drained
+      and shutdown paths. The provider-composer publishes `lock_acquire(paths,
+      ttl?)` and `lock_release(paths?)` (bare release = everything you hold),
+      drops an inner declaration that collides with either name, and hides both
+      under `publish-tools => False`. It enforces the mutating tools
+      (`fs_write`/`fs_edit`/`fs_move`/`fs_delete` by default, configurable as
+      tool patterns) against the table: another holder's lease is always an
+      is_error naming them, and under the ruled strict-when-concurrent mode —
+      driven by a `concurrent` thunk that FAILS CLOSED, so a broken liveness
+      signal over-locks rather than under-protects — a mutation with no lease
+      of its own is refused with an error that teaches the fix. A path the
+      layer cannot judge is refused when strict and forwarded with a
+      `leases-warning` key when not. Stacks UNDER the policy, so permission
+      resolves before a lease is consumed. Reads are unrestricted in v1.
+    - New MCP::Client::Reasons: a provider composer that adds one optional
+      `reason` string parameter to every tool declaration on the way out and
+      deletes it from every call on the way in, so a UI can show the human WHY
+      a call is being made without any server ever seeing the field. Never
+      added to `required` (an omitted why must not cost a turn on a schema
+      error). A tool that already declares a `reason` of its own — or names one
+      in `required` — is left completely alone in BOTH directions: its reason
+      is a real server argument, and the general rule is that stripping a
+      genuine parameter is a silent corruption while an unexpected one is the
+      server's own validation problem. Only calls to tools augmented by the
+      MOST RECENT tools-for-llm are stripped (the set is instance state,
+      replaced wholesale under a lock at each listing), and only those are
+      rebuilt: everything else — an unlisted tool, a call with no reason,
+      arguments that are not a JSON object, the empty string models send for a
+      no-argument tool — is forwarded as the very object the caller passed.
+      Canonical stack position is `Policy(Reasons(Subagents(…(Registry))))`:
+      BELOW the policy, so the permission prompt's copy of the call still
+      carries the reason; ABOVE everything else, so the `task` tool is
+      augmented too and no downstream layer sees the parameter. Because the
+      strip happens at forward time only, the reason stays in the recorded
+      assistant tool_calls, so transcripts and replay keep it with no schema
+      change. Two safety positions are doctrine, stated in the Pod: the reason
+      is a model-authored CLAIM (a UI keeps the arguments primary), and machine
+      policy — rules, danger floor, classifier — must never consume it, or the
+      permission layer becomes something a model can write its way through.
+      t/21 pins the lot, including the stacked Policy(Reasons(Registry)) case
+      where the ask sees the reason and the fixture server receives none.
+    - MCP::Client::Policy.default-rules now also allows `lock_acquire` and
+      `lock_release`: lease bookkeeping changes nothing a human owns, and
+      prompting for an advisory lock is friction in front of an answer that is
+      always yes. With no lease layer stacked, the names never appear.
+    - MCP::Client::Policy::Rules exports four more of its location helpers —
+      `located-args`, `root-for`, `path-params-for` and `absolutize` — so a
+      layer beside the policy locates a call's paths with the same code rather
+      than a second implementation of the convention. No behaviour change.
+    - MCP::Client::Policy.replace-rules: swap the whole rule set atomically
+      (validated first, installed under the lock), the seam a preset switch
+      rides on. Shipped with the command-rules work above and undocumented
+      here until now.
+    - MCP::Client::Policy re-evaluates the effective grants immediately after
+      acquiring the ask-lock. Calls queued behind an `always-allow` or
+      `always-deny` answer are decided by the grant it left instead of re-asking
+      the human the question it just settled — silently: `&on-ask` is not called
+      again, `&on-grant` does not fire, and nothing further is remembered,
+      because deciding by a grant never was an event. A granted deny refuses
+      with the same rule-shaped message a static deny uses, since no human said
+      anything about that particular call. Nothing is widened (the re-check is
+      the grant path of the decision, moved inside the lock) and the new
+      ask-lock → policy-lock nesting is one-way: nothing anywhere takes them in
+      the other order.
+    - An `always-` answer is now WRITTEN to the grants (or to the shared book)
+      before the ask-lock is released, where it used to be written just after.
+      That ordering is what makes the re-check above sound for the FIRST waiter
+      in the queue and not only for the rest of it: grant visibility
+      happens-before the release, so a waiter cannot wake into the window
+      between the human's answer and the grant that answer made, and re-ask.
+      `&on-grant` still fires OUTSIDE the ask-lock, after it, and still before
+      the call that provoked the grant is decided — a slow listener must not
+      hold up the very agents the grant has just released.
+    - New `MCP::Client::Policy.grant-decision($tool, $arguments)`, for a host
+      that asks the human ITSELF — its own dialog, its own bracket of locks —
+      rather than through `&on-ask`, and needs the same check before it opens
+      that dialog. It consults ONLY the effective grants (never the static
+      rules: a rule that allowed or denied decided the call long before anything
+      asked), with the policy's roots/path-params/command-params/checks, and
+      answers in `&on-ask`-answer shape so a callback can return it verbatim:
+      `{ action => 'allow-once', rule, reason }`, `{ action => 'deny-once',
+      rule, reason, message }`, or an undefined Hash when no grant decides.
+      Never throws and takes no lock of its own.
+    - Per-agent elicitation routing. MCP::Client takes one `on-elicit` hook, so
+      a fleet sharing a client had every server question answered by whichever
+      policy was wired at construction. A policy built with `:claim-elicits`
+      now answers the elicitations its OWN forwarded calls provoke, through its
+      own `&on-ask` and its own ask-lock, whichever policy's `elicit-hook` the
+      host wired. The claim rides a dynamic variable down the forwarding stack,
+      which works because elicitation is fulfilled on the thread that made the
+      call. Three things fall back to the wired policy, exactly as before: a
+      call from a policy that did not claim, a claimant with no `&on-ask` (a
+      headless child does not get to decline on behalf of somebody else's
+      human), and a provider that fulfils elicitations on another thread. When
+      policies are stacked the outermost claim wins, and the request hash is
+      unannotated — the callback answering it is already the claimant's own.
+    - New rule narrower `host`, for web tools: a rule may now be scoped to a
+      website, as an exact host (`docs.raku.org`) or a subdomain glob of the one
+      shape `*.` plus a host (`*.raku.org`, which covers `docs.raku.org` and
+      `a.b.raku.org` but neither `raku.org` itself nor `evilraku.org` — the
+      match is on the `.` boundary, case-blind). Nothing else glob-ish is
+      accepted, because a pattern that can never fire is the one mistake a
+      permission file must not make quietly. Without this, one "always allow"
+      on a documentation page was consent to the whole web for the session:
+      `suggest()` now offers `{ tool, host }` for a call that named a readable
+      site, so that is what "always" remembers.
+      The host comes from the call's `url` argument (deliberately NOT one of the
+      location arguments: a URL is never read as a filesystem path) through a
+      small strict parse — absolute http/https only, authority up to the first
+      `/`, `?` or `#`, IPv6 brackets and ports dropped, a trailing root dot
+      dropped so `evil.com.` cannot walk past a rule about `evil.com`. Anything
+      else, userinfo included (`https://user@evil.com#@good.com` is a shape two
+      readers disagree about), is unreadable rather than guessed at.
+      Fail-closed exactly as `under` is: an ALLOW narrowed by host fires only on
+      a URL it read and recognised, while a DENY or ASK fires on that or on
+      anything it could not read. `host` ANDs with the other narrowers, sharpens
+      which rule a prompt is told about, and — like every other narrower — keeps
+      its tool in the catalogue that a blanket deny would hide.
+    - New MCP::Client::UnknownKeys: a non-mutating auditor that compares each
+      call's argument keys against the properties the tool's own declaration
+      published, and calls `on-warn` once per (tool, undeclared key). It exists
+      because a call can arrive carrying keys the tool never declared — a
+      truncated generation that a constrained decoder closed into VALID JSON, a
+      provider that re-serialised the arguments through a lossy shape, a model
+      inventing a plausible parameter — and a server that ignores the extras
+      does four fifths of the job with nobody the wiser. It is a smoke alarm,
+      not a valve: it never refuses, strips, rewrites, delays or fails a call,
+      forwards the caller's own call objects untouched, returns the inner
+      provider's results verbatim (an inner exception throws through with no
+      shape added), and publishes the catalogue exactly as it came. Rejection
+      belongs where the argument list is known exactly and the cost of acting
+      on a mangled call is unbounded — a client-side refusal of somebody else's
+      schema would break working setups, MCP servers being free to accept
+      arguments they do not advertise.
+      It audits a call only when the tool was in the most recent
+      `tools-for-llm`, that declaration carried a non-empty `properties`
+      object, and the arguments read as a JSON object (an object, or the JSON
+      string a function call travels as); everything else — unparseable, not an
+      object, the empty string, a tool never listed — is silent, because it is
+      the provider's to report. `reason` is always tolerated, declared or not,
+      so a stack with the reason layer switched on produces no false positives
+      (the name is a literal rather than an import: the two layers are
+      independent, and a test pins them together).
+      Each (tool, key) pair is said once per instance — a model with a habit
+      would otherwise bury the first warning under one per call — while a NEW
+      key on the same tool is a new fact and is reported. The `on-warn` hash
+      carries `tool`, the `unknown-keys` being reported now, every
+      `declared-keys`, and the call `id`; it defaults to a one-line `note`,
+      is shielded (a callback that throws cannot change what a tool call does),
+      and is validated at construction for arity, since a callback that cannot
+      be called would otherwise be a layer that silently never warns.
+      Its seat is `Policy( UnknownKeys( Reasons( … ) ) )`: under the policy so
+      the arguments are the model's own, over the reason layer so the cached
+      declarations are the augmented ones the model was actually shown.
+
 0.3.0  2026-08-10T20:02:51+01:00
     - execute-tool-calls is now eager: it dispatches the calls itself rather
       than deferring them to the caller's reification of the returned Seq,

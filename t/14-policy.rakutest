@@ -20,7 +20,7 @@ use MCP::Client::Test::TestKit;
 #
 #   prove6 -Ilib -I../MCP-Server/lib t/14-policy.rakutest
 
-plan 13;
+plan 14;
 
 constant TIMEOUT = 30;
 
@@ -558,9 +558,12 @@ subtest 'headless: nobody to ask is an answer, not a hang' => {
 		'saying so in words a model can act on rather than retry blindly';
 	is $fs.seen.elems, 0, 'and the provider is never troubled';
 
+	# The read-only tools, asking the human, and the lease layer's own
+	# bookkeeping -- which changes nothing a human owns, so prompting for it
+	# would be friction in front of an answer that is always yes.
 	is-deeply MCP::Client::Policy.default-rules.map({ $_<tool> }).List,
-		<fs_read fs_list fs_glob fs_stat fs_grep user_ask>.List,
-		'the default rules are the read-only tools, and asking the human';
+		<fs_read fs_list fs_glob fs_stat fs_grep fs_map user_ask lock_acquire lock_release>.List,
+		'the default rules are the read-only tools, asking the human, and the lease tools';
 };
 
 subtest 'never throws, and forwards exactly what it was given' => {
@@ -859,6 +862,29 @@ subtest 'the argument shapes the bridge parses, parsed twice' => {
 		'and under a rule with a predicate, arguments that name no location are all refused';
 	ok @strict.map({ $_<content>.contains('Permission') }).all,
 		'by the policy, before the provider ever sees them';
+};
+
+subtest 'replace-rules swaps the whole set atomically' => {
+	plan 5;
+
+	my $fs = ScriptedProvider.new(label => 'sh', tool-names => <sh_run>);
+	my $policy = MCP::Client::Policy.new(provider => $fs,
+		rules => [{ tool => 'sh_run', decision => 'allow' }, { tool => 'fs_read', decision => 'allow' }]);
+
+	nok $policy.execute-tool-calls([call('1', 'sh_run'),])[0]<is_error>,
+		'allowed under the first rule set';
+
+	$policy.replace-rules([{ tool => 'sh_run', decision => 'deny' },]);
+	ok $policy.execute-tool-calls([call('2', 'sh_run'),])[0]<is_error>,
+		'denied after the swap';
+	is-deeply $policy.rules.map({ $_<decision> }).List, ('deny',).List,
+		'and the reported rules are the new ones only';
+
+	# A set that will not validate throws, and the old rules stand.
+	throws-like { $policy.replace-rules([{ tool => 'sh_run', decision => 'maybe' },]) },
+		X::MCP::Client, 'a bad rule set is refused';
+	ok $policy.execute-tool-calls([call('3', 'sh_run'),])[0]<is_error>,
+		'the previous rules are still in force after a refused swap';
 };
 
 done-testing;

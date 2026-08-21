@@ -146,6 +146,29 @@ a result with C<is_error> set and the reason as its C<content>, because a model
 that can read what went wrong can try something else, and an exception thrown
 into the middle of a tool round cannot be recovered from at all.
 
+=head3 How a batch is executed
+
+The calls go down the connection B<one at a time, in model order> — unless
+B<every> call in the batch names a tool the server annotated C<readOnlyHint>
+B<and> C<idempotentHint>, in which case the distinct calls are in flight
+together, up to C<$.tool-concurrency> (default 4) of them. Three things hold
+either way:
+
+=item B<Order is not an outcome.> Result I<n> answers call I<n>, whatever came
+back first, each under the C<tool_call_id> of the call it answers.
+=item B<One unannotated call makes the batch a sequence.> A write, a command or
+a question for the user beside a read means the read waits its turn: a model
+that asked for both in one turn is describing an order.
+=item B<Identical calls in a widened batch are one request>, its answer copied
+into every slot that asked for it. Two reads of one page is one fetch.
+
+A catalogue this client could not fetch means no annotation can be read, so
+that batch is serial: concurrency is opted into by a server that said its tools
+were safe for it, never assumed. C<< tool-annotations($name) >> reports what a
+server said; C<< tool-concurrency => 1 >> turns the widening off. The scheduler
+is L<MCP::Server::Batch>, shared with C<MCP::Server>'s local bridge so the two
+cannot drift.
+
 =head2 Errors
 
 Everything this client raises is an C<X::MCP::Client> (see
@@ -220,6 +243,7 @@ the notifications arrive on C<notifications> like any other.
 use JSON::Fast;
 
 use MCP::Server::Protocol;
+use MCP::Server::Batch;
 
 use MCP::Client::Cache;
 use MCP::Client::Exceptions;
@@ -267,6 +291,16 @@ has Real:D $.probe-timeout = 5;
 #| How many times a multi round-trip request may be retried before
 #| C<X::MCP::Client::InputLoopExceeded>.
 has UInt:D $.max-input-rounds = 8;
+
+#| How many calls of one C<execute-tool-calls> batch may be in flight at once,
+#| when every call in that batch is a tool the server annotated
+#| C<readOnlyHint> and C<idempotentHint>. Four, the same number
+#| C<MCP::Server>'s own bridge uses, so a toolkit reached over MCP behaves
+#| like the same toolkit reached locally.
+#|
+#| C<1> turns the widening off: every batch then goes down the connection one
+#| call at a time, exactly as it did before annotations existed.
+has Int:D $.tool-concurrency = 4;
 
 #| Called with a server C<elicitation/create> request; returns an
 #| C<ElicitResult> body, e.g. C<< { action => 'accept', content => { ... } } >>.
@@ -389,6 +423,8 @@ submethod TWEAK(*%rest) {
 		if $!request-timeout < 0;
 	die X::MCP::Client.new(detail => 'probe-timeout cannot be negative')
 		if $!probe-timeout < 0;
+	die X::MCP::Client.new(detail => 'tool-concurrency must be at least 1')
+		if $!tool-concurrency < 1;
 
 	%!declared-capabilities = %!client-capabilities.elems
 		?? %!client-capabilities.Hash
@@ -960,45 +996,98 @@ method tools-for-llm(--> List) {
 #|
 #| With C<:&on-progress> wired, each call carries a progress token of its own
 #| and the server's reports on it reach that hook tagged with the call's id.
+#|
+#| B<The concurrency contract>, which is C<MCP::Server>'s word for word (see
+#| L<MCP::Server::Batch>): the batch goes down the connection B<one call at a
+#| time, in model order>, unless B<every> call in it names a tool the server
+#| annotated C<readOnlyHint> B<and> C<idempotentHint> — in which case the
+#| distinct calls are in flight together, up to C<$.tool-concurrency> of them,
+#| and the answers are reassembled in slot order. Result I<n> answers call
+#| I<n> whatever came back first, each under the C<tool_call_id> of the call it
+#| answers, and within a widened batch two identical calls are B<one> request
+#| to the server whose answer is copied into both slots. One unannotated call
+#| — a write, a command, a question for the user — and the whole batch keeps
+#| the one-at-a-time ordering it has always had.
+#|
+#| A catalogue this client could not fetch means no annotation can be read, so
+#| the batch is serial: concurrency here is opted into by a server that said
+#| its tools were safe for it, never assumed.
 method execute-tool-calls(@tool-calls --> List) {
 	# Fetched once for the whole batch: an unknown tool is answered here rather
 	# than by the server, which saves a round trip and — because the server's
 	# own bridge answers it the same way — keeps the two in step. A catalogue we
 	# could not fetch (closed connection, dead server) means no name can be
 	# ruled out, so the call goes out and fails on its own merits.
-	my $known = self!known-tool-names;
+	my %catalogue = self!catalogue-facts;
 
-	# Assigned to an array rather than returned as a `.map(...).list`: a Seq's
-	# .list is still lazy, so the calls would go out at whatever point the caller
-	# first looked at the answers — on another thread, after the run they belong
-	# to was cancelled, or never at all. Tools have side effects. They run here,
-	# inside the method that was asked to run them, and by the time this returns
-	# every one of them has finished. MCP::Server's bridge is eager for the same
-	# reason, and t/13 pins the two together.
-	my @results = @tool-calls.map(-> $call { self!execute-one($call, $known) });
+	# The slots are built eagerly and the scheduler runs them eagerly: a Seq's
+	# .list is still lazy, so the calls would go out at whatever point the
+	# caller first looked at the answers — on another thread, after the run they
+	# belong to was cancelled, or never at all. Tools have side effects. They
+	# run here, inside the method that was asked to run them, and by the time
+	# this returns every one of them has finished. MCP::Server's bridge is eager
+	# for the same reason, and t/13 pins the two together.
+	my @slots = @tool-calls.map(-> $call { self!bridge-slot($call, %catalogue) });
 
-	@results.List;
+	run-tool-batch(@slots, concurrency => $!tool-concurrency);
 }
 
-method !known-tool-names(--> Any) {
+# What one catalogue fetch tells the bridge: which names exist, and what the
+# server said about each of them. Both from the same (cached) listing, so a
+# batch cannot be judged against two different catalogues.
+#
+# `names` is Nil when the catalogue could not be fetched at all — no name can
+# be ruled out then, and no annotation read.
+method !catalogue-facts(--> Hash:D) {
 	my $names = Nil;
+	my %annotations;
 	{
-		CATCH { default { $names = Nil } }
-		$names = self.list-tools
+		CATCH { default { $names = Nil; %annotations = () } }
+		my @tools = self.list-tools;
+		$names = @tools
 			.map({ $_ ~~ Associative ?? ($_<name> // '').Str !! '' })
 			.Set;
+		for @tools -> $tool {
+			next unless $tool ~~ Associative;
+			my $name = ($tool<name> // '').Str;
+			next unless $name.chars;
+			%annotations{$name} = $tool<annotations>.Hash
+				if $tool<annotations> ~~ Associative;
+		}
 	}
-	$names;
+	%( :$names, :%annotations );
 }
 
-method !execute-one($call, $known --> Hash:D) {
+#| What the server said about C<$name> in its C<tools/list> catalog: the MCP
+#| C<annotations> object (C<readOnlyHint>, C<idempotentHint>,
+#| C<destructiveHint>, C<openWorldHint>, C<title>), or an empty Hash for a tool
+#| that carried none — and for a catalogue this client cannot fetch, since a
+#| server that cannot be reached has not said anything.
+#|
+#| Read from the cached listing, so asking per call is cheap. They are the
+#| server's own claims about its tools and nothing verifies them; this client
+#| acts on exactly one of them, in C<execute-tool-calls>.
+method tool-annotations(Str:D $name --> Hash:D) {
+	my %facts = self!catalogue-facts;
+	(%facts<annotations>{$name} // %()).Hash;
+}
+
+# One call's slot for the batch scheduler: whether it may be in flight beside
+# its neighbours, what makes it identical to another call in the batch, and the
+# thunk that answers it.
+method !bridge-slot($call, %catalogue --> Hash:D) {
 	# Not an object at all: there is no id to answer with and no name to call,
 	# so the only useful thing left is to say so where the model can read it.
-	return {
-		role => 'tool', tool_call_id => '',
-		content => 'Malformed tool call: expected an object with an id and a function',
-		is_error => True,
-	} unless $call ~~ Associative;
+	return %(
+		id => '', concurrent => False, key => Str,
+		work => -> {
+			%(
+				role => 'tool', tool_call_id => '',
+				content => 'Malformed tool call: expected an object with an id and a function',
+				is_error => True,
+			);
+		},
+	) unless $call ~~ Associative;
 
 	my %tc = $call.Hash;
 	my $function = %tc<function>;
@@ -1007,8 +1096,7 @@ method !execute-one($call, $known --> Hash:D) {
 	my $call-id = %tc<id> // '';
 
 	my %arguments;
-	my $content;
-	my Bool $is-error = False;
+	my Str $parse-error;
 
 	if $args ~~ Associative {
 		%arguments = $args.Hash;
@@ -1023,24 +1111,53 @@ method !execute-one($call, $known --> Hash:D) {
 	else {
 		try {
 			my $parsed = from-json($args.Str);
-			if $parsed ~~ Associative {
-				%arguments = $parsed.Hash;
-			}
-			else {
-				$content = 'Tool arguments must be a JSON object';
-				$is-error = True;
-			}
+			$parse-error = $parsed ~~ Associative
+				?? Str
+				!! 'Tool arguments must be a JSON object';
+			%arguments = $parsed.Hash if $parsed ~~ Associative;
 			CATCH {
 				default {
-					$content = "Invalid tool arguments JSON: {.message}";
-					$is-error = True;
+					$parse-error = "Invalid tool arguments JSON: {.message}";
 				}
 			}
 		}
 	}
 
+	# Known here means "the catalogue we could read has it". A catalogue we
+	# could not read leaves both questions unanswered: the call still goes out
+	# (it fails on its own merits at the server), and it is never widened.
+	my $names = %catalogue<names>;
+	my Bool:D $catalogued = $names.defined && so $names{$fn-name};
+	my Bool:D $unknown = $names.defined && !$names{$fn-name};
+
+	%(
+		id => $call-id,
+		concurrent => $catalogued
+			&& concurrency-safe(%catalogue<annotations>{$fn-name}),
+		key => $catalogued && !$parse-error.defined
+			?? argument-identity($fn-name, %arguments)
+			!! Str,
+		work => -> {
+			self!run-bridge-call($fn-name, %arguments, $call-id, $parse-error, $unknown);
+		},
+	);
+}
+
+# One call, rendered as the tool message the model reads. Runs on whichever
+# thread the scheduler picked: everything it touches is either a parameter or
+# carries its own lock (the id counter, the progress table, the correlator's
+# pending-request table), which is what lets a widened batch have several of
+# these in flight on one connection.
+method !run-bridge-call(
+	$fn-name, %arguments, $call-id, Str $parse-error, Bool:D $unknown
+	--> Hash:D
+) {
+	my $content = $parse-error;
+	my $structured;
+	my Bool $is-error = $parse-error.defined;
+
 	if !$is-error {
-		if $known.defined && !$known{$fn-name} {
+		if $unknown {
 			$content = "Unknown tool: '$fn-name'";
 			$is-error = True;
 		}
@@ -1048,6 +1165,8 @@ method !execute-one($call, $known --> Hash:D) {
 			try {
 				my %result = self!call-with-progress($fn-name, %arguments, $call-id);
 				$content = result-to-text(%result);
+				$structured = %result<structuredContent>
+					if %result<structuredContent> ~~ Associative;
 				# isError is a *result*, not a failure: the text is what the
 				# model needs in order to try something else.
 				$is-error = ?%result<isError>;
@@ -1061,12 +1180,13 @@ method !execute-one($call, $known --> Hash:D) {
 		}
 	}
 
-	{
+	%(
 		role => 'tool',
 		tool_call_id => $call-id,
 		content => ~($content // ''),
 		is_error => $is-error,
-	};
+		|($structured.defined ?? (structured_content => $structured) !! ()),
+	);
 }
 
 # One tool call, with a progress token minted for exactly as long as the call is

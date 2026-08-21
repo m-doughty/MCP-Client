@@ -1,0 +1,634 @@
+use Test;
+use lib 'lib', 't/lib';
+use JSON::Fast;
+use MCP::Client::Exceptions;
+use MCP::Client::Policy;
+use MCP::Client::Reasons;
+use MCP::Client::Registry;
+use MCP::Client::UnknownKeys;
+
+# The unknown-key layer: it reads every call's argument keys, says so once when
+# one is not in the tool's own declaration, and then gets out of the way. The
+# whole design is in that last clause -- it is a smoke alarm, not a valve --
+# so most of what is tested here is what it must NOT do. A forwarded call is
+# the very object the caller passed (asserted by identity, not by value), the
+# results come back as the provider gave them, an inner provider's exception
+# comes through with no shape added, and a host callback that throws changes
+# nothing about the call it was called about.
+#
+# The rest is about being quiet when it has nothing to say: a tool it never saw
+# listed, a tool that declared no properties, arguments that are not a JSON
+# object, and `reason` -- the parameter the reason layer adds and strips, which
+# legitimately appears on calls to tools that never declared it.
+#
+# So: construction (1), transparency (2-3), the warning and its dedup (4-5),
+# reason tolerance (6), the four silences (7), argument shapes (8), a
+# catalogue refresh moving the answer (9), the failure paths (10), and
+# finally the seat it is designed for -- under a policy, over the reason layer,
+# where neither half of the comparison has been rewritten behind its back (11).
+#
+#   prove6 -Ilib t/25-unknown-keys.rakutest
+
+plan 11;
+
+# === Doubles ===
+
+# The t/21 provider: declarations supplied per test (this layer's whole job is
+# reading schemas, so the schemas have to be the variable), every call object
+# kept so "forwarded untouched" is an identity assertion, and every result
+# object kept so "returned verbatim" is one too.
+my class ScriptedProvider {
+	has Str:D $.label = 'fs';
+	has @.declarations;
+	# Both flippable mid-test: a provider that lists once and then cannot is a
+	# state this layer has a rule about (the cache it could not replace).
+	has Bool:D $.explode is rw = False;
+	has Bool:D $.explode-listing is rw = False;
+
+	has Lock $!lock .= new;
+	has @!batches;
+	has @!given;
+
+	#| Every call object this provider saw, flattened, in order.
+	method seen(--> List:D) {
+		$!lock.protect: { @!batches.map(*.Slip).List };
+	}
+
+	#| One entry per batch, holding the number of calls in it -- so an empty
+	#| batch is visible as a batch that happened.
+	method batch-sizes(--> List:D) {
+		$!lock.protect: { @!batches.map(*.elems).List };
+	}
+
+	#| Every result object this provider handed back, flattened, in order.
+	method given(--> List:D) {
+		$!lock.protect: { @!given.map(*.Slip).List };
+	}
+
+	method tools-for-llm(--> List) {
+		die "the $!label provider cannot list its tools" if $!explode-listing;
+		@!declarations.List;
+	}
+
+	method execute-tool-calls(@tool-calls --> List) {
+		die "the $!label provider is not answering" if $!explode;
+
+		my @answers = @tool-calls.map(-> $tc {
+			%(
+				role => 'tool',
+				tool_call_id => id-of($tc),
+				content => "$!label:{name-of($tc) // 'unreadable'}",
+				is_error => False,
+			);
+		}).List;
+
+		$!lock.protect: {
+			@!batches.push([@tool-calls]);
+			@!given.push([@answers]);
+		};
+
+		@answers;
+	}
+}
+
+my class HalfProvider {
+	method tools-for-llm(--> List) { () }
+}
+
+# A provider that reads nothing about the calls it is given, so a call that
+# cannot be read at all reaches it without taking it down -- the point being to
+# watch what this layer does with such a call, not what a double does.
+my class TolerantProvider {
+	has @.declarations;
+
+	method tools-for-llm(--> List) { @!declarations.List }
+
+	method execute-tool-calls(@tool-calls --> List) {
+		@tool-calls.map({ %( role => 'tool', content => 'ok', is_error => False ) }).List;
+	}
+}
+
+# A call object that throws the moment anything looks inside it.
+my class HostileCall does Associative {
+	method AT-KEY($) { die 'this call cannot be read' }
+	method EXISTS-KEY($) { die 'this call cannot be read' }
+}
+
+# === Helpers ===
+
+sub name-of($call) {
+	return Str unless $call ~~ Associative;
+	my $function = $call<function>;
+	$function ~~ Associative && $function<name> ~~ Str:D ?? $function<name> !! Str;
+}
+
+sub id-of($call) {
+	$call ~~ Associative ?? ($call<id> // '') !! '';
+}
+
+sub call(Str:D $id, Str:D $name, $arguments = %()) {
+	%( id => $id, function => %( name => $name, arguments => $arguments ) );
+}
+
+#| One tool declaration, as a server's catalogue renders it.
+sub decl(Str:D $name, :%properties, :@required --> Hash:D) {
+	my %parameters = type => 'object', properties => %properties;
+	%parameters<required> = @required.List if @required;
+
+	%(
+		type => 'function',
+		function => %(
+			name => $name,
+			description => "does $name",
+			parameters => %parameters,
+		),
+	);
+}
+
+#| The usual three: one with two properties, one that declares none at all,
+#| and one whose properties hash is empty.
+sub declarations(--> List:D) {
+	(
+		decl('fs_read',
+			properties => %( path => %( type => 'string' ), offset => %( type => 'integer' ) ),
+			required => ['path',]),
+		decl('fs_ping'),
+		decl('fs_noop', properties => %()),
+	).List;
+}
+
+sub provider(*%opts --> ScriptedProvider:D) {
+	ScriptedProvider.new(declarations => [|declarations()], |%opts);
+}
+
+#| A layer that collects its warnings, which is what every assertion here is
+#| really about.
+sub audited($provider, @warnings --> MCP::Client::UnknownKeys:D) {
+	MCP::Client::UnknownKeys.new(:$provider, on-warn => -> %warning { @warnings.push: %warning });
+}
+
+#| The arguments of a call as the provider that received it would read them.
+sub args-of($call --> Hash:D) {
+	my $raw = $call ~~ Associative && $call<function> ~~ Associative
+		?? $call<function><arguments>
+		!! Any;
+
+	return %() without $raw;
+	return $raw.Hash if $raw ~~ Associative;
+	return %() if $raw.Str.trim eq '';
+
+	my $parsed = try from-json($raw.Str);
+	$parsed ~~ Associative ?? $parsed.Hash !! %();
+}
+
+# === 1. Construction ===
+
+subtest 'construction refuses what it could not honour' => {
+	plan 6;
+
+	throws-like { MCP::Client::UnknownKeys.new(provider => provider(), providers => 'oops') },
+		X::MCP::Client,
+		message => /'unknown option'/,
+		'a mistyped option is an error rather than a layer that audits nothing';
+
+	throws-like { MCP::Client::UnknownKeys.new(provider => HalfProvider.new) },
+		X::MCP::Client,
+		message => /'execute-tool-calls'/,
+		'half a provider is not a provider';
+
+	throws-like { MCP::Client::UnknownKeys.new(provider => ScriptedProvider) },
+		X::MCP::Client,
+		message => /'type object'/,
+		'and neither is the type object of a whole one';
+
+	# A callback that cannot be called is swallowed by the shield, so it is
+	# checked where it can still be reported: at construction.
+	throws-like { MCP::Client::UnknownKeys.new(provider => provider(), on-warn => sub () { }) },
+		X::MCP::Client,
+		message => /'must accept one argument'/,
+		'an on-warn that takes no argument is refused rather than silently never called';
+
+	throws-like { MCP::Client::UnknownKeys.new(provider => provider(), on-warn => -> $a, $b { }) },
+		X::MCP::Client,
+		message => /'must accept one argument'/,
+		'and so is one that wants two';
+
+	is audited(provider(), my @unused).audited-tools.elems, 0,
+		'a fresh layer audits nothing: the cache comes from a listing, not from construction';
+};
+
+# === 2. Transparency: the calls ===
+
+subtest 'every call is forwarded as the very object it came in as' => {
+	plan 8;
+
+	my @warnings;
+	my $fs = provider();
+	my $layer = audited($fs, @warnings);
+	$layer.tools-for-llm;
+
+	my $clean = call('1', 'fs_read', %( path => 'a.txt' ));
+	my $junk = call('2', 'fs_read', '{"path":"b.txt","ffset":3}');
+	my $unlisted = call('3', 'never_listed', %( anything => 1 ));
+
+	my @sent = $clean, $junk, $unlisted;
+	my @out = $layer.execute-tool-calls(@sent);
+
+	ok (^3).map({ $fs.seen[$_] === @sent[$_] }).all.so,
+		'each is the caller\'s own object -- nothing was copied, nothing was rebuilt';
+	is-deeply args-of($fs.seen[1]).sort.List, (ffset => 3, path => 'b.txt').List,
+		'and the call that warned still carries the key it was warned about';
+	is $fs.seen[1]<function><arguments>, '{"path":"b.txt","ffset":3}',
+		'byte for byte, because it is the same string it was';
+
+	is @warnings.elems, 1, 'the one undeclared key was reported';
+
+	# The results are the provider's own objects, in the caller's order.
+	is-deeply @out.map({ $_<content> }).List,
+		('fs:fs_read', 'fs:fs_read', 'fs:never_listed').List,
+		'the results come back in order, as the provider wrote them';
+	ok (^3).map({ @out[$_] === $fs.given[$_] }).all.so,
+		'as the very result objects the provider handed back';
+	is-deeply @out.map({ $_<tool_call_id> }).List, ('1', '2', '3'), 'at the caller\'s ids';
+
+	# An empty batch is a batch: short-circuiting it would change what a
+	# provider that logs or wakes on each batch sees.
+	$layer.execute-tool-calls([]);
+	is-deeply $fs.batch-sizes.List, (3, 0).List,
+		'an empty batch is passed on rather than answered by this layer';
+};
+
+# === 3. Transparency: the catalogue ===
+
+subtest 'the catalogue is published exactly as the inner provider wrote it' => {
+	plan 4;
+
+	my @warnings;
+	my $fs = provider();
+	my $layer = audited($fs, @warnings);
+
+	my @out = $layer.tools-for-llm;
+
+	is-deeply @out.List, $fs.declarations.List, 'every declaration, deeply equal to the inner one';
+	ok (^3).map({ @out[$_] === $fs.declarations[$_] }).all.so,
+		'and each the very object it was: this layer reads schemas, it does not write them';
+	is-deeply $layer.audited-tools.List, <fs_noop fs_ping fs_read>.List,
+		'all three are cached (sorted, not in the catalogue\'s order)';
+
+	# A declaration this layer cannot read is published like any other and
+	# simply not cached, so its calls are never audited.
+	my $odd = ScriptedProvider.new(declarations => [
+		%( weird => 1 ),
+		%( type => 'function', function => %( name => 'no_schema' ) ),
+		%( type => 'function', function => %( name => 'bad_props', parameters => %( properties => 'nope' ) ) ),
+		'not even a hash',
+	]);
+	my $unreadable = audited($odd, @warnings);
+	$unreadable.tools-for-llm;
+	is-deeply $unreadable.audited-tools.List, ().List,
+		'an unreadable declaration is not cached, so nothing it is called with is audited';
+};
+
+# === 4. The warning ===
+
+subtest 'an undeclared key is reported once, with everything needed to act on it' => {
+	plan 8;
+
+	my @warnings;
+	my $fs = provider();
+	my $layer = audited($fs, @warnings);
+	$layer.tools-for-llm;
+
+	# The incident shape: a truncated generation a constrained decoder closed
+	# into valid JSON, with the rest of the prompt railroaded into junk keys.
+	my @out = $layer.execute-tool-calls([
+		call('call_7', 'fs_read', '{"path":"src/app.raku","ffset":12,"and the rest":"..."}'),
+	]);
+
+	is @warnings.elems, 1, 'one call with two undeclared keys is one warning, not two';
+	is @warnings[0]<tool>, 'fs_read', 'naming the tool';
+	is-deeply @warnings[0]<unknown-keys>.List, ('and the rest', 'ffset').List,
+		'the undeclared keys, sorted';
+	is-deeply @warnings[0]<declared-keys>.List, <offset path>.List,
+		'and everything the tool did declare, sorted -- which is what makes "ffset" legible';
+	is @warnings[0]<id>, 'call_7', 'at the call id, so a session record can find the call again';
+
+	nok @out[0]<is_error>, 'the call itself is unremarkable: warning is not refusing';
+	is args-of($fs.seen[0])<path>, 'src/app.raku', 'and it reached the provider whole';
+
+	# A call with nothing undeclared says nothing at all.
+	$layer.execute-tool-calls([call('2', 'fs_read', %( path => 'a', offset => 0 )),]);
+	is @warnings.elems, 1, 'a call that stayed inside its schema is silent';
+};
+
+# === 5. Said once ===
+
+subtest 'each (tool, key) pair is said once, and a new key is a new fact' => {
+	plan 5;
+
+	my @warnings;
+	my $fs = ScriptedProvider.new(declarations => [
+		decl('fs_read', properties => %( path => %( type => 'string' ) )),
+		decl('fs_write', properties => %( path => %( type => 'string' ) )),
+	]);
+	my $layer = audited($fs, @warnings);
+	$layer.tools-for-llm;
+
+	$layer.execute-tool-calls([call('1', 'fs_read', %( path => 'a', recursive => True )),]);
+	$layer.execute-tool-calls([call('2', 'fs_read', %( path => 'b', recursive => True )),]);
+	$layer.execute-tool-calls([call('3', 'fs_read', %( path => 'c', recursive => True )),]);
+	is @warnings.elems, 1,
+		'a model with a habit reports it once: a warning per call would bury the first one';
+
+	$layer.execute-tool-calls([call('4', 'fs_read', %( path => 'd', depth => 2 )),]);
+	is @warnings.elems, 2, 'a different key on the same tool is a different fact';
+	is-deeply @warnings[1]<unknown-keys>.List, <depth>.List,
+		'and only the new one is in it -- what was already said is not repeated';
+
+	$layer.execute-tool-calls([call('5', 'fs_write', %( path => 'e', recursive => True )),]);
+	is @warnings.elems, 3, 'and the same key on a different tool is another';
+	is @warnings[2]<tool>, 'fs_write', 'reported under that tool';
+};
+
+# === 6. The reason parameter ===
+
+subtest 'reason is tolerated, declared or not' => {
+	plan 4;
+
+	is MCP::Client::Reasons::REASON-PARAM, 'reason',
+		'the name this layer tolerates is the name the reason layer adds and strips';
+
+	my @warnings;
+	my $fs = provider();
+	my $layer = audited($fs, @warnings);
+	$layer.tools-for-llm;
+
+	# Undeclared, because the reason layer is not in this stack at all.
+	$layer.execute-tool-calls([
+		call('1', 'fs_read', '{"path":"a","reason":"Check the guard clause"}'),
+		call('2', 'fs_read', %( path => 'b', reason => 'And again' )),
+	]);
+	is @warnings.elems, 0,
+		'a reason on a tool that never declared one is never reported: the layer below adds it';
+
+	# Declared, because the reason layer IS in this stack -- the seat this
+	# module is designed for, covered end to end in subtest 11.
+	my $declaring = ScriptedProvider.new(declarations => [
+		decl('note_add', properties => %( reason => %( type => 'string' ), text => %( type => 'string' ) )),
+	]);
+	my $over = audited($declaring, @warnings);
+	$over.tools-for-llm;
+	$over.execute-tool-calls([call('3', 'note_add', %( text => 'hi', reason => 'because' )),]);
+	is @warnings.elems, 0, 'and a tool that declares its own reason is quiet for the ordinary reason';
+
+	$over.execute-tool-calls([call('4', 'note_add', %( text => 'hi', reasons => 'typo' )),]);
+	is-deeply @warnings[0]<unknown-keys>.List, <reasons>.List,
+		'the tolerance is that exact name and nothing near it';
+};
+
+# === 7. The four silences ===
+
+subtest 'it says nothing about what it has no declaration for' => {
+	plan 5;
+
+	my @warnings;
+	my $fs = provider();
+	my $layer = audited($fs, @warnings);
+
+	# Before any listing there is no cache, so nothing is audited -- the safe
+	# direction for a host that dispatches before it lists.
+	my $early = call('0', 'fs_read', %( path => 'a', nonsense => 1 ));
+	$layer.execute-tool-calls([$early]);
+	is @warnings.elems, 0, 'a call made before the catalogue was ever listed is not audited';
+
+	$layer.tools-for-llm;
+
+	# A tool that was never listed: no declaration, no opinion.
+	my $unlisted = call('1', 'never_listed', %( whatever => 1 ));
+	$layer.execute-tool-calls([$unlisted]);
+	is @warnings.elems, 0, 'nor is a call to a tool this layer never saw listed';
+
+	# A tool whose declaration has no properties key at all, and one whose
+	# properties object is empty: in both cases every key would be undeclared,
+	# which is noise standing in for an answer.
+	my $no-properties = call('2', 'fs_ping', %( anything => 1 ));
+	my $empty-properties = call('3', 'fs_noop', %( anything => 1 ));
+	$layer.execute-tool-calls([$no-properties, $empty-properties]);
+	is @warnings.elems, 0, 'nor one to a tool that declared no properties';
+
+	my @sent = $early, $unlisted, $no-properties, $empty-properties;
+	is $fs.seen.elems, 4, 'and all four still reached the provider';
+	ok (^4).map({ $fs.seen[$_] === @sent[$_] }).all.so,
+		'as the very objects they were -- silence is not stripping';
+};
+
+# === 8. Argument shapes ===
+
+subtest 'both argument shapes are audited, and neither malformed one is' => {
+	plan 6;
+
+	my @warnings;
+	my $fs = provider();
+	my $layer = audited($fs, @warnings);
+	$layer.tools-for-llm;
+
+	# The shape a model's function call actually travels as.
+	$layer.execute-tool-calls([call('1', 'fs_read', '{"path":"a","from-json":1}'),]);
+	is-deeply @warnings.map({ $_<unknown-keys>.Slip }).List, ('from-json',).List,
+		'a JSON string is parsed and audited';
+
+	# The shape a caller that parsed the arguments itself hands on.
+	$layer.execute-tool-calls([call('2', 'fs_read', %( path => 'a', 'from-hash' => 1 )),]);
+	is-deeply @warnings.map({ $_<unknown-keys>.Slip }).List, ('from-json', 'from-hash').List,
+		'an object is audited as it stands';
+
+	my @malformed =
+		call('3', 'fs_read', '{"path": '),         # will not parse
+		call('4', 'fs_read', '["path","junk"]'),   # parses, but not to an object
+		call('5', 'fs_read', ''),                  # the empty string: no arguments
+		call('6', 'fs_read', '   '),               # whitespace, meaning the same
+		call('7', 'fs_read', Str),                 # absent altogether
+		%( id => '8', function => %( arguments => '{"junk":1}' ) ),   # no tool name
+		%( id => '9' ),                            # no function
+		'not even a hash';
+
+	$layer.execute-tool-calls(@malformed);
+	is @warnings.elems, 2,
+		'arguments that will not parse, or are not an object at all, are the provider\'s to report';
+	is $fs.seen.elems, 10, 'every one of them still reached the provider';
+	ok (^8).map({ $fs.seen[2 + $_] === @malformed[$_] }).all.so, 'each as the object it was';
+
+	# A tool called with only undeclared keys is still one warning, not one per key.
+	$layer.execute-tool-calls([call('10', 'fs_read', %( a => 1, b => 2 )),]);
+	is-deeply @warnings[2]<unknown-keys>.List, <a b>.List, 'and a call of pure junk is one warning';
+};
+
+# === 9. Refreshing the catalogue ===
+
+subtest 'the declarations are the last listing\'s, and a refresh moves them' => {
+	plan 5;
+
+	my @warnings;
+	my $fs = ScriptedProvider.new(declarations => [
+		decl('fs_read', properties => %( path => %( type => 'string' ) )),
+	]);
+	my $layer = audited($fs, @warnings);
+	$layer.tools-for-llm;
+
+	$layer.execute-tool-calls([call('1', 'fs_read', %( path => 'a', offset => 0 )),]);
+	is @warnings.elems, 1, 'a key the declaration does not have is reported';
+
+	# The downstream catalogue changes underneath: the tool grows the property,
+	# and a new tool arrives.
+	$fs.declarations = [
+		decl('fs_read', properties => %( path => %( type => 'string' ), offset => %( type => 'integer' ) )),
+		decl('task', properties => %( prompt => %( type => 'string' ) )),
+	];
+	$layer.tools-for-llm;
+
+	$layer.execute-tool-calls([call('2', 'fs_read', %( path => 'a', offset => 0 )),]);
+	is @warnings.elems, 1,
+		'and stops being reported the moment a refresh declares it -- the layer is never stale';
+
+	is-deeply $layer.audited-tools.List, <fs_read task>.List,
+		'the cache is replaced rather than accumulated';
+
+	$layer.execute-tool-calls([call('3', 'task', %( prompt => 'go', promt => 'oops' )),]);
+	is-deeply @warnings[1]<unknown-keys>.List, <promt>.List, 'the newly listed tool is audited too';
+
+	# A listing that failed leaves the previous cache in place: a provider
+	# having a bad minute must not turn into a layer that stopped auditing.
+	my $dead = ScriptedProvider.new(declarations => [|declarations()], explode-listing => True);
+	my $kept = audited($dead, @warnings);
+	$dead.explode-listing = False;
+	$kept.tools-for-llm;
+	$dead.explode-listing = True;
+	{
+		CATCH { default { } }
+		$kept.tools-for-llm;
+	}
+	is-deeply $kept.audited-tools.List, <fs_noop fs_ping fs_read>.List,
+		'a failed listing leaves the cache it could not replace';
+};
+
+# === 10. The two failure paths ===
+
+subtest 'it adds no failure of its own, and survives a host callback that does' => {
+	plan 9;
+
+	my @warnings;
+	my $dead = provider(explode => True);
+	my $layer = audited($dead, @warnings);
+	$layer.tools-for-llm;
+
+	# Unlike the layers that answer for a provider, this one is transparent:
+	# an inner exception is the caller's to see exactly as it was thrown.
+	throws-like { $layer.execute-tool-calls([call('1', 'fs_read', %( path => 'a', junk => 1 )),]) },
+		Exception,
+		message => /'not answering'/,
+		'an inner provider that throws throws through, with no shape added';
+	is @warnings.elems, 1, 'the warning was still said: the audit happens before the forward';
+
+	# A listing that throws takes the listing down rather than publishing a
+	# silently shorter catalogue than the model was promised.
+	dies-ok { audited(provider(explode-listing => True), @warnings).tools-for-llm },
+		'and a provider that cannot list its tools takes the listing with it';
+
+	# A callback that throws must not reach the call it was called about.
+	my $fs = provider();
+	my $angry = MCP::Client::UnknownKeys.new(
+		provider => $fs,
+		on-warn => -> %warning { die 'the host log is on fire' },
+	);
+	$angry.tools-for-llm;
+
+	my $sent = call('2', 'fs_read', %( path => 'a', junk => 1 ));
+	my @out = $angry.execute-tool-calls([$sent]);
+	is @out.elems, 1, 'a throwing on-warn leaves the call to run';
+	is @out[0]<content>, 'fs:fs_read', 'with the provider\'s own result';
+	ok $fs.seen[0] === $sent, 'and the provider still got the caller\'s own object';
+
+	# A call this layer cannot even read must not silence the rest of the batch:
+	# the audit is shielded per call, not just per batch.
+	my @late;
+	my $tolerant = MCP::Client::UnknownKeys.new(
+		provider => TolerantProvider.new(declarations => [|declarations()]),
+		on-warn => -> %warning { @late.push: %warning },
+	);
+	$tolerant.tools-for-llm;
+
+	my @results = $tolerant.execute-tool-calls([
+		HostileCall.new,
+		call('4', 'fs_read', %( path => 'a', junk => 1 )),
+	]);
+	is @results.elems, 2, 'a call that throws on being read is still forwarded like any other';
+	is-deeply @late.map({ $_<unknown-keys>.Slip }).List, ('junk',).List,
+		'and does not cost the rest of the batch its warnings';
+
+	# The default on-warn is a `note`, which is a script's default rather than
+	# a host's: it must not be an error either.
+	lives-ok {
+		my $quiet = MCP::Client::UnknownKeys.new(provider => provider());
+		$quiet.tools-for-llm;
+		my $*ERR = class { method print(|) { }; method flush(|) { } }.new;
+		$quiet.execute-tool-calls([call('3', 'fs_read', %( path => 'a', junk => 1 )),]);
+	}, 'and the default one-line note is a warning, not an exception';
+};
+
+# === 11. In its seat, which is the whole point ===
+
+subtest 'under a policy and over the reason layer, reasons are declared and junk is not' => {
+	plan 7;
+
+	my @warnings;
+	my $fs = ScriptedProvider.new(declarations => [
+		decl('read', properties => %( path => %( type => 'string' ) )),
+		decl('write', properties => %( path => %( type => 'string' ), content => %( type => 'string' ) )),
+	]);
+
+	my $registry = MCP::Client::Registry.new;
+	$registry.add($fs, prefix => 'fs');
+
+	my $reasons = MCP::Client::Reasons.new(provider => $registry);
+	my $audit = MCP::Client::UnknownKeys.new(
+		provider => $reasons,
+		on-warn => -> %warning { @warnings.push: %warning },
+	);
+
+	my @asked;
+	my $policy = MCP::Client::Policy.new(
+		provider => $audit,
+		rules => [{ tool => 'fs_read', decision => 'allow' },],
+		on-ask => -> %request {
+			@asked.push: %request;
+			%( action => 'allow-once' );
+		},
+	);
+
+	my @tools = $policy.tools-for-llm;
+	is-deeply @tools.map({ $_<function><name> }).List, <fs_read fs_write>.List,
+		'the model sees the registry\'s names, augmented and filtered as before';
+	is-deeply $audit.audited-tools.List, <fs_read fs_write>.List,
+		'and this layer cached them under those same prefixed names';
+
+	# The point of the seat: the catalogue it cached is the AUGMENTED one, so a
+	# reason is a declared property rather than an undeclared key.
+	my @out = $policy.execute-tool-calls([
+		call('1', 'fs_read', '{"path":"docs/readme.md","reason":"Check the wording"}'),
+	]);
+	is @warnings.elems, 0, 'a call carrying the reason the model was invited to write is silent';
+	nok @out[0]<is_error>, 'and goes through';
+	nok args-of($fs.seen[0])<reason>:exists,
+		'with the reason still stripped before the server -- this layer changed nothing';
+
+	# And the property the layer below owns is intact: the human's prompt still
+	# carries the reason, because a non-mutating auditor between the two cannot
+	# take it away.
+	$policy.execute-tool-calls([
+		call('2', 'fs_write', '{"path":"a.md","content":"x","reason":"Write it up","contnet":"oops"}'),
+	]);
+	is @asked[0]<arguments><reason>, 'Write it up',
+		'the permission prompt still sees the reason the reason layer put there';
+	is-deeply @warnings.map({ $_<unknown-keys>.Slip }).List, ('contnet',).List,
+		'while the mangled key is reported, once, by name';
+};

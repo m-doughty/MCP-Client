@@ -1,0 +1,243 @@
+use Test;
+use lib 'lib', 't/lib';
+use JSON::Fast;
+use MCP::Client::Exceptions;
+use MCP::Client::Policy;
+use MCP::Client::Policy::Rules;
+
+# Argument-aware rules: the half of the permission engine that can see what a
+# shell tool was actually asked to run. A rule may narrow a tool match by the
+# program's basename (command), a leading argv prefix (args) and a
+# flag-order-independent set (args-any). The whole point is to be wrong in the
+# safe direction -- a command the engine cannot read is never quietly allowed --
+# so the shape here mirrors t/14: prove the schema refuses what it should
+# (subtest 1), prove evaluate() says the safe thing about every combination
+# (2-5), then prove the seam carries it (6-8).
+#
+#   prove6 -Ilib -I../MCP-Server/lib t/17-command-rules.rakutest
+
+plan 8;
+
+# === Helpers ===
+
+# The pure engine, called with plain data. Defaults cover the command/args
+# convention, so a call to sh_run needs no command-params.
+sub ev(@rules, Str:D $tool, %args, *%opts) {
+	evaluate(@rules, $tool, %args, |%opts);
+}
+
+sub decision(@rules, Str:D $tool, %args, *%opts) {
+	ev(@rules, $tool, %args, |%opts)<decision>;
+}
+
+# A minimal duck-typed provider so the catalogue-hiding and ask-request seams
+# can be exercised end to end.
+my class Provider {
+	has Str:D @.tool-names;
+	method tools-for-llm(--> List) {
+		@!tool-names.map(-> $n {
+			%( type => 'function', function => %( name => $n, description => "does $n",
+				parameters => %( type => 'object', properties => %() ) ) );
+		}).List;
+	}
+	method execute-tool-calls(@calls --> List) {
+		@calls.map(-> $c {
+			%( role => 'tool', tool_call_id => ($c<id> // ''), content => 'ok', is_error => False );
+		}).List;
+	}
+}
+
+sub call(Str:D $id, Str:D $name, %arguments) {
+	%( id => $id, function => %( name => $name, arguments => %arguments ) );
+}
+
+# === 1. The schema refuses what it should ===
+
+subtest 'the schema accepts the new members and refuses their misuse' => {
+	lives-ok { validate-rule({ tool => 'sh_run', decision => 'allow', command => 'git' }) },
+		'a command rule validates';
+
+	my %norm = validate-rule({
+		tool => 'sh_run', decision => 'deny', command => 'git',
+		args => ['push'], args-any => ['--force', '-f'],
+		note => 'no force pushes', severity => 'danger',
+	});
+	is %norm<command>, 'git', 'command survives normalisation';
+	is-deeply %norm<args>, ('push',), 'args survives as a list';
+	is-deeply %norm<args-any>, ('--force', '-f'), 'args-any survives as a list';
+	is %norm<note>, 'no force pushes', 'note survives';
+	is %norm<severity>, 'danger', 'severity survives';
+
+	throws-like { validate-rule({ tool => 'sh_run', decision => 'allow', args => ['x'] }) },
+		X::MCP::Client, message => /args/, 'args without a command is refused';
+	throws-like { validate-rule({ tool => 'sh_run', decision => 'allow', args-any => ['x'] }) },
+		X::MCP::Client, 'args-any without a command is refused';
+	throws-like { validate-rule({ tool => 'sh_run', decision => 'allow', command => 'a/b' }) },
+		X::MCP::Client, message => /separator/, 'a command with a path separator is refused';
+	throws-like { validate-rule({ tool => 'sh_run', decision => 'allow', command => 'git\\x' }) },
+		X::MCP::Client, 'a command with a backslash is refused';
+	throws-like { validate-rule({ tool => 'sh_run', decision => 'allow', command => 'git', args => 'push' }) },
+		X::MCP::Client, 'args that is not a list is refused';
+	throws-like { validate-rule({ tool => 'sh_run', decision => 'allow', command => 'git', args => ['', 'x'] }) },
+		X::MCP::Client, 'an empty argument token is refused';
+	throws-like { validate-rule({ tool => 'sh_run', decision => 'deny', command => 'git', severity => 'scary' }) },
+		X::MCP::Client, message => /danger/, 'an unknown severity is refused';
+	throws-like { validate-rule({ tool => 'sh_run', decision => 'deny', note => 42 }) },
+		X::MCP::Client, 'a non-string note is refused';
+	throws-like { validate-rule({ tool => 'sh_run', decision => 'deny', dir => '/x' }) },
+		X::MCP::Client, 'an unknown member is still refused';
+
+	# A glob command pattern is legitimate; a trailing-only star as before.
+	lives-ok { validate-rule({ tool => 'sh_run', decision => 'deny', command => 'python*' }) },
+		'a trailing-star command glob validates';
+};
+
+# === 2. The command basename, normalised ===
+
+subtest 'a command matches on the normalised program basename' => {
+	my @allow = { tool => 'sh_run', decision => 'allow', command => 'git' },;
+
+	is decision(@allow, 'sh_run', %( command => 'git' )), 'allow',
+		'a bare program name matches';
+	is decision(@allow, 'sh_run', %( command => '/usr/bin/git' )), 'allow',
+		'a POSIX path is reduced to its basename';
+	is decision(@allow, 'sh_run', %( command => 'C:\\bin\\git.EXE' )), 'allow',
+		'a Windows path and a .EXE extension are both stripped';
+	is decision(@allow, 'sh_run', %( command => 'gitk' )), 'ask',
+		'a different program does not match (no rule -> ask)';
+
+	my @glob = { tool => 'sh_run', decision => 'allow', command => 'gi*' },;
+	is decision(@glob, 'sh_run', %( command => 'git' )), 'allow', 'a command glob matches its prefix';
+	is decision(@glob, 'sh_run', %( command => 'grep' )), 'ask', 'a command glob does not overreach';
+
+	# reason surfaces so a prompt can explain itself
+	my %v = ev(@allow, 'sh_run', %( command => 'git' ));
+	is %v<reason>, 'rule', 'a matched command reports reason rule';
+};
+
+# === 3. args prefix and args-any, and the fail-closed cases ===
+
+subtest 'args narrows by prefix and args-any by membership, failing closed' => {
+	my @allow = { tool => 'sh_run', decision => 'allow', command => 'git', args => ['status'] },;
+	is decision(@allow, 'sh_run', %( command => 'git', args => ['status', '-s'] )), 'allow',
+		'an argv whose prefix matches is allowed';
+	is decision(@allow, 'sh_run', %( command => 'git', args => ['push'] )), 'ask',
+		'an argv whose prefix disagrees is not allowed';
+	is decision(@allow, 'sh_run', %( command => 'git', args => [] )), 'ask',
+		'an argv shorter than the required prefix is not allowed';
+
+	my @deny = { tool => 'sh_run', decision => 'deny', command => 'git',
+		args => ['push'], args-any => ['--force', '-f'] },;
+	is decision(@deny, 'sh_run', %( command => 'git', args => ['push', '--force'] )), 'deny',
+		'push plus --force fires the deny';
+	is decision(@deny, 'sh_run', %( command => 'git', args => ['push', '-f'] )), 'deny',
+		'either form of the flag fires it';
+	is decision(@deny, 'sh_run', %( command => 'git', args => ['push', 'origin'] )), 'ask',
+		'push without the flag does not fire it (no rule -> ask)';
+	is decision(@deny, 'sh_run', %( command => 'git', args => ['status'] )), 'ask',
+		'a different subcommand does not fire it';
+
+	# Missing / unreadable command: allow never fires, deny always does.
+	my @a = { tool => 'sh_run', decision => 'allow', command => 'git' },;
+	my @d = { tool => 'sh_run', decision => 'deny',  command => 'rm' },;
+	is decision(@a, 'sh_run', %( )), 'ask', 'allow does not fire when no command was named';
+	my %dv = ev(@d, 'sh_run', %( ));
+	is %dv<decision>, 'deny', 'deny fires when no command was named';
+	is %dv<reason>, 'unevaluable-path', 'and says it did so on something it could not evaluate';
+	is decision(@a, 'sh_run', %( command => ['not', 'a', 'string'] )), 'ask',
+		'a non-string command is unreadable, so allow does not fire';
+	is decision(@d, 'sh_run', %( command => ['not', 'a', 'string'] )), 'deny',
+		'a non-string command is unreadable, so deny does';
+};
+
+# === 4. command ANDs with under, and beats a blanket rule on report ===
+
+subtest 'command and under are ANDed, and command sharpens the reported rule' => {
+	# A tool that carries both a path argument (dir) and a command.
+	my %pp = ( 'x_run' => ['dir'] );
+	my @both = { tool => 'x_run', decision => 'deny', command => 'rm', under => '/etc' },;
+
+	is decision(@both, 'x_run', %( dir => '/etc/hosts', command => 'rm' ), path-params => %pp),
+		'deny', 'both conditions true fires the deny';
+	is decision(@both, 'x_run', %( dir => '/etc/hosts', command => 'ls' ), path-params => %pp),
+		'ask', 'the command failing spares it';
+	is decision(@both, 'x_run', %( dir => '/tmp/x', command => 'rm' ), path-params => %pp),
+		'ask', 'the path failing spares it';
+
+	# Two deny rules fire; the command-bearing one is reported as more specific.
+	my @rules =
+		{ tool => 'sh_run', decision => 'deny' },
+		{ tool => 'sh_run', decision => 'deny', command => 'git' },
+	;
+	my %v = ev(@rules, 'sh_run', %( command => 'git' ));
+	is %v<decision>, 'deny', 'a blanket deny and a command deny agree';
+	is %v<rule><command>, 'git', 'the command rule is the one reported';
+};
+
+# === 5. note and severity reach the verdict ===
+
+subtest 'note and severity travel with the fired rule' => {
+	my @rules = { tool => 'sh_run', decision => 'ask', command => 'git',
+		args => ['push'], note => 'pushes are irreversible', severity => 'danger' },;
+	my %v = ev(@rules, 'sh_run', %( command => 'git', args => ['push', '--force'] ));
+	is %v<decision>, 'ask', 'the rule asks';
+	is %v<rule><note>, 'pushes are irreversible', 'the note is on the reported rule';
+	is %v<rule><severity>, 'danger', 'the severity is on the reported rule';
+};
+
+# === 6. An argument-scoped deny keeps its tool in the catalogue ===
+
+subtest 'only a blanket deny hides its tool' => {
+	my $prov = Provider.new(tool-names => <sh_run fs_read>);
+
+	my $blanket = MCP::Client::Policy.new(provider => $prov,
+		rules => [{ tool => 'sh_run', decision => 'deny' },]);
+	my @blanket-names = $blanket.tools-for-llm.map({ $_<function><name> });
+	ok 'sh_run' ∉ @blanket-names, 'a blanket deny hides sh_run';
+
+	my $scoped = MCP::Client::Policy.new(provider => $prov,
+		rules => [{ tool => 'sh_run', decision => 'deny', command => 'rm' },]);
+	my @scoped-names = $scoped.tools-for-llm.map({ $_<function><name> });
+	ok 'sh_run' ∈ @scoped-names, 'a command-scoped deny keeps sh_run visible';
+};
+
+# === 7. The ask request carries the why ===
+
+subtest 'a danger ask reaches the human with its note and severity' => {
+	my $prov = Provider.new(tool-names => <sh_run>);
+	my %seen;
+	my $policy = MCP::Client::Policy.new(
+		provider => $prov,
+		rules => [{ tool => 'sh_run', decision => 'ask', command => 'git', args => ['push'],
+			note => 'pushes are irreversible', severity => 'danger' },],
+		on-ask => -> %request { %seen = %request; %( action => 'deny-once' ) },
+	);
+
+	my @out = $policy.execute-tool-calls([
+		call('1', 'sh_run', %( command => 'git', args => ['push', '--force'] )),
+	]);
+	is @out.elems, 1, 'one result comes back';
+	ok @out[0]<is_error>, 'a deny-once answer refuses the call';
+	is %seen<kind>, 'permission', 'the human was asked a permission question';
+	is %seen<rule><note>, 'pushes are irreversible', 'the request carries the note';
+	is %seen<rule><severity>, 'danger', 'the request carries the severity';
+};
+
+# === 8. Command-bearing grants survive a JSON round trip ===
+
+subtest 'grants with command members serialise and reload' => {
+	my $prov = Provider.new(tool-names => <sh_run>);
+	my $policy = MCP::Client::Policy.new(
+		provider => $prov,
+		grants => [{ tool => 'sh_run', decision => 'allow', command => 'git', args-any => ['--version'] },],
+	);
+	my @grants = $policy.grants;
+	my @reloaded = from-json(to-json(@grants));
+	is to-json(@reloaded, :sorted-keys), to-json(@grants, :sorted-keys),
+		'the command grant is JSON-safe and unchanged';
+
+	# And it still decides: a reloaded grant list rebuilds a working policy.
+	lives-ok {
+		MCP::Client::Policy.new(provider => $prov, grants => @reloaded);
+	}, 'a reloaded grant list rebuilds a policy';
+};

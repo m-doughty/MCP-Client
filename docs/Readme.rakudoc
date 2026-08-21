@@ -685,7 +685,9 @@ the model asked for something the tool cannot be given.) Content blocks
 are flattened to the text a model reads,
 with binary payloads named rather than inlined — a base64 PNG in a
 transcript costs a fortune in tokens and tells the model nothing it can
-act on.
+act on. A protocol result's C<structuredContent> is retained separately as
+C<structured_content>, byte-compatible with the local server bridge, so a
+composer can consume machine metadata without putting it into the transcript.
 
 B<C<execute-tool-calls> never throws.> A malformed call, arguments that
 are not a JSON object, a tool the server does not have, a tool that
@@ -700,6 +702,32 @@ the answers: what comes back is a real C<List>, so a batch that has
 returned is a batch that has already happened. Tools have side effects,
 and a lazily-reified batch would run them on whatever thread eventually
 looked at the result — or, for a run that was cancelled, never.
+
+=head3 How a batch is executed
+
+One call at a time, in model order — unless B<every> call in the batch names
+a tool the server annotated C<readOnlyHint> B<and> C<idempotentHint> in its
+C<tools/list> catalog, in which case the distinct calls are in flight
+together, up to C<$.tool-concurrency> (default C<4>) of them.
+
+=item B<Order is not an outcome.> Result I<n> answers call I<n>, whatever came
+back first, each under the C<tool_call_id> of the call it answers.
+=item B<One unannotated call makes the batch a sequence.> A write, a command
+or a question for the user beside a read means the read waits its turn: a
+model that asked for both in one turn is describing an order, and the
+annotation is the only evidence there is that a call is not part of one.
+=item B<Identical calls in a widened batch are one request>, its answer copied
+into every slot that asked for it. Two reads of one page is one fetch, and one
+lot of tokens.
+
+A catalogue this client could not fetch means no annotation can be read, so
+that batch is serial: concurrency is opted into by a server that said its
+tools were safe for it, never assumed.
+C<< $mcp.tool-annotations('read_file') >> reports what a server said about one
+of its tools, and C<< tool-concurrency => 1 >> turns the widening off
+entirely. The scheduler is C<MCP::Server::Batch>, shared with
+C<MCP::Server>'s local bridge — the same reason the rest of the pair is
+byte-compatible.
 
 =head3 The Registry
 
@@ -776,12 +804,55 @@ $policy.tools-for-llm;               # fs_delete is not on it
 $policy.execute-tool-calls(@calls);  # allowed calls forwarded as one batch
 =end code
 
-A rule is C<< { tool, decision, under? } >>: an exact tool name or a
-trailing-C<*> prefix glob, one of C<allow>/C<deny>/C<ask>, and an
-optional directory the rule is about. Every matching rule is evaluated
-and the strongest decision wins — B<deny E<gt> ask E<gt> allow>, so a
-serialized rule set can be merged and re-ordered without changing what it
-means — and B<a call no rule matched is asked about>, never allowed.
+A rule is plain data with two required members — C<tool>, an exact name
+or a trailing-C<*> prefix glob, and C<decision>, one of
+C<allow>/C<deny>/C<ask> — and a handful of optional narrowers saying
+which calls to C<tool> the rule actually has an opinion about:
+
+=item C<under> — a directory; the rule only speaks about calls whose
+      location arguments (C<path>/C<from>/C<to>, by convention) fall
+      inside it.
+=item C<command> — a program basename, exact or a trailing-C<*> glob,
+      matched against the call's program (never a path — a C</> in a
+      pattern could not fire).
+=item C<args> — argv tokens the call's program must B<begin> with, in
+      order. Needs a C<command>.
+=item C<args-any> — argv tokens, B<any one> of which must appear
+      anywhere in the argv. Needs a C<command>.
+=item C<check> — the name of a semantic predicate the policy itself
+      supplies, evaluated over the same effective command as C<command>
+      and C<args>.
+=item C<host> — a website: an exact host, or a C<*.> suffix glob
+      (C<*.raku.org>), matched against the call's C<url> argument.
+
+A C<sh_run> rule narrowed by command and argv:
+
+=begin code :lang<raku>
+{ tool => 'sh_run', decision => 'ask', command => 'git',
+  args-any => ['--force', '-f'],
+  note => 'force pushes rewrite history', severity => 'danger' }
+=end code
+
+fires for any C<git> call whose argv contains C<--force> or C<-f> — a
+plain C<git status> is untouched, a C<git push --force> is asked about.
+And a C<web_fetch> rule narrowed by host:
+
+=begin code :lang<raku>
+{ tool => 'web_fetch', decision => 'allow', host => '*.raku.org' }
+=end code
+
+fires for C<https://docs.raku.org/...> but not for
+C<https://raku.org/...> (the site itself, not a site under it) or
+C<https://evilraku.org/...> (which merely ends in the same letters).
+
+Every predicate present on one rule is ANDed together, and every
+matching rule is evaluated with the strongest decision winning —
+B<deny E<gt> ask E<gt> allow>, so a serialized rule set can be merged
+and re-ordered without changing what it means. Every predicate fails
+closed the same way: an B<allow> only fires when every item it can
+check comes back a definite C<yes>, while a B<deny> or C<ask> fires on
+a C<yes> B<or> on anything it cannot read to a conclusion — and
+B<a call no rule matched is asked about>, never allowed.
 
 Containment is B<purely lexical>, segment by segment, and never touches
 the filesystem: the paths belong to the server's disk, and symlink truth
@@ -840,6 +911,52 @@ my $policy = MCP::Client::Policy.new(
 );
 =end code
 
+A fleet needs one more thing: a grant belongs to the B<human>, not to
+the policy that happened to ask. Ten children with ten policies will ask
+the same question ten times unless they share a book, so
+L<MCP::Client::Policy::Grants|lib/MCP/Client/Policy/Grants.rakumod> is
+one — a small lock-protected list any number of policies consult and any
+of them can add to. Hand it to all of them as C<grants-store> and the
+doctrine is B<one session, one grant set>: the human says "always" once,
+and every agent alive then, plus every agent started afterwards, is
+bound by it.
+
+=begin code :lang<raku>
+my $grants = MCP::Client::Policy::Grants.new(grants => $session.grants);
+
+my $parent = MCP::Client::Policy.new(:$provider, :&on-ask, grants-store => $grants);
+my $child  = MCP::Client::Policy.new(:$provider, :&on-ask, grants-store => $grants);
+=end code
+
+With a store wired, an C<always-> answer is written there rather than to
+the policy that asked, and every policy reads the store on B<every>
+decision, so a grant is in force for a call a millisecond later on
+another thread. C<.grants> then renders the B<effective> set — this
+policy's own grants, then the book — which is what C<&on-grant> is
+handed and what a session should persist; seed a resumed session into
+the store rather than into C<grants> so a rule is not counted twice.
+None of it widens anything: grants are still consulted only after the
+static rules have said C<ask>, so no shared grant can overrule a C<deny>
+rule or the danger floor.
+
+When the suggestion is too fine-grained to be worth offering — one
+directory, one tool, ten more questions coming — an answer can carry
+C<rules> instead of C<rule> and remember several at once:
+
+=begin code :lang<raku>
+{
+    action => 'always-allow',
+    rules  => [
+        { tool => 'fs_write', under => '/srv/work' },
+        { tool => 'fs_edit',  under => '/srv/work' },
+        { tool => 'fs_mkdir', under => '/srv/work' },
+    ],
+}
+=end code
+
+Each is validated exactly as a single rule is, and the answer is all or
+nothing: one unusable rule refuses that call and remembers none of them.
+
 Wire C<on-elicit> B<only> when there is somebody to ask — setting it is
 what declares the elicitation capability, and a server told it may ask
 will ask. C<.interactive> is the guard. Headless, every C<ask> outcome is
@@ -854,6 +971,257 @@ symptom is everything asking). And grants are consulted B<only> once the
 static rules have said C<ask>, so an explicit C<< { tool => '*',
 decision => 'ask' } >> rule means "keep asking" — which is why the
 default rules do not include one.
+
+=head3 File leases: the Leases layer
+
+Two agents editing one checkout will, eventually, edit one file. Not at the
+same instant — the calls are serialized by the server — but across the window
+that matters: read the file, think about it, write it back. The second
+agent's read happened before the first agent's write, and its write throws
+that away, and nothing in the permission layer notices, because both calls
+were things their agent was perfectly entitled to make.
+L<MCP::Client::Leases|lib/MCP/Client/Leases.rakumod> is the smallest thing
+that closes that window: an in-process, advisory, bounded-wait lock table
+with two tools in front of it.
+
+It satisfies the same duck type a registry and a policy do, so it stacks
+anywhere a provider goes — but it is meant to be built B<one instance per
+agent>, each carrying that agent's own id, all of them pointing at B<one>
+C<MCP::Client::Leases::Table> the engine owns for the whole workspace. The
+composer is where a call is routed and judged; the table is where contention
+is actually resolved, which is why it is the one object every agent's stack
+has to share:
+
+=begin code :lang<raku>
+use MCP::Client::Leases;
+use MCP::Client::Leases::Table;
+use MCP::Client::Policy;
+
+my $table = MCP::Client::Leases::Table.new;   # one per workspace
+
+sub provider-for(Str:D $agent-id) {
+    MCP::Client::Policy.new(
+        provider => MCP::Client::Leases.new(
+            inner      => $registry,
+            table      => $table,
+            agent-id   => $agent-id,
+            roots      => { fs => '/srv/work', lock => '/srv/work' },
+            concurrent => { $engine.live-agents },   # > 1 turns strict mode on
+        ),
+        rules => MCP::Client::Policy.default-rules,
+        :&on-ask,
+    );
+}
+=end code
+
+Every C<Leases> instance publishes two tools, without any registry prefix, and
+routes on those names ahead of everything else:
+C<lock_acquire(paths, ttl?, wait?)> claims paths, all or nothing;
+C<lock_release(paths?)> gives them back, or everything the caller holds when
+C<paths> is omitted.
+
+B<Acquisition waits, but never for ever.> C<lock_acquire> tries at once and,
+if somebody else has the path, polls the table about once a second for up to
+C<wait> seconds — 90 by default, capped at the table's C<default-ttl> — before
+returning the refusal. Waiting here rather than in the model is the entire
+point: a refused agent's "try again" is a fresh round trip carrying the whole
+conversation, so two agents sharing one file can spend hundreds of thousands
+of prompt tokens taking turns at a lock that was free after four seconds.
+Polling a hash in-process costs nothing. Safety comes from the wait being
+bounded twice over — by C<wait>, and by the TTL every lease expires at, which
+the cap ties it to — and from nothing being held while waiting, so no cycle of
+waiters can form. C<wait: 0> is the original never-blocking acquire, to the
+byte. There is still B<no queue and no fairness>: a freed lease goes to
+whoever's poll lands first.
+
+The refusal at the end of the wait is a value, not a throw: it names the
+holder and how long they have held it, which is enough for a model to work on
+something else and come back rather than treat the refusal as a hard failure.
+
+Because a waiting agent is not a working one, the composer takes two optional
+callbacks — C<on-wait-begin> and C<on-wait-end> — which fire around a wait that
+really begins (never around an immediate grant, and never for C<wait: 0>), so a
+host that caps concurrency by counting working agents can stop counting one
+that is parked on a lock. C<on-wait-end> fires on every exit, including an
+exception. A C<cancelled> thunk, asked once per poll, ends a wait early when
+the run it belongs to has been cancelled; unlike C<concurrent> it fails
+B<open>, because over-waiting costs seconds while a falsely abandoned acquire
+costs correctness. Both hooks are shielded — a host whose bookkeeping throws
+must not turn a granted lock into an error the model has to interpret.
+
+Enforcement follows the tools that change things — C<fs_write>, C<fs_edit>,
+C<fs_move> and C<fs_delete> by default, C<:enforced-tools> for a server that
+calls its mutating tools something else. B<Another holder's lease always
+refuses>, whether or not anything is strict: that is the one rule this layer
+enforces unconditionally. Everything else depends on C<:&concurrent>, a
+thunk answering how many agents are live right now. With none set, or with
+one live agent, an unleased mutation goes straight through — locking
+discipline is overhead nobody needs when there is nobody to contend with.
+The moment C<&concurrent> reports more than one, the layer goes B<strict>:
+a mutating call must be covered by a lease this agent holds, or it is
+refused with an error that teaches the fix (call C<lock_acquire> first).
+Strictness relaxes on its own once the last sibling drains. The thunk fails
+B<closed> — a throw, or an answer that cannot be read as a count, is taken
+as "concurrent" — because the cost of over-strictness is a model asking for
+locks it did not need, and the cost of under-strictness is two agents
+silently overwriting each other's work, and only one of those shows up in
+the transcript.
+
+A lease lasts C<default-ttl> seconds (300 on the table, unless a composer or
+a C<lock_acquire> call says otherwise), and a holder re-acquiring a path it
+already holds refreshes that clock rather than stacking a second lease — the
+way a long edit keeps its claim alive without a second kind of call. Leases
+come back four ways: the model calls C<lock_release>; the engine releases
+them off the agent's run being C<drained> — C<$run.drained.then({
+$table.release-holder($agent-id) })> — never off C<result>, since a detached
+write may still be landing when the answer is already in; a wedged holder's
+claim simply expires; or the whole table is emptied at shutdown with
+C<$table.release-all>.
+
+None of this reaches outside the process. A lease is advisory, does not
+survive the process, and nothing but this table honours it — the filesystem
+truth stays with the server's own sandbox, and C<fs_edit>'s exact-match
+C<old-string> is still what protects the single-call race a lease is not
+meant to cover.
+
+=head3 Why a call was made: the Reasons layer
+
+A tool call tells you what an agent is about to do. It does not tell you
+why, and "why" is most of what a human needs to answer a permission prompt
+in under a minute — C<fs_write> to C<config/app.yml> is either the change
+that was asked for or the beginning of a bad afternoon, and the arguments
+look the same either way. L<MCP::Client::Reasons|lib/MCP/Client/Reasons.rakumod>
+is the smallest thing that gets the why onto the record: it adds one
+optional C<reason> string parameter to every tool declaration on the way
+out, and deletes it from every call's arguments on the way back in, so the
+model fills it in because it is declared where the model is looking, and the
+server never learns the parameter exists.
+
+=begin code :lang<raku>
+use MCP::Client::Reasons;
+use MCP::Client::Policy;
+
+my $policy = MCP::Client::Policy.new(
+    provider => MCP::Client::Reasons.new(provider => $registry),
+    rules    => MCP::Client::Policy.default-rules,
+    :&on-ask,
+);
+
+# The model now writes:
+#   fs_write { "path": "src/app.raku", "content": "...",
+#              "reason": "Add the missing guard clause you asked for" }
+#
+# The permission prompt sees the reason (it is in the call's arguments), the
+# tool card renders it, and the server is handed the call without it.
+=end code
+
+Where it sits in the stack is the whole design: B<below> the policy, and
+B<above> everything else —
+
+=begin code
+Policy( Reasons( Subagents( ...( Registry ) ) ) )
+=end code
+
+Below the policy because C<&on-ask>'s request carries a copy of the call, and
+the call still has C<reason> in its arguments at that point — put this layer
+above the policy instead and the prompt shows a human a call the field has
+already been stripped from, which is the one thing this layer exists to
+prevent. Above everything else because every provider under it gets its
+declarations augmented too — the subagent composer's C<task> tool included,
+delegating being exactly the kind of call a human wants the why of — and
+because no layer that inspects arguments (a lease layer locating paths, an
+escalation layer matching a command) should ever see a parameter that is not
+the server's own.
+
+A tool that already declares its own C<reason> parameter is left B<completely
+alone>, in both directions: not augmented a second time, and — more
+importantly — not stripped, since that C<reason> is a real argument its
+server expects to receive. The general rule is: when in doubt, do not strip.
+
+Two things follow from a reason being written by the model, about its own
+intentions, in the same sampling step as the arguments — it is a B<claim>,
+not evidence, and nobody has checked it:
+
+=item A UI must keep the arguments primary. Render the reason as supporting
+      text next to the command, the path and the diff — never instead of
+      them, and never in a way that lets a human approve a call having read
+      only the reason. A model that is wrong about what it is doing writes a
+      sincere reason for the wrong call.
+=item Machine policy must never consume it. The rule engine, the danger
+      floor and any auto-mode classifier decide on the tool name, the
+      arguments and the paths — never on this field. A permission layer that
+      read the reason would be one a model could talk its way through by
+      writing nicer sentences, which is precisely the property the static
+      rules exist not to have.
+
+Because the strip happens at forward time and nowhere else, the reason
+stays in the assistant message the model produced — a session transcript, a
+replay and a resumed run all still have it, with no schema change anywhere.
+Read it back with the parameter name this module publishes as
+C<MCP::Client::Reasons::REASON-PARAM>.
+
+=head3 Arguments nobody declared: the UnknownKeys layer
+
+A tool call arrives as a JSON object, and nothing between the sampler and the
+server has to agree about what is in it. A truncated generation that a
+constrained decoder closed into I<valid> JSON, a provider that re-serialised
+the arguments through a lossy shape, a model that invented a plausible
+parameter: all three produce a call whose keys are not the keys the tool
+declared, and a server that ignores the extras does four fifths of the job
+with nobody the wiser.
+
+L<MCP::Client::UnknownKeys|lib/MCP/Client/UnknownKeys.rakumod> makes that
+visible and does nothing else. It caches the C<properties> of every declaration
+it passes through, compares each call's argument keys against them, and calls
+C<&on-warn> once per (tool, undeclared key) — then forwards the caller's own
+call object, untouched, and returns the inner provider's results as they came.
+
+=begin code :lang<raku>
+use MCP::Client::UnknownKeys;
+
+my $audited = MCP::Client::UnknownKeys.new(
+    provider => MCP::Client::Reasons.new(provider => $registry),
+    on-warn  => -> %warning {
+        note "{%warning<tool>} ({%warning<id>}) carried undeclared argument(s) "
+            ~ "{%warning<unknown-keys>.join(', ')}; it declares "
+            ~ %warning<declared-keys>.join(', ');
+    },
+);
+
+my $policy = MCP::Client::Policy.new(provider => $audited, :@rules, :&on-ask);
+=end code
+
+It is a B<smoke alarm, not a valve>: it never refuses a call, strips a key,
+rewrites arguments, delays a batch or turns an unknown key into an error a
+model has to interpret, and an inner provider that throws throws straight
+through it. Rejection is right where the argument list is known exactly and the
+cost of acting on a mangled call is unbounded — spawning a subagent on a
+truncated brief, say, which a delegation tool is free to validate strictly on
+its own account. For the rest of a toolkit a client-side refusal would be a
+second opinion about somebody else's schema, and MCP servers are free to accept
+arguments they never advertised.
+
+It is quiet unless it has something to say. A tool it never saw listed, a tool
+that declared no properties, arguments that will not parse or are not an object
+at all, and the empty string a model sends for an argument-free call are all
+somebody else's to report. C<reason> is always tolerated, declared or not, so a
+stack with the reason layer switched on produces no false positives. And each
+(tool, key) pair is reported B<once per instance> — a model that has decided
+C<fs_read> takes a C<recursive> flag decides it again on every call, and a
+warning per call would bury the first — while a new key on the same tool is a
+new fact and is reported.
+
+Its seat is between the two layers whose rewriting it has to see the right side
+of:
+
+=begin code
+Policy( UnknownKeys( Reasons( ...( Registry ) ) ) )
+=end code
+
+Under the policy, so the arguments it reads are the model's own. Over the
+reason layer, so the declarations it caches are the B<augmented> ones the model
+was actually shown — which is what makes a C<reason> in a call match a declared
+property rather than look like the very thing this layer reports.
 
 =head3 A full tool loop
 

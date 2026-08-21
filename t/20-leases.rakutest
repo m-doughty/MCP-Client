@@ -1,0 +1,1154 @@
+use Test;
+use lib 'lib', 't/lib';
+use JSON::Fast;
+use MCP::Client::Exceptions;
+use MCP::Client::Leases;
+use MCP::Client::Leases::Table;
+use MCP::Client::Policy;
+use MCP::Client::Policy::Rules;
+
+# The file-lease layer: advisory, in-process, bounded-wait locks over one
+# shared workspace. Two properties carry the whole design and every subtest
+# here is about one of them. First, contention is a VALUE -- acquire grants or
+# says who is in the way, and a mutating call on somebody else's path comes back
+# as an is_error rather than an exception or a clobbered file. Second,
+# it is wrong in the safe direction: an unevaluable path is refused rather than
+# assumed free, and a liveness signal that breaks turns strictness ON.
+#
+# So: the table's own semantics first (1-4), then the composer's construction
+# and catalogue (5-6), then the seam -- the two tools (7), enforcement (8), the
+# strict-when-concurrent flip and its fail-closed edges (9-11), the never-throws
+# and batching contracts (12-13), that the layer locates paths by exactly the
+# same rules the policy does (14-15), and finally the bounded wait a contended
+# acquire makes rather than sending the model round again (16-20).
+#
+#   prove6 -Ilib t/20-leases.rakutest
+
+plan 25;
+
+constant ROOT = '/srv/work';
+constant ROOTS = { fs => ROOT, patch => ROOT, lock => ROOT };
+
+# === Doubles ===
+
+# The t/14 provider, minus its assumption that a call is well-formed: this layer
+# forwards a call it cannot read rather than refusing it, so the double has to
+# survive one. It keeps the call objects themselves so "forwarded untouched" can
+# be asserted by identity, and the batch boundaries so "one batch, not N" can be.
+my class ScriptedProvider {
+	has Str:D $.label = 'fs';
+	has Str:D @.tool-names = <fs_read fs_write fs_edit fs_move fs_delete>;
+	has Bool:D $.explode = False;
+	has Bool:D $.explode-listing = False;
+	has Int $.short;
+	has $.plain;                    # answer with this exact non-object value
+
+	has Lock $!lock .= new;
+	has @!declared;
+	has @!batches;
+
+	submethod TWEAK {
+		@!declared = @!tool-names.map(-> $name {
+			%(
+				type => 'function',
+				function => %(
+					name => $name,
+					description => "$!label does $name",
+					parameters => %( type => 'object', properties => %() ),
+				),
+			);
+		});
+	}
+
+	#| The names of the calls in each batch this provider was handed, in order.
+	method batches(--> List:D) {
+		$!lock.protect: { @!batches.map({ $_.map({ name-of($_) // '?' }).List }).List };
+	}
+
+	#| Every call object this provider saw, flattened, in order.
+	method seen(--> List:D) {
+		$!lock.protect: { @!batches.map(*.Slip).List };
+	}
+
+	method tools-for-llm(--> List) {
+		die "the $!label provider cannot list its tools" if $!explode-listing;
+		@!declared.List;
+	}
+
+	method declared(--> List:D) {
+		@!declared.List;
+	}
+
+	method execute-tool-calls(@tool-calls --> List) {
+		die "the $!label provider is not answering" if $!explode;
+
+		$!lock.protect: { @!batches.push([@tool-calls]) };
+
+		my @answers = @tool-calls.map(-> $tc {
+			$!plain.defined
+				?? $!plain
+				!! %(
+					role => 'tool',
+					tool_call_id => id-of($tc),
+					content => "$!label:{name-of($tc) // 'unreadable'}",
+					is_error => False,
+				);
+		}).list;
+
+		$!short.defined ?? @answers.head($!short).List !! @answers.List;
+	}
+}
+
+my class HalfProvider {
+	method tools-for-llm(--> List) { () }
+}
+
+# === Helpers ===
+
+sub name-of($call) {
+	return Str unless $call ~~ Associative;
+	my $function = $call<function>;
+	$function ~~ Associative && $function<name> ~~ Str:D ?? $function<name> !! Str;
+}
+
+sub id-of($call) {
+	$call ~~ Associative ?? ($call<id> // '') !! '';
+}
+
+sub call(Str:D $id, Str:D $name, $arguments = %()) {
+	%( id => $id, function => %( name => $name, arguments => $arguments ) );
+}
+
+sub table(*%opts --> MCP::Client::Leases::Table:D) {
+	MCP::Client::Leases::Table.new(|%opts);
+}
+
+sub leases-over($inner, *%opts --> MCP::Client::Leases:D) {
+	MCP::Client::Leases.new(
+		:$inner,
+		table => (%opts<table>:delete) // table(),
+		agent-id => (%opts<agent-id>:delete) // 'w1',
+		roots => ROOTS,
+		|%opts,
+	);
+}
+
+# === 1. The table grants ===
+
+subtest 'the table grants, snapshots, and refreshes rather than stacking' => {
+	plan 12;
+
+	my $table = table();
+	my %got = $table.acquire(holder => 'w1', paths => [ROOT ~ '/src', ROOT ~ '/README.md']);
+
+	ok %got<granted>, 'two paths, both granted';
+	is %got<leases>.elems, 2, 'one lease each';
+
+	is-deeply %got<leases>[0].keys.sort.List,
+		<acquired-at expires-at expires-in held-for holder path ttl>.List,
+		'a lease renders every field a status surface needs';
+	is %got<leases>[0]<path>, ROOT ~ '/src', 'the path as it was asked for';
+	is %got<leases>[0]<holder>, 'w1', 'held by the agent that asked';
+	is %got<leases>[0]<ttl>, 300, 'the table default of five minutes';
+	ok %got<leases>[0]<held-for> < 1, 'and it has only just been taken';
+
+	is $table.leases.elems, 2, 'the snapshot agrees';
+
+	# Re-acquiring is how a long edit keeps its claim: the clock restarts and no
+	# second lease appears. Spelt differently on purpose -- a model that writes
+	# the same path twice, slightly differently, means the same path.
+	my %again = $table.acquire(holder => 'w1', paths => [ROOT ~ '/src/'], ttl => 60);
+	ok %again<granted>, 'the holder may re-acquire what it already holds';
+	is $table.leases.elems, 2, 'without stacking a second lease on it';
+
+	my $refreshed = $table.leases.first({ $_<path> eq ROOT ~ '/src' });
+	is $refreshed<ttl>, 60, 'the new ttl replaced the old one';
+	ok $refreshed<expires-in> <= 60, 'and the clock restarted from now';
+};
+
+# === 2. Contention ===
+
+subtest 'contention is a value, in both directions, and nothing is half-granted' => {
+	plan 12;
+
+	my $table = table();
+	$table.acquire(holder => 'w1', paths => [ROOT ~ '/src']);
+
+	# A file inside a leased directory.
+	my %inside = $table.acquire(holder => 'r1', paths => [ROOT ~ '/src/app.raku']);
+	nok %inside<granted>, 'a file inside somebody else\'s leased directory is refused';
+	is %inside<reason>, 'conflict', 'and says why';
+	is %inside<conflicts>[0]<holder>, 'w1', 'naming who has it';
+	is %inside<conflicts>[0]<path>, ROOT ~ '/src/app.raku', 'the path that was asked for';
+	is %inside<conflicts>[0]<leased>, ROOT ~ '/src', 'and the lease that stood in the way';
+	ok %inside<conflicts>[0]<held-for> >= 0, 'with an age a refusal can quote';
+
+	# ... and the other way round: a directory containing a leased file.
+	my $other = table();
+	$other.acquire(holder => 'w1', paths => [ROOT ~ '/src/app.raku']);
+	nok $other.acquire(holder => 'r1', paths => [ROOT ~ '/src'])<granted>,
+		'a directory containing somebody else\'s leased file is refused too';
+
+	# An unknown in either direction is a collision: a relative claim cannot be
+	# measured against an absolute one, so it is not ruled out.
+	my $mixed = table();
+	$mixed.acquire(holder => 'w1', paths => ['src']);
+	nok $mixed.acquire(holder => 'r1', paths => [ROOT ~ '/src'])<granted>,
+		'a pair that cannot be compared fails closed';
+
+	# All or nothing.
+	my %partial = $table.acquire(holder => 'r1', paths => [ROOT ~ '/docs', ROOT ~ '/src/app.raku']);
+	nok %partial<granted>, 'a request with one contended path grants none of it';
+	is $table.covering(holder => 'r1', path => ROOT ~ '/docs')<verdict>, 'free',
+		'the path that was free is still free';
+	is $table.leases.elems, 1, 'and the table did not grow';
+
+	is $table.covering(holder => 'w1', path => ROOT ~ '/src/app.raku')<verdict>, 'own',
+		'the holder itself sees its own lease covering what is under it';
+};
+
+# === 3. Expiry and release ===
+
+subtest 'a lease expires on its own, and can be handed back' => {
+	plan 11;
+
+	my $table = table();
+	$table.acquire(holder => 'w1', paths => [ROOT ~ '/fast'], ttl => 0.05);
+	is $table.covering(holder => 'r1', path => ROOT ~ '/fast')<verdict>, 'other',
+		'held while it lives';
+
+	sleep 0.2;
+	is $table.covering(holder => 'r1', path => ROOT ~ '/fast')<verdict>, 'free',
+		'a wedged holder cannot keep a path forever';
+	is $table.leases.elems, 0, 'the expired lease is reaped on the way past';
+
+	$table.acquire(holder => 'w1', paths => [ROOT ~ '/a', ROOT ~ '/b']);
+	my %gave = $table.release(holder => 'w1', paths => [ROOT ~ '/a', ROOT ~ '/nope']);
+	is-deeply %gave<released>.List, (ROOT ~ '/a',), 'what was held is released';
+	is-deeply %gave<not-held>.List, (ROOT ~ '/nope',),
+		'and what was not held is reported rather than refused';
+	is $table.leases.elems, 1, 'the other lease still stands';
+
+	$table.acquire(holder => 'w1', paths => [ROOT ~ '/c']);
+	is $table.release(holder => 'w1')<released>.elems, 2,
+		'a bare release gives back everything the holder has';
+	is $table.leases.elems, 0, 'leaving nothing behind';
+
+	$table.acquire(holder => 'w1', paths => [ROOT ~ '/a']);
+	$table.acquire(holder => 'r1', paths => [ROOT ~ '/b']);
+	is $table.release-holder('w1'), 1, 'release-holder answers how many it took back';
+	is $table.leases.elems, 1, 'and leaves the other agent alone';
+
+	is $table.release-all, 1, 'release-all empties the table';
+};
+
+# === 4. Fail-closed at acquire ===
+
+subtest 'a path the table cannot read is a path it will not lock' => {
+	plan 10;
+
+	my $table = table();
+
+	# A '..' the server alone could resolve; a backslash that is a separator on
+	# one kind of server and a filename character on another; nothing at all; a
+	# null byte. Note what is NOT on this list: a path made of spaces is a
+	# perfectly good filename, and the table locks it like any other.
+	for (ROOT ~ '/../etc', ROOT ~ "\\srv", '', "x\0y") -> $bad {
+		my %no = $table.acquire(holder => 'w1', paths => [$bad]);
+		is %no<reason>, 'unevaluable-path',
+			"'{$bad.subst("\0", '\\0', :g)}' is refused rather than guessed at";
+	}
+
+	is $table.acquire(holder => 'w1', paths => [Any])<reason>, 'unevaluable-path',
+		'a null path entry is refused';
+	is $table.acquire(holder => 'w1', paths => [42])<reason>, 'unevaluable-path',
+		'and so is one that is not a string';
+
+	# All or nothing applies to unreadable paths too.
+	my %mixed = $table.acquire(holder => 'w1', paths => [ROOT ~ '/good', ROOT ~ '/../bad']);
+	is %mixed<reason>, 'unevaluable-path', 'one bad path refuses the whole request';
+	is $table.leases.elems, 0, 'and nothing at all was locked';
+
+	is $table.acquire(holder => 'w1', paths => [])<reason>, 'no-paths',
+		'a request for nothing is not a grant';
+	is $table.acquire(holder => 'w1', paths => [ROOT ~ '/x'], ttl => -1)<reason>, 'invalid-ttl',
+		'a ttl that is not a duration is refused';
+};
+
+# === 5. Construction ===
+
+subtest 'construction refuses what it could not honour' => {
+	plan 8;
+
+	my $fs = ScriptedProvider.new;
+	my $table = table();
+
+	lives-ok { MCP::Client::Leases.new(inner => $fs, :$table, agent-id => 'w1') },
+		'the minimum is an inner provider, a table and an id';
+
+	throws-like { MCP::Client::Leases.new(inner => $fs, :$table, agent-id => 'w1', root => ROOT) },
+		X::MCP::Client, message => /'unknown option'/,
+		'a typo\'d option is an error rather than a layer that enforces nothing';
+
+	throws-like { MCP::Client::Leases.new(inner => HalfProvider.new, :$table, agent-id => 'w1') },
+		X::MCP::Client, message => /'tools-for-llm'/,
+		'half a provider is not a provider';
+
+	throws-like { MCP::Client::Leases.new(inner => ScriptedProvider, :$table, agent-id => 'w1') },
+		X::MCP::Client, message => /'type object'/,
+		'and neither is a type object';
+
+	throws-like { MCP::Client::Leases.new(inner => $fs, :$table, agent-id => '') },
+		X::MCP::Client, message => /'agent-id'/,
+		'a lease has to be held by somebody';
+
+	throws-like {
+		MCP::Client::Leases.new(
+			inner => $fs, :$table, agent-id => 'w1', enforced-tools => ['fs*write',],
+		);
+	}, X::MCP::Client, message => /'invalid tool pattern'/,
+		'an enforced-tools pattern is validated exactly as a rule\'s tool is';
+
+	throws-like { MCP::Client::Leases.new(inner => $fs, :$table, agent-id => 'w1', default-ttl => 0) },
+		X::MCP::Client, message => /'positive number'/,
+		'a zero-second lease is not a lease';
+
+	throws-like { MCP::Client::Leases::Table.new(default-ttl => -5) },
+		X::MCP::Client, message => /'positive number'/,
+		'and the table says the same about its own default';
+};
+
+# === 6. The catalogue ===
+
+subtest 'the catalogue gains two tools, loses a collision, and can hide both' => {
+	plan 10;
+
+	my $fs = ScriptedProvider.new;
+	my $leases = leases-over($fs);
+
+	my @out = $leases.tools-for-llm;
+	is-deeply @out.map({ $_<function><name> }).List,
+		<fs_read fs_write fs_edit fs_move fs_delete lock_acquire lock_release>.List,
+		'the inner tools, then the two lease tools';
+	ok @out[0] === $fs.declared[0],
+		'an inner declaration is passed through as the very object it was';
+
+	my $props = @out.first({ $_<function><name> eq 'lock_acquire' })<function><parameters><properties>;
+	ok $props<paths><type> eq 'array' && $props<ttl><type> eq 'number',
+		'lock_acquire declares paths and an optional ttl';
+	ok $props<wait><type> eq 'number'
+		&& $props<wait><description>.contains(
+			MCP::Client::Leases::DEFAULT-WAIT-SECONDS.Str),
+		'and the wait, with the default in the text: a model cannot reason '
+			~ 'about how long a call may take from a name alone';
+	like @out.first({ $_<function><name> eq 'lock_acquire' })<function><description>,
+		/'THIS CALL WAITS'/,
+		'its description teaches that a contended acquire waits rather than failing';
+	like @out.first({ $_<function><name> eq 'lock_acquire' })<function><description>,
+		/'not a failure to retry blindly'/,
+		'and that the refusal at the end of the wait is still not a hard failure';
+	like @out.first({ $_<function><name> eq 'lock_release' })<function><description>,
+		/'releases everything you hold'/,
+		'lock_release teaches the bare form';
+
+	my $collides = ScriptedProvider.new(tool-names => <fs_read lock_acquire>);
+	my @merged = leases-over($collides).tools-for-llm;
+	is-deeply @merged.map({ $_<function><name> }).List,
+		<fs_read lock_acquire lock_release>.List,
+		'an inner tool of the same name is dropped rather than published twice';
+	is @merged.first({ $_<function><name> eq 'lock_acquire' })<function><description>.substr(0, 5),
+		'Claim', 'and it is this layer\'s declaration that survives';
+
+	is-deeply leases-over($collides, publish-tools => False).tools-for-llm
+			.map({ $_<function><name> }).List,
+		<fs_read>.List,
+		'solo-only hides both tools, and still refuses to publish the collision';
+};
+
+# === 7. The two tools ===
+
+subtest 'lock_acquire and lock_release round-trip through the bridge' => {
+	plan 17;
+
+	my $fs = ScriptedProvider.new;
+	my $table = table();
+	my $leases = leases-over($fs, :$table);
+
+	# Arguments as a JSON string, which is how a model's call actually arrives.
+	my @out = $leases.execute-tool-calls([
+		call('1', 'lock_acquire', '{"paths":["src/app.raku"],"ttl":600}'),
+	]);
+	nok @out[0]<is_error>, 'a grant is not an error';
+	is-deeply @out[0].keys.sort.List, <content is_error role tool_call_id>.List,
+		'and the result is exactly the four keys a tool result has';
+	like @out[0]<content>, /'600s'/, 'the ttl the model asked for is confirmed back';
+	is $table.leases[0]<path>, ROOT ~ '/src/app.raku',
+		'the relative path was measured from the lock tools\' root';
+	is $table.leases[0]<holder>, 'w1', 'and held under this composer\'s agent id';
+
+	# The same thing, with the arguments already an object.
+	my @two = $leases.execute-tool-calls([
+		call('2', 'lock_acquire', %( paths => ['docs'] )),
+	]);
+	nok @two[0]<is_error>, 'an object argument works the same way';
+	is $table.leases.elems, 2, 'and adds a second lease';
+
+	# A whitespace-only argument string is a call with no arguments: for a
+	# release, that is the bare form.
+	my @bare = $leases.execute-tool-calls([call('3', 'lock_release', '   '),]);
+	nok @bare[0]<is_error>, 'a bare release is not an error';
+	like @bare[0]<content>, /'released'/, 'and says what went back';
+	is $table.leases.elems, 0, 'everything this holder had is gone';
+
+	my @nothing = $leases.execute-tool-calls([call('4', 'lock_release', %( paths => ['gone'] )),]);
+	nok @nothing[0]<is_error>,
+		'releasing something you never held is reported, not refused';
+
+	my @bad = $leases.execute-tool-calls([call('5', 'lock_acquire', %( paths => 42 )),]);
+	ok @bad[0]<is_error> && @bad[0]<content>.contains('list of strings'),
+		'an unusable paths argument is refused by name, with the usage';
+
+	# The refusal a contended acquire produces: the message the whole design
+	# turns on, because it is the only thing standing between a model and a
+	# retry loop it cannot win.
+	#
+	# `wait => 0` throughout: this subtest is about the SHAPE of the refusal,
+	# and a default acquire now sits out ninety seconds before producing it.
+	# The waiting is subtest 16's business.
+	$table.acquire(holder => 'reviewer-1', paths => [ROOT ~ '/src']);
+	my @clash = $leases.execute-tool-calls([
+		call('6', 'lock_acquire', %( paths => ['src/app.raku', 'docs'], wait => 0 )),
+	]);
+	ok @clash[0]<is_error>, 'a contended acquire comes back as an error, not an exception';
+	like @clash[0]<content>, /'reviewer-1'/, 'naming who has it';
+	like @clash[0]<content>, /'nothing was locked'/,
+		'and saying plainly that the free path in the same request was not taken either';
+	is $table.leases.grep({ $_<holder> eq 'w1' }).elems, 0, 'which is true of the table as well';
+
+	ok $leases.execute-tool-calls([call('7', 'lock_acquire', %()),])[0]<is_error>,
+		'an acquire that names nothing is refused with the usage';
+};
+
+# === 8. Enforcement ===
+
+subtest 'another holder\'s lease stops the call, and the provider never sees it' => {
+	plan 10;
+
+	my $fs = ScriptedProvider.new;
+	my $table = table();
+	my $leases = leases-over($fs, :$table, agent-id => 'w1');
+
+	$table.acquire(holder => 'reviewer-1', paths => [ROOT ~ '/src']);
+
+	my @out = $leases.execute-tool-calls([
+		call('1', 'fs_write', %( path => 'src/app.raku' )),
+	]);
+	ok @out[0]<is_error>, 'a write into somebody else\'s lease is refused';
+	like @out[0]<content>, /'reviewer-1'/, 'the refusal names the holder';
+	like @out[0]<content>, /'held for '\d+'s'/, 'and how long they have had it';
+	is $fs.seen.elems, 0, 'and the provider is never troubled with it';
+
+	# Reads are unrestricted in v1.
+	my @read = $leases.execute-tool-calls([call('2', 'fs_read', %( path => 'src/app.raku' )),]);
+	nok @read[0]<is_error>, 'a read of a leased path still goes through';
+
+	# The holder itself, and a path nobody has claimed.
+	$table.acquire(holder => 'w1', paths => [ROOT ~ '/mine']);
+	my $own = call('3', 'fs_write', %( path => 'mine/notes.md' ));
+	my $free = call('4', 'fs_edit', %( path => 'elsewhere.md' ));
+	my @through = $leases.execute-tool-calls([$own, $free]);
+
+	nok @through[0]<is_error>, 'a write inside this agent\'s own lease goes through';
+	nok @through[1]<is_error>, 'and so does one on a path nobody has claimed';
+	nok $fs.seen[1] === $own || $fs.seen[2] === $free,
+		'filesystem mutations are copied before machine-only revision conditions are added';
+	is $fs.seen[1]<function><arguments><_expected-revisions><path>, 'sha256-v1:absent',
+		'an unobserved mutation is conditioned on the target still being absent';
+	is-deeply $fs.batches.List, (<fs_read>.List, <fs_write fs_edit>.List),
+		'the read went in its own batch, and these two in one of theirs';
+};
+
+# === 9. Strict when concurrent ===
+
+subtest 'strictness follows the live-agent count, and relaxes again' => {
+	plan 8;
+
+	my $fs = ScriptedProvider.new;
+	my $table = table();
+	my Int $live = 1;
+	my Int $asked = 0;
+	my $leases = leases-over(
+		$fs, :$table, agent-id => 'w1',
+		concurrent => { $asked++; $live },
+	);
+
+	nok $leases.execute-tool-calls([call('1', 'fs_write', %( path => 'a.md' )),])[0]<is_error>,
+		'solo, an unlocked write is nobody\'s business but its own';
+	is $asked, 1, 'and liveness was read exactly once for the batch';
+
+	$live = 2;
+	my @refused = $leases.execute-tool-calls([call('2', 'fs_write', %( path => 'a.md' )),]);
+	ok @refused[0]<is_error>, 'with a sibling live, an unlocked write is refused';
+	like @refused[0]<content>, /'another agent is live'/, 'saying why';
+	like @refused[0]<content>, /'lock_acquire'/, 'and what to do about it';
+
+	$leases.execute-tool-calls([call('3', 'lock_acquire', %( paths => ['a.md'] )),]);
+	nok $leases.execute-tool-calls([call('4', 'fs_write', %( path => 'a.md' )),])[0]<is_error>,
+		'with the lock taken, the same write goes through';
+
+	# Every path, not merely one of them: a move whose destination nobody holds
+	# is still a write nobody holds.
+	ok $leases.execute-tool-calls([
+		call('5', 'fs_move', %( from => 'a.md', to => 'b.md' )),
+	])[0]<is_error>,
+		'a two-ended call needs both ends covered';
+
+	$leases.execute-tool-calls([call('6', 'lock_release', %()),]);
+	$live = 1;
+	nok $leases.execute-tool-calls([call('7', 'fs_write', %( path => 'a.md' )),])[0]<is_error>,
+		'and when the last sibling drains, strictness relaxes on its own';
+};
+
+# === 10. The liveness signal, broken ===
+
+subtest 'a broken liveness signal fails closed' => {
+	plan 6;
+
+	my $table = table();
+	sub writes-with(&concurrent?) {
+		my $leases = &concurrent
+			?? leases-over(ScriptedProvider.new, :$table, :&concurrent)
+			!! leases-over(ScriptedProvider.new, :$table);
+		$leases.execute-tool-calls([call('1', 'fs_write', %( path => 'a.md' )),])[0]<is_error>;
+	}
+
+	nok writes-with(), 'no signal at all means advisory-only: this is a solo deployment';
+	nok writes-with({ 1 }), 'one live agent is not concurrency';
+	ok writes-with({ 2 }), 'two is';
+	ok writes-with({ die 'the engine is gone' }),
+		'a thunk that throws is taken to mean concurrent, not to mean solo';
+	ok writes-with({ Int }), 'and so is one that answers with a type object';
+	ok writes-with({ 'lots' }), 'and one that answers with something unreadable';
+};
+
+# === 11. Paths the layer cannot judge ===
+
+subtest 'an unjudgeable path is refused while siblings are live, and flagged when not' => {
+	plan 9;
+
+	my $table = table();
+	my $fs = ScriptedProvider.new;
+	my $strict = leases-over($fs, :$table, concurrent => { 2 });
+
+	my @out = $strict.execute-tool-calls([call('1', 'fs_write', %( path => '../etc/passwd' )),]);
+	ok @out[0]<is_error>, 'a traversal argument is refused rather than assumed free';
+	like @out[0]<content>, /'cannot tell where'/, 'saying which way it was hopeless';
+	is $fs.seen.elems, 0, 'and it never reaches the provider';
+
+	ok $strict.execute-tool-calls([call('2', 'fs_write', %( path => %( deep => 1 ) )),])[0]<is_error>,
+		'an argument that is not a path at all is refused too';
+	# A truncated argument string -- the shape a streamed tool call arrives in
+	# when the model ran out of tokens mid-object.
+	ok $strict.execute-tool-calls([call('3', 'fs_write', '{"path":"a",}'),])[0]<is_error>,
+		'and so is a call whose arguments will not parse';
+
+	# Advisory: the call goes through, carrying a note that it was not checked.
+	my $advisory = leases-over(ScriptedProvider.new, :$table);
+	my @warned = $advisory.execute-tool-calls([call('4', 'fs_write', %( path => '../etc/passwd' )),]);
+	nok @warned[0]<is_error>, 'with nobody to collide with, the call is not refused';
+	like @warned[0]<leases-warning>, /'did not check'/, 'but it says it was not checked';
+	is @warned[0]<content>, 'fs:fs_write', 'and the provider\'s own answer is untouched';
+
+	# A result that is not an object is never reshaped to carry a warning.
+	my $plain = leases-over(ScriptedProvider.new(plain => 'just a string'), :$table);
+	is-deeply $plain.execute-tool-calls([call('5', 'fs_write', %( path => '../x' )),]).List,
+		('just a string',),
+		'a non-object result is passed straight back, warning or no warning';
+};
+
+# === 12. Never throws ===
+
+subtest 'never throws, whatever the provider or the caller does' => {
+	plan 9;
+
+	my $table = table();
+	my $dead = ScriptedProvider.new(explode => True);
+	my $leases = leases-over($dead, :$table);
+
+	my @out;
+	lives-ok {
+		@out = $leases.execute-tool-calls([
+			call('a', 'fs_read', %( path => 'x' )),
+			call('b', 'lock_acquire', %( paths => ['y'] )),
+			call('c', 'fs_write', %( path => 'y' )),
+		]);
+	}, 'a provider that dies mid-batch does not take the caller with it';
+
+	is @out.elems, 3, 'every call still has a result';
+	is-deeply @out.map({ $_<tool_call_id> }).List, <a b c>.List, 'in the caller\'s own order';
+	ok @out[0]<is_error> && @out[2]<is_error>, 'the forwarded calls come back as errors';
+	nok @out[1]<is_error>, 'and the lock call, which never needed the provider, still worked';
+
+	# Calls this layer cannot read are the inner provider's problem, not this
+	# one's: it has no opinion about them and does not invent one.
+	my $fs = ScriptedProvider.new;
+	my $ok = leases-over($fs, :$table);
+	my @junk;
+	lives-ok {
+		@junk = $ok.execute-tool-calls([
+			'not a call at all',
+			%( id => 'no-function' ),
+			call('d', 'fs_read', %( path => 'x' )),
+		]);
+	}, 'a malformed call does not throw either';
+	is @junk.elems, 3, 'and still gets a result each';
+
+	# One result per call, even from a provider that came up short.
+	my $short = leases-over(ScriptedProvider.new(short => 1), :$table);
+	my @gaps = $short.execute-tool-calls([
+		call('e', 'fs_read', %( path => 'x' )),
+		call('f', 'fs_read', %( path => 'y' )),
+	]);
+	ok !@gaps[0]<is_error> && @gaps[1]<is_error>
+		&& @gaps[1]<content>.contains('no result'),
+		'a missing answer becomes an error rather than a hole';
+
+	# The other half of the contract, and deliberately not symmetrical: a
+	# catalogue that cannot be built throws, because publishing a silently
+	# shorter one leaves a model wondering where a capability went.
+	throws-like {
+		leases-over(ScriptedProvider.new(explode-listing => True), :$table).tools-for-llm;
+	}, X::AdHoc, message => /'cannot list its tools'/,
+		'listing keeps the asymmetry the policy keeps';
+};
+
+# === 13. Batching ===
+
+subtest 'the locks settle first, then one batch, at the caller\'s indices' => {
+	plan 6;
+
+	my $fs = ScriptedProvider.new;
+	my $table = table();
+	my $leases = leases-over($fs, :$table, concurrent => { 2 });
+
+	$table.acquire(holder => 'reviewer-1', paths => [ROOT ~ '/taken.md']);
+
+	my @out = $leases.execute-tool-calls([
+		call('0', 'lock_acquire', %( paths => ['mine.md'] )),
+		call('1', 'fs_write', %( path => 'mine.md' )),
+		call('2', 'fs_read', %( path => 'anything.md' )),
+		call('3', 'fs_write', %( path => 'taken.md' )),
+	]);
+
+	is-deeply @out.map({ $_<tool_call_id> }).List, ('0', '1', '2', '3'),
+		'every result is at the index its call came in at';
+	nok @out[0]<is_error>, 'the lock was taken';
+	nok @out[1]<is_error>,
+		'and the write it protects went through in the same batch -- locks settle first';
+	nok @out[2]<is_error>, 'the unrelated call went through';
+	ok @out[3]<is_error>, 'and the contended one did not';
+
+	is-deeply $fs.batches.List, (<fs_write fs_read>.List,),
+		'the provider saw one batch, of exactly the forwarded calls, in their own order';
+};
+
+# === 14. Path parity with the policy ===
+
+subtest 'paths are located exactly as the policy locates them' => {
+	plan 6;
+
+	my $table = table();
+	my $fs = ScriptedProvider.new(tool-names => <fs_write fs_move patch_apply>);
+	my $leases = leases-over(
+		$fs, :$table,
+		enforced-tools => <fs_write fs_move patch_*>,
+		path-params => { patch_apply => ['target',] },
+	);
+
+	# The policy's own view of the same call, as the parity anchor.
+	my @policy-paths = evaluate(
+		(), 'fs_write', %( path => 'src/app.raku' ), roots => ROOTS,
+	)<paths>.List;
+	is-deeply @policy-paths.List, (ROOT ~ '/src/app.raku',),
+		'the policy engine absolutizes a relative argument against the tool root';
+
+	$table.acquire(holder => 'reviewer-1', paths => @policy-paths);
+	ok $leases.execute-tool-calls([call('1', 'fs_write', %( path => 'src/app.raku' )),])[0]<is_error>,
+		'and the lease layer sees the very same location';
+
+	# Both ends of a two-ended call, by the from/to convention.
+	nok $leases.execute-tool-calls([
+		call('2', 'fs_move', %( from => 'a.md', to => 'b.md' )),
+	])[0]<is_error>,
+		'a move nobody has claimed either end of goes through';
+	ok $leases.execute-tool-calls([
+		call('3', 'fs_move', %( from => 'a.md', to => 'src/app.raku' )),
+	])[0]<is_error>,
+		'a move onto a leased destination does not';
+
+	# The path-params override, exactly as the policy reads it.
+	$table.acquire(holder => 'reviewer-1', paths => [ROOT ~ '/patched.md']);
+	ok $leases.execute-tool-calls([
+		call('4', 'patch_apply', %( target => 'patched.md' )),
+	])[0]<is_error>,
+		'an overridden location parameter is enforced';
+	nok $leases.execute-tool-calls([
+		call('5', 'patch_apply', %( target => 'other.md', path => 'patched.md' )),
+	])[0]<is_error>,
+		'and the convention it replaced is not consulted';
+};
+
+# === 15. The promoted helpers ===
+
+subtest 'the location helpers the layer shares with the policy are exported' => {
+	plan 10;
+
+	my %roots = fs => ROOT, '' => '/tmp/agent';
+
+	is root-for('fs_write', %roots), ROOT, 'the longest matching tool-name prefix wins';
+	is root-for('sh_run', %roots), '/tmp/agent', "and '' is a catch-all";
+	is root-for('fs_write', {}), Str, 'with no table, there is no root';
+
+	is-deeply path-params-for('fs_move', {}).List, <path from to>.List,
+		'the location convention is path/from/to';
+	is-deeply path-params-for('sql_query', { sql_query => () }).List, ().List,
+		'an explicit empty list means the tool names no locations';
+
+	is absolutize('notes.md', ROOT), ROOT ~ '/notes.md', 'a relative argument gains the root';
+	is absolutize('/etc/passwd', ROOT), '/etc/passwd', 'an absolute one keeps itself';
+	is absolutize(42, ROOT), Str, 'and a value that is not a string has no path at all';
+
+	my @located = located-args('fs_move', %( from => 'a', to => %( deep => 1 ) ), {}, ROOT);
+	is-deeply @located.map({ $_<param> }).List, <from to>.List,
+		'every location argument the call carried, in declaration order';
+	ok @located[0]<path> eq ROOT ~ '/a' && !(@located[1]<path> ~~ Str:D),
+		'a present-but-unreadable argument is kept, with no path -- not dropped';
+};
+
+# === 16-19. The wait ===
+#
+# `lock_acquire` waits out a contended path rather than making the MODEL poll
+# (each of whose laps re-sends the whole conversation). Everything here is
+# about the four ways that wait can end -- granted, deadline, cancelled,
+# capped -- and about the promise that `wait: 0` is still the layer these
+# subtests' neighbours were written against.
+#
+# The clock is real, because the thing under test IS a clock. It is kept cheap
+# by short waits and a synthetic table default-ttl rather than by mocking the
+# poll away.
+
+# The refusal a contended acquire has always produced. Spelled out rather than
+# matched loosely: the whole point of the wait is that what comes back at the
+# END of it is the message the model already knows how to read.
+#
+# The one thing that legitimately differs between a refusal at once and a
+# refusal a minute later is how long the holder has had it, so `held-for` is
+# normalised away and everything else is compared to the character.
+sub contention-refusal(Str:D $path, Str:D $leased, Str:D $holder --> Str:D) {
+	"lock_acquire: nothing was locked. '$path' is locked by $holder "
+		~ "(locked as '$leased'), held for Ns. Work on something else and try "
+		~ 'again later, or say that the path is taken.';
+}
+
+sub ageless(Str:D $content --> Str:D) {
+	$content.subst(/'held for ' \d+ 's'/, 'held for Ns', :g);
+}
+
+subtest 'wait: 0 is the acquire this layer shipped with, to the byte' => {
+	plan 4;
+
+	my $fs = ScriptedProvider.new;
+	my $table = table();
+	my $leases = leases-over($fs, :$table);
+
+	$table.acquire(holder => 'reviewer-1', paths => [ROOT ~ '/src'], ttl => 600);
+
+	my $started = now;
+	my @out = $leases.execute-tool-calls([
+		call('1', 'lock_acquire', %( paths => ['src/app.raku'], wait => 0 )),
+	]);
+	my $elapsed = now - $started;
+
+	ok @out[0]<is_error>, 'a contended acquire with no wait is still an error';
+	is ageless(@out[0]<content>),
+		contention-refusal(ROOT ~ '/src/app.raku', ROOT ~ '/src', 'reviewer-1'),
+		'and the message is the one it always was, word for word — nothing '
+			~ 'about the wait leaks into the refusal of a call that did not wait';
+	ok $elapsed < 1, 'it did not sleep on the way there';
+
+	# The other half of "byte-identical": zero must not be read as absent.
+	my $default = $leases.execute-tool-calls([
+		call('2', 'lock_acquire', %( paths => ['src/app.raku'], wait => '0' )),
+	]);
+	ok $default[0]<is_error>,
+		'a zero written as a string is a zero, not an unreadable wait';
+};
+
+subtest 'a contended acquire waits, and takes the lease the moment it is free' => {
+	plan 6;
+
+	my $fs = ScriptedProvider.new;
+	my $table = table();
+
+	my @begun;
+	my @ended;
+	my $leases = leases-over($fs, :$table,
+		on-wait-begin => { @begun.push: now },
+		on-wait-end   => { @ended.push: now },
+	);
+
+	$table.acquire(holder => 'reviewer-1', paths => [ROOT ~ '/src'], ttl => 600);
+
+	# The holder finishes while the waiter is asleep between polls.
+	my $releaser = start {
+		sleep 1.2;
+		$table.release(holder => 'reviewer-1', paths => [ROOT ~ '/src']);
+	};
+
+	my $started = now;
+	my @out = $leases.execute-tool-calls([
+		call('1', 'lock_acquire', %( paths => ['src/app.raku'], wait => 20 )),
+	]);
+	my $elapsed = now - $started;
+	await $releaser;
+
+	nok @out[0]<is_error>, 'the wait ended in a grant, not a refusal';
+	like @out[0]<content>, /'locked'/,
+		'and the grant is the same grant an uncontended acquire produces';
+	is $table.leases.grep({ $_<holder> eq 'w1' }).elems, 1,
+		'the lease is really in the table, under this agent';
+
+	ok $elapsed >= 1,
+		'it really waited — the path was taken when the call was made';
+	ok $elapsed < 10,
+		'and it came back when the lock came free, not at the deadline';
+
+	is (@begun.elems, @ended.elems), (1, 1),
+		'the host was told once that the agent had stopped working, and once '
+			~ 'that it had started again';
+};
+
+subtest 'a wait that runs out refuses exactly as a wait: 0 would' => {
+	plan 7;
+
+	my $fs = ScriptedProvider.new;
+	my $table = table();
+
+	my @begun;
+	my @ended;
+	my $leases = leases-over($fs, :$table,
+		on-wait-begin => { @begun.push: 1 },
+		on-wait-end   => { @ended.push: 1 },
+	);
+
+	$table.acquire(holder => 'reviewer-1', paths => [ROOT ~ '/src'], ttl => 600);
+
+	my $started = now;
+	my @out = $leases.execute-tool-calls([
+		call('1', 'lock_acquire', %( paths => ['src/app.raku'], wait => 2 )),
+	]);
+	my $elapsed = now - $started;
+
+	ok @out[0]<is_error>, 'the deadline passes and the call is refused';
+	is ageless(@out[0]<content>),
+		contention-refusal(ROOT ~ '/src/app.raku', ROOT ~ '/src', 'reviewer-1'),
+		'in the standard shape, holder and held-for and all: a model that '
+			~ 'has learned to read this does not have to learn again';
+	ok $elapsed >= 2, 'having spent the whole wait on it';
+	is (@begun.elems, @ended.elems), (1, 1),
+		'and the end hook fires on the deadline path too';
+
+	# --- An immediate grant is not a wait. ------------------------------
+	@begun = ();
+	@ended = ();
+	nok $leases.execute-tool-calls([
+		call('2', 'lock_acquire', %( paths => ['docs'] )),
+	])[0]<is_error>, 'an uncontended acquire is granted at once';
+	is (@begun.elems, @ended.elems), (0, 0),
+		'and fires neither hook — a host that counts suspensions must not '
+			~ 'count an agent that never stopped working';
+
+	# --- A hook that throws is the host's problem, not the model's. -----
+	my $broken = leases-over(ScriptedProvider.new, :$table, agent-id => 'w2',
+		on-wait-begin => { die 'the bookkeeping is broken' },
+		on-wait-end   => { die 'and so is the other half' },
+	);
+	my @survived = $broken.execute-tool-calls([
+		call('3', 'lock_acquire', %( paths => ['src/app.raku'], wait => 1 )),
+	]);
+	is ageless(@survived[0]<content>),
+		contention-refusal(ROOT ~ '/src/app.raku', ROOT ~ '/src', 'reviewer-1'),
+		'a hook that throws is swallowed: the acquire answers as if the host '
+			~ 'had said nothing';
+};
+
+subtest 'a cancelled run stops waiting, and a broken cancel signal does not' => {
+	plan 6;
+
+	my $fs = ScriptedProvider.new;
+	my $table = table();
+
+	my @ended;
+	my $cancelled = False;
+	my $leases = leases-over($fs, :$table,
+		on-wait-end => { @ended.push: 1 },
+		cancelled   => { $cancelled },
+	);
+
+	$table.acquire(holder => 'reviewer-1', paths => [ROOT ~ '/src'], ttl => 600);
+
+	my $flip = start { sleep 1.2; $cancelled = True };
+
+	my $started = now;
+	my @out = $leases.execute-tool-calls([
+		call('1', 'lock_acquire', %( paths => ['src/app.raku'], wait => 60 )),
+	]);
+	my $elapsed = now - $started;
+	await $flip;
+
+	ok @out[0]<is_error>, 'a cancelled wait ends in the refusal, not a grant';
+	ok ageless(@out[0]<content>).starts-with(
+		contention-refusal(ROOT ~ '/src/app.raku', ROOT ~ '/src', 'reviewer-1')),
+		'which is the standard refusal, unchanged, with the cut-short note '
+			~ 'appended rather than folded into it';
+	like @out[0]<content>, /'cut short'/, 'and the note says what happened';
+	ok $elapsed < 15,
+		'the wait was abandoned at a poll tick, not sat out to its deadline';
+	is @ended.elems, 1, 'the end hook fires on the cancel path as well';
+
+	# --- Fail OPEN, unlike the concurrency thunk. -----------------------
+	#
+	# A cancel probe that throws must not fake a cancellation: over-waiting
+	# costs seconds, a falsely refused acquire costs correctness.
+	my $broken = leases-over(ScriptedProvider.new, :$table, agent-id => 'w2',
+		cancelled => { die 'the cancel probe is broken' },
+	);
+	my $from = now;
+	$broken.execute-tool-calls([
+		call('2', 'lock_acquire', %( paths => ['src/app.raku'], wait => 2 )),
+	]);
+	ok (now - $from) >= 2,
+		'a thunk that throws is read as "not cancelled", so the wait runs '
+			~ 'its course';
+};
+
+subtest 'the wait cannot outlast the lease it is waiting on' => {
+	plan 5;
+
+	my $fs = ScriptedProvider.new;
+	# A synthetic workspace TTL, which is what the cap is measured against:
+	# out of the box it is 300 seconds, and a test cannot sit that out.
+	my $table = table(default-ttl => 2);
+	my $leases = leases-over($fs, :$table);
+
+	# The holder asks for much longer than the workspace default, so the
+	# wait cannot end by the lease being reaped — only by the cap.
+	$table.acquire(holder => 'reviewer-1', paths => [ROOT ~ '/src'], ttl => 600);
+
+	my $started = now;
+	my @out = $leases.execute-tool-calls([
+		call('1', 'lock_acquire', %( paths => ['src/app.raku'], wait => 9999 )),
+	]);
+	my $elapsed = now - $started;
+
+	ok @out[0]<is_error>, 'the absurd wait still ends in the standard refusal';
+	ok $elapsed >= 2, 'having waited the cap out';
+	ok $elapsed < 20,
+		'and NOT the 9999 seconds it asked for: a wait longer than a lease '
+			~ 'can live is time spent waiting on a holder that has already '
+			~ 'been reaped';
+
+	# --- What a wait may not be. ----------------------------------------
+	ok $leases.execute-tool-calls([
+		call('2', 'lock_acquire', %( paths => ['docs'], wait => 'soon' )),
+	])[0]<content>.contains('wait must be'),
+		'a wait that is not a number of seconds is refused by name, with the usage';
+
+	# THE BOOL TRAP, the same one `ttl` answers for: a Raku Bool IS an Int,
+	# so `"wait": true` would otherwise be one second of waiting.
+	ok $leases.execute-tool-calls([
+		call('3', 'lock_acquire', %( paths => ['docs'], wait => True )),
+	])[0]<content>.contains('wait must be'),
+		'and a boolean where a number belongs is refused rather than guessed at';
+};
+
+subtest 'wait graph detects long cycles and cleanup removes registrations' => {
+	plan 9;
+	my $table = table();
+	$table.acquire(holder => 'a', paths => [ROOT ~ '/a']);
+	$table.acquire(holder => 'b', paths => [ROOT ~ '/b']);
+	$table.acquire(holder => 'c', paths => [ROOT ~ '/c']);
+
+	is $table.wait-attempt(
+		waiter-id => 'wa', holder => 'a', paths => [ROOT ~ '/b'],
+	)<reason>, 'conflict', 'the first graph edge registers';
+	is $table.wait-attempt(
+		waiter-id => 'wb', holder => 'b', paths => [ROOT ~ '/c'],
+	)<reason>, 'conflict', 'and a second edge may extend the chain';
+	my %cycle = $table.wait-attempt(
+		waiter-id => 'wc', holder => 'c', paths => [ROOT ~ '/a'],
+	);
+	is %cycle<reason>, 'deadlock', 'the closing edge is refused as a deadlock';
+	is-deeply %cycle<cycle>.List, <c a b c>.List,
+		'the arbitrary-length cycle is returned for diagnosis';
+	is $table.status<waiters>.elems, 2,
+		'the refused closing waiter was removed immediately';
+	$table.release-holder('b');
+	is $table.status<waiters>[0]<holder>, 'a',
+		'releasing a holder removes that holder\'s waiter but preserves others';
+	is-deeply $table.status<waiters>[0]<blockers>.List, ().List,
+		'and recomputes the surviving waiter\'s now-cleared blockers';
+	ok $table.cancel-wait('wa'), 'a waiter can be cancelled explicitly';
+	is $table.status<waiters>.elems, 0, 'cancellation removes its graph edge';
+};
+
+subtest 'holding one lease makes a contended acquire fail immediately' => {
+	plan 4;
+	my $table = table();
+	my $leases = leases-over(ScriptedProvider.new, :$table, agent-id => 'a');
+	$table.acquire(holder => 'a', paths => [ROOT ~ '/mine']);
+	$table.acquire(holder => 'b', paths => [ROOT ~ '/theirs']);
+
+	my $started = now;
+	my $result = $leases.execute-tool-calls([
+		call('hold', 'lock_acquire', %( paths => ['theirs'], wait => 20 )),
+	])[0];
+	ok $result<is_error>, 'the acquire is refused';
+	like $result<content>, /'already holds a lease'/, 'the hold-and-wait cause is explicit';
+	like $result<content>, /'complete deduplicated working set'/,
+		'the result teaches release and atomic union acquisition';
+	ok now - $started < 1, 'it does not enter the bounded wait';
+};
+
+subtest 'mutation pins defer expiry and explicit release' => {
+	plan 7;
+	my $table = table(default-ttl => 0.1);
+	$table.acquire(holder => 'a', paths => [ROOT ~ '/x']);
+	my %pin = $table.pin(holder => 'a', paths => [ROOT ~ '/x/file']);
+	ok %pin<pinned>, 'a covering generation can be pinned';
+	sleep 0.2;
+	is $table.status<leases>.elems, 1, 'expiry is deferred during the provider window';
+	is $table.status<pins>.elems, 1, 'the pin is visible in the status snapshot';
+	is $table.release-holder('a'), 1, 'release reports the lease it made pending';
+	ok $table.status<leases>[0]<release-pending>, 'release is visibly pending';
+	ok $table.unpin(%pin<token>), 'the provider returns its pin exactly once';
+	is $table.status<leases>.elems, 0, 'the pending expired lease is then reaped';
+};
+
+subtest 'filesystem observations drive hidden revision expectations' => {
+	plan 9;
+	my class RevisionProvider {
+		has Str $.token is rw = 'sha256-v1:file:one';
+		has Bool $.fail-next is rw = False;
+		has @.seen;
+		method tools-for-llm { () }
+		method execute-tool-calls(@calls) {
+			@!seen.append: @calls;
+			@calls.map(-> $call {
+				my $name = $call<function><name>;
+				if $name eq 'fs_read' {
+					%(
+						role => 'tool', tool_call_id => $call<id>, content => 'one',
+						is_error => False,
+						structured_content => %(
+							revisionScheme => 'sha256-v1',
+							revisions => %( path => %( state => 'file', token => $!token ) ),
+						),
+					);
+				}
+				elsif $!fail-next {
+					$!fail-next = False;
+					%( role => 'tool', tool_call_id => $call<id>,
+						content => 'stale', is_error => True );
+				}
+				else {
+					$!token = $!token eq 'sha256-v1:file:one'
+						?? 'sha256-v1:file:two' !! 'sha256-v1:file:three';
+					%(
+						role => 'tool', tool_call_id => $call<id>, content => 'changed',
+						is_error => False,
+						structured_content => %(
+							revisionScheme => 'sha256-v1',
+							revisions => %( path => %( state => 'file', token => $!token ) ),
+						),
+					);
+				}
+			}).List;
+		}
+	}
+
+	my $provider = RevisionProvider.new;
+	my $table = table();
+	my $leases = leases-over($provider, :$table, agent-id => 'a', concurrent => { 2 });
+	$table.acquire(holder => 'a', paths => [ROOT ~ '/doc']);
+
+	$leases.execute-tool-calls([call('r', 'fs_read', %( path => 'doc' )),]);
+	my $write = call('w', 'fs_write', %( path => 'doc', content => 'two' ));
+	my $written = $leases.execute-tool-calls([$write,])[0];
+	nok $written<is_error>, 'an observed mutation succeeds';
+	is $provider.seen[1]<function><arguments><_expected-revisions><path>,
+		'sha256-v1:file:one', 'the read revision was injected';
+	nok $provider.seen[1] === $write, 'the model-authored call was not mutated';
+
+	my $edit = call('e', 'fs_edit', %( path => 'doc', 'old-string' => 'two',
+		'new-string' => 'three' ));
+	$leases.execute-tool-calls([$edit,]);
+	is $provider.seen[2]<function><arguments><_expected-revisions><path>,
+		'sha256-v1:file:two', 'a successful mutation advanced the cache';
+
+	$provider.fail-next = True;
+	my $failed = $leases.execute-tool-calls([
+		call('f', 'fs_write', %( path => 'doc', content => 'bad' )),
+	])[0];
+	ok $failed<is_error>, 'a provider-side stale result is preserved';
+	$leases.execute-tool-calls([
+		call('again', 'fs_write', %( path => 'doc', content => 'retry' )),
+	]);
+	is $provider.seen[4]<function><arguments><_expected-revisions><path>,
+		'sha256-v1:absent', 'failure invalidated the cached observation';
+
+	is $table.status<pins>.elems, 0, 'every synchronous provider call returned its pin';
+	is $table.status<leases>.elems, 1, 'and the covering lease remains live';
+	is $provider.seen.elems, 5, 'read and each mutation reached the provider once';
+};
+
+subtest 'the composer pins a lease for the whole provider call' => {
+	plan 7;
+	my class BlockingProvider {
+		has Promise:D $.entered is required;
+		has Promise:D $.release is required;
+		method tools-for-llm { () }
+		method execute-tool-calls(@calls) {
+			$!entered.keep(True);
+			await $!release;
+			@calls.map({ %(
+				role => 'tool', tool_call_id => $_<id>, content => 'done', is_error => False,
+			)}).List;
+		}
+	}
+
+	my $entered = Promise.new;
+	my $release = Promise.new;
+	my $table = table(default-ttl => 0.1);
+	my $leases = leases-over(
+		BlockingProvider.new(:$entered, :$release), :$table,
+		agent-id => 'a', concurrent => { 2 },
+	);
+	$table.acquire(holder => 'a', paths => [ROOT ~ '/doc']);
+	my $call = start {
+		$leases.execute-tool-calls([
+			call('blocked', 'fs_write', %( path => 'doc', content => 'x' )),
+		]);
+	};
+	await $entered;
+	is $table.status<pins>.elems, 1, 'the lease is pinned before provider code runs';
+	sleep 0.2;
+	is $table.status<leases>.elems, 1, 'expiry cannot reap an in-flight generation';
+	is $table.release-holder('a'), 1, 'an explicit release sees the lease';
+	ok $table.status<leases>[0]<release-pending>, 'and makes release pending';
+	$release.keep(True);
+	my @answer = await $call;
+	nok @answer[0]<is_error>, 'the provider result is returned normally';
+	is $table.status<pins>.elems, 0, 'the LEAVE returned the pin';
+	is $table.status<leases>.elems, 0, 'and the pending expired lease was reaped';
+};

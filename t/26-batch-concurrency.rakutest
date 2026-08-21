@@ -1,0 +1,252 @@
+use Test;
+use lib 'lib', 't/lib';
+use MCP::Server;
+use MCP::Client;
+use MCP::Client::Exceptions;
+use MCP::Client::Test::InProcessTransport;
+
+# The remote half of the promise MCP::Server::Batch makes. A toolkit behind a
+# connection has to run a batch the way the same toolkit inside the process
+# does: serial unless every call is annotated read-only and idempotent, and
+# then bounded, ordered, and de-duplicated.
+
+plan 8;
+
+my constant READS = { readOnlyHint => True, idempotentHint => True };
+
+my sub call(Str:D $id, Str:D $name, %arguments = {}) {
+	%( id => $id, function => %( name => $name, arguments => %arguments ) );
+}
+
+# A server with an annotated slow read and an unannotated twin of it, plus the
+# bookkeeping a test needs: how many handlers ran, and how many were inside one
+# at the same moment.
+my sub rig(Real:D :$delay = 0, *%client-opts) {
+	my $lock = Lock.new;
+	my Int $runs = 0;
+	my Int $in-flight = 0;
+	my Int $peak = 0;
+
+	my &body = -> :%args {
+		$lock.protect: {
+			$runs++;
+			$in-flight++;
+			$peak = $in-flight if $in-flight > $peak;
+		}
+		sleep $delay if $delay;
+		$lock.protect: { $in-flight-- };
+		'read:' ~ (%args<path> // '');
+	};
+
+	my $server = MCP::Server.new(name => 'annotated', version => '1.0.0');
+	$server.tool: 'read',
+		description => 'Read a thing',
+		annotations => READS,
+		params => { path => { type => 'string' } },
+		handler => &body;
+	$server.tool: 'touch',
+		description => 'Write a thing',
+		params => { path => { type => 'string' } },
+		handler => -> :%args {
+			$lock.protect: { $runs++ };
+			'touch:' ~ (%args<path> // '');
+		};
+
+	my $wire = MCP::Client::Test::InProcessTransport.new(server => $server);
+	my $client = MCP::Client.new(
+		transport => $wire,
+		on-warn => -> Str:D $m { diag "client warning: $m" },
+		|%client-opts,
+	);
+
+	%(
+		:$client, :$wire, :$server,
+		runs => -> { $lock.protect: { $runs } },
+		peak => -> { $lock.protect: { $peak } },
+	);
+}
+
+subtest 'the server\'s annotations reach the client' => {
+	plan 4;
+
+	my %rig = rig();
+	LEAVE { %rig<client>.close }
+
+	is-deeply %rig<client>.tool-annotations('read'),
+		%( readOnlyHint => True, idempotentHint => True ),
+		'read as the server published them in tools/list';
+	is-deeply %rig<client>.tool-annotations('touch'), %(),
+		'a tool that declared none has an empty Hash';
+	is-deeply %rig<client>.tool-annotations('nonesuch'), %(),
+		'and so does a name this server does not have';
+
+	# Same reason as the local bridge: these declarations go on an
+	# OpenAI-compatible provider's wire verbatim.
+	my %decl = %rig<client>.tools-for-llm.first({ $_<function><name> eq 'read' });
+	is-deeply %decl<function>.keys.sort.List, ('description', 'name', 'parameters'),
+		'while the LLM declarations carry no annotations at all';
+};
+
+subtest 'an annotated batch is in flight together' => {
+	plan 3;
+
+	my %rig = rig(delay => 0.4);
+	LEAVE { %rig<client>.close }
+
+	my $began = now;
+	my @results = %rig<client>.execute-tool-calls(
+		(^4).map({ call("c$_", 'read', %( path => "f$_" )) }));
+	my $elapsed = now - $began;
+
+	is @results.map({ $_<content> }).List,
+		('read:f0', 'read:f1', 'read:f2', 'read:f3'),
+		'four answers, in the order the model asked';
+	ok %rig<peak>() > 1, 'more than one call was at the server at once';
+	ok $elapsed < 1.2,
+		"four 0.4s calls took {$elapsed.round(0.01)}s, not the 1.6s of a queue";
+};
+
+subtest 'one unannotated call keeps the whole batch serial' => {
+	plan 3;
+
+	my %rig = rig(delay => 0.2);
+	LEAVE { %rig<client>.close }
+
+	my $began = now;
+	my @results = %rig<client>.execute-tool-calls((
+		call('a', 'read',  %( path => 'one' )),
+		call('b', 'touch', %( path => 'two' )),
+		call('c', 'read',  %( path => 'three' )),
+	));
+	my $elapsed = now - $began;
+
+	is @results.map({ $_<content> }).List,
+		('read:one', 'touch:two', 'read:three'),
+		'model order, as always';
+	is %rig<peak>(), 1, 'and nothing was ever in flight beside anything else';
+	ok $elapsed >= 0.4, 'two 0.2s reads, one after the other';
+};
+
+subtest 'identical calls in a widened batch are one request' => {
+	plan 4;
+
+	my %rig = rig();
+	LEAVE { %rig<client>.close }
+
+	my @results = %rig<client>.execute-tool-calls((
+		call('a', 'read', %( path => 'same' )),
+		call('b', 'read', %( path => 'same' )),
+		call('c', 'read', %( path => 'other' )),
+	));
+
+	is %rig<wire>.count-for('tools/call'), 2,
+		'three calls, two round trips — the duplicate never reached the wire';
+	is %rig<runs>(), 2, 'and the server ran two handlers';
+	is @results.map({ $_<content> }).List,
+		('read:same', 'read:same', 'read:other'),
+		'while every slot has its answer';
+	is @results.map({ $_<tool_call_id> }).List, ('a', 'b', 'c'),
+		'under the id of the call it answers';
+};
+
+subtest 'a widened batch answers exactly as a serial one does' => {
+	plan 3;
+
+	my %serial = rig(tool-concurrency => 1);
+	LEAVE { %serial<client>.close }
+	my %wide = rig(tool-concurrency => 8);
+	LEAVE { %wide<client>.close }
+
+	my @calls = (^50).map({ call("c$_", 'read', %( path => "f{$_ % 7}" )) });
+
+	my @one-at-a-time = %serial<client>.execute-tool-calls(@calls);
+	my @widened = %wide<client>.execute-tool-calls(@calls);
+
+	is-deeply @widened.map({ $_.Hash }).List,
+		@one-at-a-time.map({ $_.Hash }).List,
+		'fifty answers, result for result and key for key';
+	is %serial<runs>(), 50, 'fifty executions when nothing may be shared';
+	is %wide<runs>(), 7, 'and seven distinct paths when it may';
+};
+
+subtest 'a server that annotates nothing gets the old behaviour' => {
+	plan 2;
+
+	my $server = MCP::Server.new(name => 'quiet', version => '1.0.0');
+	my $lock = Lock.new;
+	my Int $in-flight = 0;
+	my Int $peak = 0;
+	$server.tool: 'read',
+		params => { path => { type => 'string' } },
+		handler => -> :%args {
+			$lock.protect: { $in-flight++; $peak = $in-flight if $in-flight > $peak };
+			sleep 0.15;
+			$lock.protect: { $in-flight-- };
+			'read:' ~ (%args<path> // '');
+		};
+
+	my $client = MCP::Client.new(
+		transport => MCP::Client::Test::InProcessTransport.new(:$server),
+	);
+	LEAVE { $client.close }
+
+	my @results = $client.execute-tool-calls(
+		(^3).map({ call("c$_", 'read', %( path => "f$_" )) }));
+
+	is @results.map({ $_<content> }).List,
+		('read:f0', 'read:f1', 'read:f2'), 'answers in order';
+	is $lock.protect({ $peak }), 1,
+		'and one at a time: concurrency is opted into by a server that said '
+			~ 'its tools were safe for it, never assumed';
+};
+
+subtest 'a failure in a widened batch belongs to its own call' => {
+	plan 3;
+
+	my $server = MCP::Server.new(name => 'unlucky', version => '1.0.0');
+	$server.tool: 'read',
+		annotations => READS,
+		params => { path => { type => 'string' } },
+		handler => -> :%args {
+			die 'no such file' if (%args<path> // '') eq 'missing';
+			'read:' ~ (%args<path> // '');
+		};
+
+	my $client = MCP::Client.new(
+		transport => MCP::Client::Test::InProcessTransport.new(:$server),
+	);
+	LEAVE { $client.close }
+
+	my @results = $client.execute-tool-calls((
+		call('a', 'read', %( path => 'here' )),
+		call('b', 'read', %( path => 'missing' )),
+		call('c', 'read', %( path => 'also-here' )),
+	));
+
+	is @results.map({ $_<tool_call_id> }).List, <a b c>.List, 'three answers, in order';
+	is-deeply @results.map({ $_<is_error> }).List, (False, True, False),
+		'and the isError is on the call that failed';
+	like @results[1]<content>, /'no such file'/, 'carrying what went wrong';
+};
+
+subtest 'a width below one is refused at construction' => {
+	plan 2;
+
+	my $server = MCP::Server.new(name => 'width', version => '1.0.0');
+	$server.tool: 'read', handler => -> :%args { 'r' };
+
+	throws-like {
+		MCP::Client.new(
+			transport => MCP::Client::Test::InProcessTransport.new(:$server),
+			tool-concurrency => 0,
+		)
+	}, X::MCP::Client, message => /'tool-concurrency'/,
+		'zero is not a batch width';
+	throws-like {
+		MCP::Client.new(
+			transport => MCP::Client::Test::InProcessTransport.new(:$server),
+			tool-concurrency => -3,
+		)
+	}, X::MCP::Client, message => /'tool-concurrency'/,
+		'and neither is a negative one';
+};

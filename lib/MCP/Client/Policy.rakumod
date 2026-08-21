@@ -97,6 +97,10 @@ answered with one of:
 { action => 'deny-once' }
 { action => 'always-allow' }                          # remembers the suggestion
 { action => 'always-deny', rule => { tool => 'fs_*', under => '/srv/live' } }
+{ action => 'always-allow', rules => [                # several, in one answer
+	{ tool => 'fs_write', under => '/srv' },
+	{ tool => 'fs_edit',  under => '/srv' },
+] }
 =end code
 
 C<rule> defaults to C<suggestion>, and the C<decision> of a remembered rule is
@@ -104,6 +108,15 @@ taken from the action rather than from the rule, so a UI need only say what the
 human clicked. Anything else — an unknown action, a rule that will not
 validate, a callback that throws, no callback at all — is a refusal of B<this
 call only>, phrased in a way the model can read and act on.
+
+C<rules> is the plural of C<rule>, for the coarse offers a UI makes when the
+suggestion is too fine-grained to be useful — "allow edits and new directories
+anywhere under the workspace" is four rules and one click. Every rule in it is
+validated exactly as a single one is, and the answer is B<all or nothing>: one
+unusable rule refuses this call and remembers none of them, because half a
+grant is not what the human agreed to. An empty C<rules>, or an answer carrying
+both C<rule> and C<rules>, is the same kind of refusal. C<&.on-grant> fires once
+per answer however many rules it carried.
 
 The other kind is a server's own elicitation, forwarded from
 C<MCP::Client>'s C<on-elicit> hook by C<elicit-hook>:
@@ -128,10 +141,63 @@ handler, say — deadlocks on its own question, with no diagnostic. Treat the
 callback as a leaf: collect the answer, return, and only then let the
 application do more work.
 
+What the queue does B<not> do is put the same question twice. The effective
+grants are read again the moment the lock is acquired, so the calls that were
+waiting behind an C<always-allow> or C<always-deny> answer are decided by the
+grant it left rather than re-asked: C<&on-ask> is not called again, C<&on-grant>
+does not fire again, and nothing further is remembered — deciding by a grant
+never was an event. Ask six agents about the same directory at once and the
+human answers once. A host that asks the human B<itself>, in its own bracket of
+locks rather than through C<&on-ask>, wants the same check by hand before it
+opens a dialog: that is C<grant-decision>.
+
 A C<suggestion> is the deepest directory that really contains every path in
 the call, so it can be as wide as C<'/'> when nothing narrower is true (an
 absolute path with no configured root, for instance). A UI should render the
 suggested directory rather than assume it is narrow.
+
+A call that named no directory but B<did> name a website — a C<web_fetch> and
+its C<url> — is suggested by C<host> instead: C<< { tool => 'web_fetch', host
+=> 'docs.raku.org' } >>, so that "always allow" means this site and not the
+web. Never both, and neither when there is nothing honest to scope to (a URL
+that will not parse leaves the bare tool). A UI that renders the suggestion
+should read whichever narrower is there rather than expect C<under>.
+
+=head2 Per-agent elicitation
+
+C<MCP::Client> takes B<one> C<on-elicit> hook, which is a problem the moment a
+fleet of agents shares a client: the server's question goes to whichever
+policy's C<elicit-hook> was wired at construction, which is rarely the agent
+whose call provoked it. Build the children with C<< :claim-elicits >> and each
+one answers its own:
+
+=begin code :lang<raku>
+my $child = MCP::Client::Policy.new(
+	:$provider, on-ask => &ask-in-this-pane, :claim-elicits,
+);
+=end code
+
+While a claiming policy is forwarding a batch, any elicitation those calls
+provoke is put to B<that> policy's C<&on-ask>, as a C<server-elicit>, under
+B<that> policy's C<ask-lock> — whichever policy the host wired. The request hash
+is unchanged: the callback answering it is already the claimant's own, which is
+the only badge a UI needs. Nothing else moves; permission prompts were always
+asked by the policy deciding the call.
+
+This works because elicitation is fulfilled on the thread that made the call —
+C<MCP::Client> answers an input-required round inline, before C<call-tool>
+returns — so the claim travels as a dynamic variable down the forwarding stack.
+Three things therefore fall back to the wired policy, which is exactly the
+behaviour of every host written before this existed:
+
+=item a call from a policy that did not claim;
+=item a claimant with no C<&on-ask> — a headless child does not get to answer by
+      declining on behalf of a human somebody else has;
+=item a provider that fulfils elicitations on some other thread than the one
+      that called it. No provider in this distribution does.
+
+Stacked policies do not fight over a question: the outermost claim wins, because
+the call entered through the agent whose batch it is.
 
 =head2 Never throws
 
@@ -150,6 +216,23 @@ B<under> a registry sees C<read> where a policy B<over> the same registry sees
 C<fs_read>. Same for C<roots> keys. Getting this wrong is silent: no rule ever
 matches, the engine falls through to C<ask>, and every call goes to the human.
 If everything is suddenly asking, this is why.
+
+The other composers in this distribution are written to sit B<below> a policy,
+in this order:
+
+=begin code :lang<raku>
+Policy( Reasons( Leases( Registry ) ) )
+=end code
+
+L<MCP::Client::Reasons|lib/MCP/Client/Reasons.rakumod> gives every tool an
+optional C<reason> parameter and deletes it again before the call is forwarded.
+It goes directly under the policy so that the C<&on-ask> request still carries
+the model's sentence — a UI renders it beside the arguments, never instead of
+them, and no rule, floor or classifier ever reads it.
+
+L<MCP::Client::Leases|lib/MCP/Client/Leases.rakumod> goes further down still,
+so that permission is resolved before a lease is consumed and a re-asked call
+cannot walk around one.
 
 =head1 EXAMPLES
 
@@ -217,6 +300,31 @@ my $policy = MCP::Client::Policy.new(
 Like C<&on-ask>, it is a leaf: it runs on the thread deciding the call, so
 collect what you need and return.
 
+A fleet — a parent agent and the children it spawned, each with its own policy
+— wants B<one> grant set between them, or the human answers the same question
+once per child. Hand them all the same
+L<MCP::Client::Policy::Grants|lib/MCP/Client/Policy/Grants.rakumod> and they
+have it:
+
+=begin code :lang<raku>
+my $grants = MCP::Client::Policy::Grants.new(grants => $session.grants);
+
+my $parent = MCP::Client::Policy.new(:$provider, :&on-ask, grants-store => $grants);
+my $child  = MCP::Client::Policy.new(:$provider, :&on-ask, grants-store => $grants);
+=end code
+
+With a store wired, an C<always-> answer is written to the store instead of to
+the policy that asked, and every policy reads the store on B<every> decision —
+so a grant made through the parent binds a child that started before it and a
+child started after it alike. C<.grants> then renders the B<effective> set (this
+policy's own grants, then the book), which is what C<&on-grant> is handed and
+what a session should persist. Seed a resumed session into the store rather than
+into C<grants>, so a rule is not counted twice.
+
+None of this widens anything: grants are still consulted only once the static
+rules have said C<ask>, so a shared grant cannot overrule a C<deny> rule or the
+danger floor, and a deny grant still beats an allow grant.
+
 Stacked, with a rule set at each layer — the outer policy speaks the model's
 names, the inner one speaks the server's:
 
@@ -240,6 +348,7 @@ use JSON::Fast;
 
 use MCP::Client::Exceptions;
 use MCP::Client::Policy::Rules;
+use MCP::Client::Policy::Grants;
 
 unit class MCP::Client::Policy;
 
@@ -247,7 +356,8 @@ unit class MCP::Client::Policy;
 # for `rules`, `root` for `roots` -- is an error at construction instead of a
 # policy that silently has no rules and therefore asks about everything.
 my constant OPTIONS =
-	<provider rules grants roots path-params on-ask on-grant filter-tools ask-lock>.Set;
+	<provider rules grants grants-store roots path-params command-params checks on-ask on-grant
+	 filter-tools ask-lock claim-elicits>.Set;
 
 has $.provider is required;
 has &.on-ask;
@@ -271,6 +381,14 @@ has &.on-ask;
 #| has been made cannot be un-made by a listener that fell over.
 has &.on-grant;
 
+#| The shared grant book, if this policy has been given one: an
+#| L<MCP::Client::Policy::Grants|lib/MCP/Client/Policy/Grants.rakumod> that any
+#| number of policies consult and any of them can add to. With one wired, an
+#| C<always-> answer is written B<there> rather than here, and every sharer is
+#| bound by it from its very next decision. Undefined when the policy keeps its
+#| grants to itself.
+has $.grants-store;
+
 has Bool:D $.filter-tools = True;
 
 #| The lock every question is asked under. One human, one question at a time —
@@ -278,15 +396,30 @@ has Bool:D $.filter-tools = True;
 #| C<elicit-hook> forwards. Pass your own to share it with something else.
 has Lock:D $.ask-lock .= new;
 
+#| Opt in to claiming the server elicitations this policy's own calls provoke.
+#| While a batch from B<this> policy is being forwarded, a server question one of
+#| those calls raises is answered by B<this> policy's C<&on-ask> — as a
+#| C<server-elicit>, under this policy's C<ask-lock> — whichever policy's
+#| C<elicit-hook> the host happened to wire into C<MCP::Client>. That is what
+#| lets a fleet of children share one client and still each answer their own
+#| server's questions.
+#|
+#| Off by default: an unclaimed elicitation is answered by the wired policy,
+#| exactly as it always was. See "Per-agent elicitation" in the description for
+#| the contract and for what falls back to the wired policy.
+has Bool:D $.claim-elicits = False;
+
 has Lock $!lock .= new;
 has      @!rules;
 has      @!grants;
 has      %!roots;
 has      %!path-params;
+has      %!command-params;
+has      %!checks;
 
 submethod TWEAK(
-	:$provider, :$rules, :$grants, :$roots, :$path-params,
-	:&on-ask, :&on-grant, :$filter-tools, :$ask-lock,
+	:$provider, :$rules, :$grants, :$grants-store, :$roots, :$path-params, :$command-params,
+	:$checks, :&on-ask, :&on-grant, :$filter-tools, :$ask-lock, :$claim-elicits,
 	*%unknown
 ) {
 	my @unknown = %unknown.keys.grep({ !OPTIONS{$_} }).sort;
@@ -306,23 +439,77 @@ submethod TWEAK(
 			~ 'execute-tool-calls method',
 	) unless $!provider.defined && provider-shaped($!provider);
 
+	# Prose rather than a type constraint on the attribute: a caller who passed
+	# the grant *list* where the store goes should be told which of the two this
+	# option wants, not handed a binding failure.
+	die X::MCP::Client.new(
+		detail => 'the grants-store of a policy must be an MCP::Client::Policy::Grants, not '
+			~ ($grants-store.defined
+				?? 'a ' ~ $grants-store.^name
+				!! 'the ' ~ $grants-store.^name ~ ' type object'),
+	) unless $grants-store === Any || $grants-store ~~ MCP::Client::Policy::Grants:D;
+
 	@!rules = validate-rules($rules, what => 'policy rule');
 	@!grants = validate-rules($grants, what => 'policy grant');
 	%!roots = validate-roots($roots);
 	%!path-params = validate-path-params($path-params);
+	%!command-params = validate-command-params($command-params);
+
+	# The checks are code the policy supplies for a rule's `check` predicate to
+	# name (the danger floor's target analysis). Not plain data, so not
+	# serialised and not returned by an accessor -- a rule only ever names one.
+	if $checks.defined {
+		die X::MCP::Client.new(
+			detail => 'the policy checks must be an object of check name to callable, not a '
+				~ $checks.^name,
+		) unless $checks ~~ Associative;
+		for $checks.Hash.kv -> $name, $fn {
+			die X::MCP::Client.new(
+				detail => "the policy check '$name' must be a callable",
+			) unless $fn ~~ Callable;
+			%!checks{$name} = $fn;
+		}
+	}
 }
 
 #| The rules this policy was built with, as a deep plain-data copy: safe to
 #| serialise, and safe to hand to a UI that edits what it is given.
 method rules(--> List:D) {
-	@!rules.map({ plain-copy($_) }).List;
+	$!lock.protect: { @!rules.map({ plain-copy($_) }).List };
 }
 
-#| The session grants — the C<always-allow> and C<always-deny> answers this
-#| policy has been given — in the order they were made, as a deep plain-data
-#| copy. Persist them and pass them back as C<grants> to carry a session over.
+#| Swap the whole rule set atomically — the seam a preset switch rides on. The
+#| new rules are validated first (a bad set throws and the old rules stand), then
+#| installed under the lock, so a call deciding concurrently sees either the old
+#| set or the new one, never a half-applied mix. Grants, roots, path-params,
+#| command-params and checks are untouched.
+#|
+#| The catalogue (C<tools-for-llm>) reflects the new rules from the next time it
+#| is fetched — a consumer that lists tools once per run therefore sees the
+#| change at the next run boundary, which is the intended granularity.
+method replace-rules(@new-rules --> Nil) {
+	my @validated = validate-rules(@new-rules, what => 'policy rule');
+	$!lock.protect: { @!rules = @validated };
+	Nil;
+}
+
+#| The session grants — the C<always-allow> and C<always-deny> answers in force
+#| — in the order they were made, as a deep plain-data copy. Persist them and
+#| pass them back as C<grants> to carry a session over.
+#|
+#| This is the B<effective> set: the grants this policy was built with, followed
+#| by everything in the shared C<grants-store>, if it has one. It is exactly
+#| what a call is decided against and exactly what C<&.on-grant> is handed, so a
+#| host that persists one and resumes from it resumes what was really in force.
+#|
+#| With a store wired, seed the session's remembered grants into the B<store>
+#| rather than into C<grants>: putting the same rules in both makes them appear
+#| twice here (harmless to decide against — a repeated rule decides the same
+#| call the same way — but noise in anything that persists this list).
 method grants(--> List:D) {
-	$!lock.protect: { @!grants.map({ plain-copy($_) }).List };
+	my @mine = $!lock.protect: { @!grants.map({ plain-copy($_) }) };
+	return @mine.List without $!grants-store;
+	(|@mine, |$!grants-store.list).List;
 }
 
 #| The tool-name-prefix to directory table, as a copy.
@@ -335,6 +522,12 @@ method path-params(--> Hash:D) {
 	%!path-params.map({ $_.key => $_.value.List }).Hash;
 }
 
+#| The per-tool overrides of the C<command>/C<args> convention — which
+#| parameters name a call's program and argv — as a copy.
+method command-params(--> Hash:D) {
+	%!command-params.map({ $_.key => $_.value.Hash }).Hash;
+}
+
 #| Whether there is anybody to ask. False means every C<ask> outcome is a
 #| refusal — and means C<MCP::Client>'s C<on-elicit> must be left unwired, since
 #| wiring it is what tells a server it may ask questions.
@@ -343,12 +536,19 @@ method interactive(--> Bool:D) {
 }
 
 #| The starting rules for a coding agent: the C<MCP::Server::Tool::FileSystem>
-#| pack's read-only tools, and C<user_ask>.
+#| pack's read-only tools, C<user_ask>, and the two lease tools.
 #|
 #| C<user_ask> is on the list because asking the human is inherently consented
 #| to — the elicitation UI I<is> the permission prompt, and the human answers or
 #| declines there. Without it, a model wanting to ask a question would first
 #| trigger a permission prompt asking whether it may ask a question.
+#|
+#| C<lock_acquire> and C<lock_release> are on it for the same reason: they are
+#| C<MCP::Client::Leases>'s bookkeeping over its own table, they change nothing
+#| a human owns, and asking permission to take an advisory lock is pure
+#| friction — the answer is always yes, and a model that has just been told to
+#| lock before it writes would stop at a prompt to do so. With no lease layer
+#| stacked, the two names simply never appear.
 #|
 #| There is deliberately no C<< { tool => '*', decision => 'ask' } >> catch-all:
 #| the engine already asks about anything no rule matched, and a catch-all would
@@ -363,7 +563,10 @@ method default-rules(--> List:D) {
 		{ tool => 'fs_glob', decision => 'allow' },
 		{ tool => 'fs_stat', decision => 'allow' },
 		{ tool => 'fs_grep', decision => 'allow' },
+		{ tool => 'fs_map', decision => 'allow' },
 		{ tool => 'user_ask', decision => 'allow' },
+		{ tool => 'lock_acquire', decision => 'allow' },
+		{ tool => 'lock_release', decision => 'allow' },
 	).List;
 }
 
@@ -383,7 +586,20 @@ method tools-for-llm(--> List) {
 	my @published = $!provider.tools-for-llm.list;
 	return @published.List unless $!filter-tools;
 
-	my @hiding = @!rules.grep({ $_<decision> eq 'deny' && !($_<under>:exists) });
+	# Only a blanket deny hides its tool. A deny that narrows by path, by host or
+	# by command still permits the tool for the calls it does not refuse, so the
+	# model must be able to see it. Snapshot under the lock so a concurrent
+	# replace-rules cannot be observed half-applied.
+	my @rules = $!lock.protect: { @!rules.List };
+	my @hiding = @rules.grep({
+		$_<decision> eq 'deny'
+			&& !($_<under>:exists)
+			&& !($_<host>:exists)
+			&& !($_<command>:exists)
+			&& !($_<args>:exists)
+			&& !($_<args-any>:exists)
+			&& !($_<check>:exists)
+	});
 	return @published.List unless @hiding;
 
 	@published.grep({ !hidden-by(@hiding, $_) }).List;
@@ -395,7 +611,9 @@ method tools-for-llm(--> List) {
 #| B<Never throws.> A refusal, a malformed call, a callback that threw and a
 #| provider that died all come back as C<is_error> results.
 method execute-tool-calls(@tool-calls --> List) {
-	my @rules = @!rules.map({ plain-copy($_) }).List;
+	# Snapshot the rules once, under the lock, so the whole batch is decided
+	# against one coherent rule set even if a preset switch lands mid-batch.
+	my @rules = $!lock.protect: { @!rules.map({ plain-copy($_) }).List };
 	my @results;
 	my @forward;
 
@@ -431,8 +649,24 @@ method execute-tool-calls(@tool-calls --> List) {
 		}
 	}
 
+	# WHO a server question raised by this batch belongs to. Read here, in the
+	# enclosing scope, and installed below: a dynamic variable cannot be looked up
+	# and declared in one scope, and looking it up on the right of its own
+	# declaration would only ever find the fresh container. An outer claim wins,
+	# because the call entered through the outermost claimant -- a stacked policy
+	# does not take a question away from the agent whose batch this is.
+	my $claimant = $*MCP-CLIENT-ELICIT-POLICY // ($!claim-elicits ?? self !! Nil);
+
 	if @forward {
 		my @calls = @forward.map({ $_<call> }).List;
+
+		# A dynamic variable rather than an argument, because elicitation
+		# fulfilment runs on the thread that made the call -- MCP::Client answers
+		# an input-required round inline, before it returns -- so this frame is
+		# still on the stack when &on-elicit fires and elicit-hook can find the
+		# claim by walking up to it.
+		my $*MCP-CLIENT-ELICIT-POLICY = $claimant;
+
 		my @answers;
 		my $failure;
 		{
@@ -454,24 +688,49 @@ method execute-tool-calls(@tool-calls --> List) {
 #| question to C<&on-ask> as a C<server-elicit>, under the same lock permission
 #| prompts are asked under.
 #|
+#| The question goes to whichever policy B<claimed> it — the one whose forwarded
+#| batch provoked it, if that policy was built with C<< :claim-elicits >> — and
+#| otherwise to this one, the policy the client was wired to. See "Per-agent
+#| elicitation" in the description.
+#|
 #| With no callback wired — or with one that throws, or answers with something
 #| that is not an C<ElicitResult> — the server is declined. Declining is an
 #| ordinary answer in the protocol, and one the server is required to handle.
 method elicit-hook(--> Callable:D) {
 	-> %request {
-		my $answer;
+		# Whose question this is. A claimant that cannot ask anybody is no use
+		# here, so a headless claimant hands the question back to the policy the
+		# host wired -- which may have a human even though the child does not.
+		my $claimant = $*MCP-CLIENT-ELICIT-POLICY // Nil;
+		my $target = $claimant ~~ MCP::Client::Policy:D && $claimant.interactive
+			?? $claimant
+			!! self;
 
-		# `if`, not an early `return`: this closure is a Block, and `return`
-		# from one dies rather than exiting it.
-		if &!on-ask.defined {
-			$!ask-lock.protect: {
-				CATCH { default { $answer = Nil } }
-				$answer = &!on-ask({ kind => 'server-elicit', request => plain-copy(%request) });
-			}
-		}
-
-		$answer ~~ Associative ?? $answer.Hash !! { action => 'decline' };
+		# Not annotated with who claimed it: the request is the server's question
+		# as it stands, and the callback answering it is already the claimant's
+		# own, which is the only badge a UI needs.
+		$target!answer-elicit(%request);
 	};
+}
+
+# One server elicitation, put to this policy's human under this policy's lock.
+# Split out of elicit-hook so that a claiming policy can be handed the question
+# the wired policy was asked for -- a private method on another instance of the
+# same class, which is the least public seam that will carry it.
+method !answer-elicit(%request --> Hash:D) {
+	my $answer;
+
+	# A guard rather than an early return: there are two ways of having no answer
+	# -- no callback at all, and a callback that threw -- and both leave $answer
+	# undefined and fall through to the decline below.
+	if &!on-ask.defined {
+		$!ask-lock.protect: {
+			CATCH { default { $answer = Nil } }
+			$answer = &!on-ask({ kind => 'server-elicit', request => plain-copy(%request) });
+		}
+	}
+
+	$answer ~~ Associative ?? $answer.Hash !! { action => 'decline' };
 }
 
 # === Deciding ===
@@ -485,14 +744,19 @@ method !decide(Str:D $name, $raw-arguments, $call, @rules --> Hash:D) {
 	my %verdict = evaluate(
 		@rules, $name, $arguments,
 		roots => %!roots, path-params => %!path-params,
+		command-params => %!command-params, checks => %!checks,
 	);
 
 	# Grants are consulted only once the static rules have said "ask": a rule
 	# that asks is a standing instruction to keep asking.
 	if %verdict<decision> eq 'ask' {
+		# self.grants, not a snapshot taken at construction: with a shared store
+		# wired, a grant another agent's human made a moment ago is in force for
+		# this call.
 		my %granted = evaluate(
-			self!grant-snapshot, $name, $arguments,
+			self.grants, $name, $arguments,
 			roots => %!roots, path-params => %!path-params,
+			command-params => %!command-params, checks => %!checks,
 		);
 		%verdict = %granted if %granted<rule>.defined;
 	}
@@ -503,6 +767,65 @@ method !decide(Str:D $name, $raw-arguments, $call, @rules --> Hash:D) {
 	}
 
 	self!ask($name, $arguments, $call, %verdict);
+}
+
+#| The session grants, consulted directly: what a host that asks the human
+#| B<itself> — outside this policy's own prompt, inside its own bracket of locks
+#| — calls before it puts the question, so that a question the human has already
+#| answered with "always" is never put again.
+#|
+#| Evaluates B<only> the effective grants — never the static rules, because a
+#| rule that allowed or denied decided the call long before anything asked —
+#| with this policy's roots, path-params, command-params and checks, exactly as a
+#| real decision would.
+#|
+#| Answers in the shape of an C<&on-ask> answer, so a callback can return it
+#| verbatim:
+#|
+#|   a grant that allows  ->  { action => 'allow-once', rule, reason }
+#|   a grant that denies  ->  { action => 'deny-once',  rule, reason, message }
+#|   no grant decides     ->  Hash    # the type object; test it with `with`
+#|
+#| The C<message> of a denial is the same rule-shaped refusal a static deny
+#| produces, so a host that hands it back gets the phrasing the policy would
+#| have used itself. C<reason> is C<'rule'> or C<'unevaluable-path'>, as in the
+#| ask request.
+#|
+#| B<Never throws>, and B<never touches the ask-lock> — arguments that will not
+#| parse are treated exactly as a real decision treats them (a grant naming a
+#| bare tool still decides; a path-scoped one cannot match), so it is safe to
+#| call from inside an C<&on-ask> callback that this or any other policy is
+#| holding its ask-lock around. It reads the policy's own state under the
+#| policy's own leaf lock, which is the order every other path takes them in.
+method grant-decision(Str:D $tool, $arguments --> Hash) {
+	my $parsed = parse-arguments($arguments);
+	my %granted = evaluate(
+		self.grants, $tool, $parsed,
+		roots => %!roots, path-params => %!path-params,
+		command-params => %!command-params, checks => %!checks,
+	);
+	return Hash unless %granted<rule>.defined;
+
+	given %granted<decision> {
+		when 'allow' {
+			%(
+				action => 'allow-once',
+				rule => plain-copy(%granted<rule>),
+				reason => (%granted<reason> // Str),
+			);
+		}
+		when 'deny' {
+			%(
+				action => 'deny-once',
+				rule => plain-copy(%granted<rule>),
+				reason => (%granted<reason> // Str),
+				message => refusal-by-rule($tool, %granted),
+			);
+		}
+		# A grant whose decision is `ask` decides nothing: it is a standing
+		# instruction to keep asking, and the host should go on and ask.
+		default { Hash }
+	}
 }
 
 # The human, or the absence of one.
@@ -529,9 +852,62 @@ method !ask(Str:D $name, $arguments, $call, %verdict --> Hash:D) {
 
 	my $answer;
 	my $threw;
+	my $action = '';
+	my %granted;
+	my %kept;
 	$!ask-lock.protect: {
-		CATCH { default { $threw = $_ } }
-		$answer = &!on-ask(%request);
+		# The re-check. N agents queued on this lock behind an "always" answer
+		# must not each re-ask the question it settled, so the effective grants
+		# are read again here, once the queue has been survived, and whichever
+		# waiter finds one answers its own call silently -- the grant path of
+		# !decide, moved inside the lock. No observer fires and nothing new is
+		# remembered: deciding by a grant never was an event.
+		#
+		# Sound for the FIRST waiter and not merely for the rest of the queue,
+		# because the answer below is written down before this lock is released:
+		# a grant is visible to self.grants strictly before any waiter can wake
+		# and read it. Without that ordering the waiter next in line would race
+		# the answering thread's write and sometimes re-ask.
+		#
+		# This nests $!lock (self.grants, !remember) inside the ask-lock, which
+		# is safe because nothing anywhere takes them the other way round:
+		# elicit-hook takes only the ask-lock, the shared grant book is a leaf
+		# with a lock of its own, and every path that touches $!lock either has
+		# the ask-lock or wants nothing else.
+		%granted = evaluate(
+			self.grants, $name, $arguments,
+			roots => %!roots, path-params => %!path-params,
+			command-params => %!command-params, checks => %!checks,
+		);
+
+		# A grant that says `ask` settles nothing, and neither does no grant at
+		# all: both fall through to the human, who is now next in the queue.
+		%granted = () unless %granted<rule>.defined
+			&& %granted<decision> eq 'allow' | 'deny';
+
+		unless %granted {
+			CATCH { default { $threw = $_ } }
+			$answer = &!on-ask(%request);
+			$action = $answer ~~ Associative ?? ($answer<action> // '') !! '';
+
+			# Still holding the lock: an "always" answer is a grant the moment
+			# the human gives it, and the queue behind this call is entitled to
+			# find it there. A callback that threw never reaches this line --
+			# the CATCH above exits the block with it -- and a rule that will
+			# not validate is caught inside !remember, so an answer that cannot
+			# be kept refuses its call exactly as it always did.
+			if $action eq 'always-allow' | 'always-deny' {
+				%kept = self!remember(
+					$answer, %request, $action eq 'always-allow' ?? 'allow' !! 'deny',
+				);
+			}
+		}
+	}
+
+	if %granted {
+		return %granted<decision> eq 'allow'
+			?? %( decision => 'allow' )
+			!! %( decision => 'deny', message => refusal-by-rule($name, %granted) );
 	}
 
 	if $threw.defined {
@@ -542,7 +918,9 @@ method !ask(Str:D $name, $arguments, $call, %verdict --> Hash:D) {
 		);
 	}
 
-	my $action = $answer ~~ Associative ?? ($answer<action> // '') !! '';
+	# The announcement, once the lock is out of the way but before the call that
+	# provoked the grant is decided -- which is the contract &.on-grant documents.
+	self!announce-grants(%kept<snapshot>) if %kept<ok>;
 
 	given $action {
 		when 'allow-once' {
@@ -552,8 +930,8 @@ method !ask(Str:D $name, $arguments, $call, %verdict --> Hash:D) {
 			%( decision => 'deny', message => "Permission denied: the user refused '$name'" );
 		}
 		when 'always-allow' | 'always-deny' {
+			# Already remembered, under the lock, and already announced.
 			my $wanted = $action eq 'always-allow' ?? 'allow' !! 'deny';
-			my %kept = self!remember($answer, %request, $wanted);
 
 			if %kept<ok> {
 				$wanted eq 'allow'
@@ -561,15 +939,16 @@ method !ask(Str:D $name, $arguments, $call, %verdict --> Hash:D) {
 					!! %(
 						decision => 'deny',
 						message => "Permission denied: the user refused '$name', and every call "
-							~ "matching '{rule-text(%kept<rule>)}' from now on",
+							~ "matching {%kept<rules>.map({ q{'} ~ rule-text($_) ~ q{'} }).join(', ')} "
+							~ 'from now on',
 					);
 			}
 			else {
 				%(
 					decision => 'deny',
 					message => "Permission denied: the permission prompt for '$name' asked to "
-						~ "remember a rule that is not a usable one ({%kept<why>}), so the call "
-						~ 'was refused',
+						~ "remember something that is not a usable rule ({%kept<why>}), so the "
+						~ 'call was refused',
 				);
 			}
 		}
@@ -586,19 +965,125 @@ method !ask(Str:D $name, $arguments, $call, %verdict --> Hash:D) {
 	}
 }
 
-# Turn an always-answer into a session grant and append it. Appended under the
-# lock and immediately, so a later call in the same batch is decided by a grant
-# the human made two calls ago -- which is the whole point of saying "always"
-# to a model that asked for six things at once.
+# Turn an always-answer into session grants and append them. Appended
+# immediately, so a later call in the same batch is decided by a grant the human
+# made two calls ago -- which is the whole point of saying "always" to a model
+# that asked for six things at once.
+#
+# Called with the ask-lock held, and that is not incidental: the grant has to be
+# visible to self.grants before the next waiter can wake and re-check, or the
+# question the human has just answered gets put to them again. Announcing it is
+# somebody else's code and therefore somebody else's problem, so that half is
+# !announce-grants, called once the lock is released. Answers
+# { ok => True, rules => [...], snapshot => [...] } or { ok => False, why => ... },
+# and never throws either way.
 method !remember($answer, %request, Str:D $decision --> Hash:D) {
-	my $given = $answer ~~ Associative ?? $answer<rule> !! Any;
+	my %wanted = self!wanted-grants($answer, %request, $decision);
+	return %wanted unless %wanted<ok>;
+	my @rules = %wanted<rules>.list;
 
-	# An explicit rule is taken as written -- a UI that deliberately narrows the
-	# suggestion to a bare tool must not have the suggestion's `under` put back.
-	my %wanted = $given ~~ Associative ?? $given.Hash !! plain-copy(%request<suggestion>);
-	%wanted<decision> = $decision;
+	my @snapshot;
+	my $failed;
+	{
+		# Belt and braces: every rule here has already been through the
+		# validator, so the store cannot refuse them -- and "never throws" is
+		# not a promise to keep by assumption.
+		CATCH {
+			default {
+				$failed = $_ ~~ X::MCP::Client
+					?? ($_.detail // $_.message)
+					!! ($_.message.lines.head // 'it could not be kept');
+			}
+		}
 
-	my %rule;
+		if $!grants-store.defined {
+			# Written to the book, not to this policy: the grant belongs to the
+			# session, and every policy sharing the book is bound by it from its
+			# next decision. The effective list -- what .grants renders, and what
+			# on-grant is owed -- is this policy's own grants and then the book.
+			my @book = $!grants-store.add(@rules);
+			my @mine = $!lock.protect: { @!grants.map({ plain-copy($_) }) };
+			@snapshot = (|@mine, |@book);
+		}
+		else {
+			$!lock.protect: {
+				@!grants.append: @rules;
+				# Copied under the lock so the snapshot is of the list as it
+				# stood when this grant landed, whatever another thread's batch
+				# does next.
+				@snapshot = @!grants.map({ plain-copy($_) });
+			}
+		}
+	}
+
+	return %( ok => False, why => $failed ) if $failed.defined;
+
+	%( ok => True, rules => @rules.List, snapshot => @snapshot.List );
+}
+
+# Tell &.on-grant about the grant that has just been made. Outside the ask-lock,
+# and after it: the hook is somebody else's code, and one that took a while
+# (writing grants.json, say) would otherwise hold every other agent's question
+# up behind it -- including the waiters the grant has just decided. A hook that
+# throws changes nothing -- the grant is already made, and refusing the call over
+# a failed listener would be a worse answer than a call that went through
+# unannounced.
+#
+# One firing per answer, not per rule: a UI that offered "allow edits and new
+# directories here" asked one question and got one answer, and a host persisting
+# the list wants to write it once.
+method !announce-grants(@snapshot --> Nil) {
+	if &!on-grant.defined {
+		CATCH { default { } }
+		&!on-grant(@snapshot.List);
+	}
+	Nil;
+}
+
+# What an always-answer asked to be remembered, validated: one rule, several, or
+# the suggestion it was offered. Answers { ok => True, rules => [...] } or
+# { ok => False, why => '...' }, and refuses the whole answer if any one rule in
+# it is unusable -- half a grant is not what the human said yes to.
+method !wanted-grants($answer, %request, Str:D $decision --> Hash:D) {
+	my $one = $answer ~~ Associative ?? $answer<rule> !! Any;
+	my $many = $answer ~~ Associative ?? $answer<rules> !! Any;
+
+	if $one.defined && $many.defined {
+		return %(
+			ok => False,
+			why => 'it named both a rule and a list of rules, and only one of the two can be '
+				~ 'what it meant',
+		);
+	}
+
+	my @wanted;
+	if $many.defined {
+		return %(
+			ok => False,
+			why => "its rules are a {$many.^name} rather than a list of rule objects",
+		) unless $many ~~ Positional;
+
+		my @given = $many.list;
+		return %( ok => False, why => 'its list of rules is empty' ) unless @given;
+
+		# The decision comes from the action, exactly as it does for a single
+		# rule: a UI says what the human clicked, not what it means.
+		@wanted = @given.map({
+			$_ ~~ Associative
+				?? do { my %rule = $_.Hash; %rule<decision> = $decision; %rule }
+				!! $_
+		});
+	}
+	else {
+		# An explicit rule is taken as written -- a UI that deliberately narrows
+		# the suggestion to a bare tool must not have the suggestion's `under`
+		# put back.
+		my %rule = $one ~~ Associative ?? $one.Hash !! plain-copy(%request<suggestion>);
+		%rule<decision> = $decision;
+		@wanted = %rule,;
+	}
+
+	my @rules;
 	my $why;
 	{
 		CATCH {
@@ -608,34 +1093,10 @@ method !remember($answer, %request, Str:D $decision --> Hash:D) {
 					!! ($_.message.lines.head // 'it could not be read');
 			}
 		}
-		%rule = validate-rule(%wanted, what => 'session grant');
+		@rules = @wanted.map({ validate-rule($_, what => 'session grant') });
 	}
 
-	return %( ok => False, :$why ) if $why.defined;
-
-	my @snapshot;
-	$!lock.protect: {
-		@!grants.push: %rule;
-		# Copied under the lock so the snapshot is of the list as it stood when
-		# this grant landed, whatever another thread's batch does next.
-		@snapshot = @!grants.map({ plain-copy($_) });
-	}
-
-	# Outside the lock, and after it: the hook is somebody else's code, and one
-	# that took a while (writing grants.json, say) would otherwise hold every
-	# other batch's decisions up behind it. A hook that throws changes nothing --
-	# the grant is already made, and refusing the call over a failed listener
-	# would be a worse answer than a call that went through unannounced.
-	if &!on-grant.defined {
-		CATCH { default { } }
-		&!on-grant(@snapshot.List);
-	}
-
-	%( ok => True, rule => %rule );
-}
-
-method !grant-snapshot(--> List:D) {
-	$!lock.protect: { @!grants.map({ plain-copy($_) }).List };
+	$why.defined ?? %( ok => False, :$why ) !! %( ok => True, rules => @rules.List );
 }
 
 # === Helpers ===
@@ -669,11 +1130,14 @@ my sub parse-arguments($raw) {
 	$parsed ~~ Associative ?? $parsed.Hash !! Any;
 }
 
-# A rule as a human reads it back.
+# A rule as a human reads it back. The narrowers are named in the order they
+# read in -- "deny web_fetch on evil.com" -- so a refusal says what the rule was
+# about and not merely which tool it was about.
 my sub rule-text(%rule --> Str:D) {
-	%rule<under>:exists
-		?? "{%rule<decision>} {%rule<tool>} under {%rule<under>}"
-		!! "{%rule<decision>} {%rule<tool>}";
+	my $text = "{%rule<decision>} {%rule<tool>}";
+	$text ~= " under {%rule<under>}" if %rule<under>:exists;
+	$text ~= " on {%rule<host>}" if %rule<host>:exists;
+	$text;
 }
 
 my sub path-note(%verdict --> Str:D) {

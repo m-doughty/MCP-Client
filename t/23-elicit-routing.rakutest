@@ -1,0 +1,225 @@
+use Test;
+use lib 'lib', 't/lib';
+use MCP::Server;
+use MCP::Client;
+use MCP::Client::Policy;
+use MCP::Client::Test::InProcessTransport;
+
+# MCP::Client takes one on-elicit hook. A fleet of agents sharing that client
+# has many humans -- or one human and many panes -- and a server's question
+# belongs to whichever of them provoked it, which is almost never the policy that
+# happened to be wired at construction. `:claim-elicits` is how a child says so.
+#
+# The claim rides a dynamic variable down the forwarding stack, which only works
+# because elicitation is fulfilled on the thread that made the call. So none of
+# this is testable with a simulated request: every subtest here drives a real
+# server that really asks, through a real client, and reads the answer off the
+# greeting that comes back -- 'Hello, Ada!' means the child answered, 'Hello,
+# Parent!' means the wired policy did, and 'Nobody, then.' means the server was
+# declined.
+#
+# The claim (1), the wired policy's own call (2), and then the three ways a
+# claim comes to nothing: never made (3), made by a policy with nobody to ask
+# (4), and made by one whose human's dialog fell over (5).
+#
+#   prove6 -Ilib -It/lib -I../MCP-Server/lib t/23-elicit-routing.rakutest
+
+plan 5;
+
+constant TIMEOUT = 30;
+
+# === Doubles ===
+
+#| The t/14 server: it greets whoever it is told to, and asks who if it has not
+#| been told. The only tool here that can provoke an elicitation.
+sub eliciting-server(--> MCP::Server:D) {
+	my $server = MCP::Server.new(name => 'asks', version => '1.0.0');
+
+	$server.tool: 'greet',
+		description => 'Greet somebody, asking who if it has to',
+		params => { name => { type => 'string', description => 'Who to greet' } },
+		handler => -> :%args {
+			my $who = %args<name>;
+			unless $who ~~ Str:D && $who.chars {
+				my $answer = $*MCP-REQUEST-CONTEXT.elicit(
+					'Who should I greet?',
+					properties => { name => { type => 'string', description => 'A name' } },
+					required => ['name',],
+				);
+				$who = $answer.accepted ?? $answer.content<name> !! Str;
+			}
+			$who.defined ?? "Hello, $who!" !! 'Nobody, then.';
+		};
+
+	$server;
+}
+
+#| The arrangement every subtest starts from: a live server, a client wired to
+#| the B<parent> policy's elicit-hook, and the parent. The forward declaration is
+#| the one the class Pod warns about -- the client needs the hook at construction
+#| and the policy needs the client.
+#|
+#| Answers as 'Parent', so which policy answered is legible in the greeting. The
+#| requests it was handed are in C<seen>.
+sub arrangement(--> Hash:D) {
+	my @seen;
+	my $parent;
+
+	my $client = MCP::Client.new(
+		transport => MCP::Client::Test::InProcessTransport.new(server => eliciting-server()),
+		client-name => 'elicit-routing',
+		on-warn => -> Str:D $m { diag "client warning: $m" },
+		on-elicit => -> %req { $parent.elicit-hook.(%req) },
+	);
+
+	$parent = MCP::Client::Policy.new(
+		provider => $client,
+		rules => [{ tool => 'greet', decision => 'allow' },],
+		on-ask => -> %req {
+			@seen.push(%req);
+			{ action => 'accept', content => { name => 'Parent' } };
+		},
+	);
+
+	%( :$client, :$parent, :@seen );
+}
+
+#| A child agent over the same client, allowed to greet and nothing else. Its
+#| own ask-lock by default, because a child with its own human has its own queue.
+sub child($client, *%opts --> MCP::Client::Policy:D) {
+	MCP::Client::Policy.new(
+		provider => $client,
+		rules => [{ tool => 'greet', decision => 'allow' },],
+		ask-lock => Lock.new,
+		|%opts,
+	);
+}
+
+sub call(Str:D $id, Str:D $name, $arguments = '{}') {
+	%( id => $id, function => %( name => $name, arguments => $arguments ) );
+}
+
+#| One greeting, driven to completion or declared timed out. Off the main thread
+#| for the same reason t/14 does it: a hook that never answers must fail the test
+#| rather than hang the file.
+sub greet-through($policy, Str:D $what --> Hash:D) {
+	my $work = start { $policy.execute-tool-calls([call('1', 'greet'),]) };
+	await Promise.anyof($work, Promise.in(TIMEOUT));
+	die "Timed out waiting for $what" if $work.status === Planned;
+	$work.result[0].Hash;
+}
+
+# === The claim ===
+
+subtest 'a claiming child answers the question its own call provoked' => {
+	plan 4;
+
+	my %live = arrangement();
+	my @child-seen;
+	my $ada = child(%live<client>,
+		:claim-elicits,
+		on-ask => -> %req {
+			@child-seen.push(%req);
+			{ action => 'accept', content => { name => 'Ada' } };
+		},
+	);
+
+	my %out = greet-through($ada, "the claiming child's greeting");
+
+	is %out<content>, 'Hello, Ada!',
+		'the server\'s question went to the policy whose call provoked it';
+	is-deeply @child-seen.map({ $_<kind> }).List, ('server-elicit',),
+		'as a server elicitation, through the same seam a permission prompt uses';
+	is @child-seen[0]<request><method>, 'elicitation/create',
+		'carrying the server\'s request as it stands, unannotated with who claimed it';
+	is %live<seen>.elems, 0,
+		'and the policy the client was actually wired to was never troubled';
+
+	%live<client>.close;
+};
+
+subtest 'the wired policy\'s own call is still the wired policy\'s question' => {
+	plan 3;
+
+	# The claiming child exists and is claiming: what decides is whose batch the
+	# call is in, not whose policy is the most eager.
+	my %live = arrangement();
+	my @child-seen;
+	child(%live<client>,
+		:claim-elicits,
+		on-ask => -> %req { @child-seen.push(%req); { action => 'accept', content => { name => 'Ada' } } },
+	);
+
+	my %out = greet-through(%live<parent>, "the parent's greeting");
+
+	is %out<content>, 'Hello, Parent!', 'a call the parent forwarded is answered by the parent';
+	is-deeply %live<seen>.map({ $_<kind> }).List, ('server-elicit',), 'through its own callback';
+	is @child-seen.elems, 0, 'and a child that claims does not intercept somebody else\'s question';
+
+	%live<client>.close;
+};
+
+# === What falls back ===
+
+subtest 'a child that did not claim leaves the question where it was wired' => {
+	plan 3;
+
+	my %live = arrangement();
+	my @child-seen;
+	my $quiet = child(%live<client>,
+		on-ask => -> %req { @child-seen.push(%req); { action => 'accept', content => { name => 'Ada' } } },
+	);
+
+	my %out = greet-through($quiet, 'the unclaiming child\'s greeting');
+
+	is %out<content>, 'Hello, Parent!',
+		'without the claim the wired policy answers, exactly as it always did';
+	is-deeply %live<seen>.map({ $_<kind> }).List, ('server-elicit',), 'and is asked to';
+	is @child-seen.elems, 0,
+		'a child with a callback of its own is not enough: claiming is deliberate';
+
+	%live<client>.close;
+};
+
+subtest 'a headless claimant hands the question back rather than swallowing it' => {
+	plan 3;
+
+	# A child with no &on-ask has nobody to put the question to, and declining on
+	# behalf of a human somebody else has would be the worst of both. The wired
+	# policy gets it, and the call does not hang waiting for a dialog that is
+	# never going to open.
+	my %live = arrangement();
+	my $mute = child(%live<client>, :claim-elicits);
+
+	nok $mute.interactive, 'the claimant has nobody to ask';
+
+	my %out = greet-through($mute, 'the headless claimant\'s greeting');
+
+	is %out<content>, 'Hello, Parent!', 'so the question falls back to the wired policy';
+	is-deeply %live<seen>.map({ $_<kind> }).List, ('server-elicit',), 'which answers it';
+
+	%live<client>.close;
+};
+
+subtest 'a claimant whose dialog falls over declines, and says nothing else' => {
+	plan 3;
+
+	# The claim is not a promise to answer well. A callback that throws is
+	# declined here exactly as it is for the wired policy -- an ordinary answer
+	# the server is required to handle -- and the failure does not escape into
+	# the client or get handed on to anybody else.
+	my %live = arrangement();
+	my $broken = child(%live<client>,
+		:claim-elicits,
+		on-ask => -> %req { die 'the dialog is not there any more' },
+	);
+
+	my %out = greet-through($broken, 'the broken claimant\'s greeting');
+
+	is %out<content>, 'Nobody, then.', 'the server is declined and its handler carries on';
+	nok %out<is_error>, 'which is an answer, not a failure of the call';
+	is %live<seen>.elems, 0,
+		'and the question is not passed on to the wired policy after the claimant fumbled it';
+
+	%live<client>.close;
+};

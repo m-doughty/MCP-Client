@@ -63,9 +63,20 @@ this machine's at all.
 Containment is checked in B<both directions> when a lease is taken. Claiming
 C</srv/src> collides with somebody else's lease on C</srv/src/app.raku> just as
 surely as the other way round, and an C<unknown> in either direction (a C<..>
-segment, a backslash, an absolute path measured against a relative one) counts
-as a collision. Fail-closed: a path the table cannot reason about is a path it
-will not hand out.
+segment, a backslash outside a Windows path, an absolute path measured against
+a relative one) counts as a collision. Fail-closed: a path the table cannot
+reason about is a path it will not hand out.
+
+Collisions are compared the way the permission engine compares a deny
+(C<path-under>'s C<:fold>), because over-matching is the safe direction for a
+lock too. Case is ignored: C<C:/Work/x> and C<c:/work/X> are one file on a
+case-insensitive filesystem. Two Windows volumes are never ruled apart:
+C<\\localhost\C$\work\x> is C<C:\work\x>, and a share, a C<subst> or mapped
+drive or a mount point can make any two volumes meet, so a lease on one and a
+claim on the other collide. And on a Windows path an 8.3 short name collides
+with every name it could stand for: C<C:\work\SRC~1> may well be
+C<C:\work\src>. Whether a holder's B<own> lease covers a path stays case-exact
+and volume-exact, as an allow does in the permission engine.
 
 =head2 All or nothing
 
@@ -464,7 +475,9 @@ method pin(Str:D :$holder!, :@paths! --> Hash:D) {
 			$_<pins>++ for @selected;
 			%!pins{$token} = %(
 				holder => $holder,
-				generations => @selected.map(*<generation>).List,
+				# Eager: a lazy list kept in the table would be filled in by
+				# whichever thread read it first, `status` or `unpin`.
+				generations => @selected.map(*<generation>).eager.List,
 				pinned-at => $now,
 			);
 			%answer = %( pinned => True, :$token );
@@ -491,6 +504,10 @@ method unpin(Str:D $token --> Bool:D) {
 }
 
 # One status call so a host does not assemble mutually inconsistent snapshots.
+# Every row is built here, under the lock: a `.map(...).List` is LAZY, and
+# without `.eager` the rows would be read out of the live leases and waiters --
+# whose pins and blockers are rewritten in place -- after the lock is released.
+# (`sort` is eager on its input, so the pins rows already were.)
 method status(--> Hash:D) {
 	my %status;
 	$!lock.protect: {
@@ -499,14 +516,14 @@ method status(--> Hash:D) {
 			leases => @!leases.map({
 				%( |render($_, $now), pins => $_<pins>,
 					release-pending => ?$_<release-pending> )
-			}).List,
+			}).eager.List,
 			waiters => %!waiters.values.sort(*<id>).map({
 				%(
 					id => $_<id>, holder => $_<holder>, paths => $_<paths>.List,
 					blockers => $_<blockers>.List,
 					waiting-for => ($now - $_<registered-at>).Num,
 				)
-			}).List,
+			}).eager.List,
 			pins => %!pins.map({
 				%(
 					token => .key, holder => .value<holder>,
@@ -555,8 +572,9 @@ method covering(Str:D :$holder!, Str :$path --> Hash:D) {
 				next;
 			}
 
-			my $down = path-under(%lease<path>, $path);
-			my $up = path-under($path, %lease<path>);
+			# Somebody else's lease: folded, so a case variant still collides.
+			my $down = path-under(%lease<path>, $path, :fold);
+			my $up = path-under($path, %lease<path>, :fold);
 
 			if $down eq 'yes' || $up eq 'yes' {
 				$other //= %lease;
@@ -625,12 +643,14 @@ method !reap(--> Instant:D) {
 
 # Recompute rather than decrement edges: one directory lease can cover many
 # requested paths and release/expiry can invalidate several blockers at once.
-# Called only with $!lock held.
+# Called only with $!lock held. The blockers are stored fully built (`.eager`):
+# `status` hands this very List out, and one still filling itself in would be
+# filled in by whichever thread read it first.
 method !refresh-waiters(Instant:D $now --> Nil) {
 	for %!waiters.values -> %waiter {
 		%!waiters{%waiter<id>}<blockers> = self!conflicts(
 			%waiter<holder>, %waiter<paths>.list, $now,
-		).map(*<holder>).unique.sort.List;
+		).map(*<holder>).unique.sort.eager.List;
 	}
 }
 
@@ -710,8 +730,10 @@ method !cycle-from(Str:D $start --> List:D) {
 
 # Whether two paths collide: either contains the other, or the pair cannot be
 # compared at all. Unknown is a collision -- see the fail-closed note in the Pod.
+# Folded: a case variant is 'yes', and another Windows volume or an 8.3 short
+# name is 'unknown' rather than 'no'.
 my sub overlapping(Str:D $a, Str:D $b --> Bool:D) {
-	so path-under($a, $b) ne 'no' || path-under($b, $a) ne 'no';
+	so path-under($a, $b, :fold) ne 'no' || path-under($b, $a, :fold) ne 'no';
 }
 
 # Whether two strings name the same location: containment both ways. The lexical

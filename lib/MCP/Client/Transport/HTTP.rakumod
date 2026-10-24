@@ -460,7 +460,10 @@ method alive(--> Bool) {
 #| (header name => the property path its value lives at). Diagnostic: the
 #| capture happens by itself, on every C<tools/list> response.
 method tool-annotations(--> Hash:D) {
-	$!lock.protect: { %!annotations.Hash };
+	# A copy made under the lock. `.Hash` on a Hash is that same Hash, which
+	# would hand out the live table: the next `tools/list` would rewrite what
+	# the caller holds, and could do it while the caller was reading it.
+	$!lock.protect: { my %copy = %!annotations; %copy };
 }
 
 #| Record the annotations a C<tools/list> result carries and hand the result
@@ -682,7 +685,7 @@ method !headers-for(%msg --> List:D) {
 	if (%msg<method> // '') eq 'tools/call' {
 		my $params = %msg<params>;
 		my $name = $params ~~ Associative ?? $params<name> !! Any;
-		%annotations = $!lock.protect({ (%!annotations{$name} // {}).Hash })
+		%annotations = $!lock.protect({ my %copy = %!annotations{$name} // {}; %copy })
 			if $name ~~ Str:D;
 	}
 

@@ -35,6 +35,33 @@ sub timed($promise, Str:D $what) {
 
 my $server = MCP::Server.new(:name<http-client-test>, :version<0.4.2>);
 
+# MCP::Server::log echoes every line to $*ERR as well as to the client, and has no
+# switch for the echo. The tests want the client half (that is what they assert
+# on), so the echo is pointed at a sink that keeps the lines instead: the output
+# stays TAP-only, and the echo itself is something the tests can check.
+class ServerStderr {
+	has Lock:D $!lock .= new;
+	has @!lines;
+
+	method say(*@args --> True) { $!lock.protect: { @!lines.push(@args.join) } }
+	method print(*@args --> True) { $!lock.protect: { @!lines.push(@args.join) } }
+	method flush(--> True) { }
+	method lines(--> List:D) { $!lock.protect: { @!lines.List } }
+}
+
+my $server-stderr = ServerStderr.new;
+
+#| Run $code with the server's stderr echo going to the sink, not the terminal.
+sub quietly(&code) {
+	my $*ERR = $server-stderr;
+	code();
+}
+
+#| Log through the server exactly as a handler would, minus the terminal echo.
+sub server-log(Str:D $level, Str:D $message --> Nil) {
+	quietly({ $server.log($level, $message) });
+}
+
 $server.tool: 'greet', :description('Greet somebody'),
 	:params({ name => { type => 'string', description => 'who to greet', required => True } }),
 	:handler(-> :%args { "Hi, {%args<name> // 'you'}" });
@@ -42,21 +69,35 @@ $server.tool: 'greet', :description('Greet somebody'),
 # Two log lines before it answers, which is what makes the server upgrade the
 # response to an event stream.
 $server.tool: 'chatty', :description('Thinks out loud'), :handler(-> :%args {
-	$server.log('info', 'thinking');
-	$server.log('info', 'still thinking');
+	server-log('info', 'thinking');
+	server-log('info', 'still thinking');
 	'chattered';
 });
 
 # Speaks at once so the client knows the request is in flight, then lingers,
-# polling the cancellation flag the way a well-behaved handler does.
-$server.tool: 'slow', :description('Takes its time'), :handler(-> :%args {
-	$server.log('info', 'slow started');
-	for ^40 {
-		last if $*MCP-REQUEST-CONTEXT.cancelled;
-		sleep 0.05;
-	}
-	'eventually';
-});
+# polling the cancellation flag the way a well-behaved handler does. The line it
+# speaks names the call (the tag the caller sent), so a test waiting for its own
+# call to start cannot be satisfied by an earlier call's line -- which would let
+# it hang up before its handler had run at all.
+#
+# Every caller of this tool hangs up on it, and answering a client that has
+# already gone makes Cro report "Cannot write to a closed socket" on stderr. So
+# the handler never answers: once it has noticed the hang-up (or given up
+# waiting for the server's disconnect probe to tell it) it parks, because nobody
+# is left to read an answer. Awaiting a promise that is never kept holds no
+# thread, and the process exits with the handler still parked.
+my $hung-up-on = Promise.new;
+$server.tool: 'slow', :description('Takes its time'),
+	:params({ tag => { type => 'string', description => 'which call this is' } }),
+	:handler(-> :%args {
+		server-log('info', "slow started: {%args<tag> // ''}");
+		for ^40 {
+			last if $*MCP-REQUEST-CONTEXT.cancelled;
+			sleep 0.05;
+		}
+		await $hung-up-on;
+		'never answered';
+	});
 
 $server.tool: 'execute_sql', :description('Runs a query in a region'),
 	:params({ region => { type => 'string' }, query => { type => 'string' } }),
@@ -93,7 +134,7 @@ sub boot(--> List) {
 					$listening = False;
 				}
 			}
-			$http.start;
+			quietly({ $http.start });
 		}
 
 		if $listening {
@@ -115,14 +156,14 @@ sub boot(--> List) {
 				!! 'the endpoint never answered';
 		}
 
-		try $http.stop;
+		try quietly({ $http.stop });
 	}
 
 	die "Could not start the MCP HTTP endpoint on any of 5 random ports: $last-error";
 }
 
 my ($http, $port) = boot();
-LEAVE { try $http.stop }
+LEAVE { try quietly({ $http.stop }) }
 
 my $endpoint = "http://127.0.0.1:$port/mcp";
 
@@ -212,7 +253,7 @@ subtest 'a tool call round-trips as one JSON response' => {
 };
 
 subtest 'a handler that logs upgrades the answer to an event stream' => {
-	plan 3;
+	plan 4;
 
 	my $before = logged().elems;
 	my %result = $mcp.call-tool('chatty');
@@ -226,6 +267,12 @@ subtest 'a handler that logs upgrades the answer to an event stream' => {
 	is-deeply logged()[$before .. *].List, ('thinking', 'still thinking').List,
 		'both notifications arrived, in the order the handler raised them';
 	ok $mcp.alive, 'and the connection is still usable afterwards';
+
+	# The server also echoes each line to its own stderr, which is why that is a
+	# sink the test owns and not the terminal.
+	is-deeply $server-stderr.lines.grep(*.contains('thinking')).List,
+		('[MCP/info] thinking', '[MCP/info] still thinking').List,
+		'and the server echoed them to its stderr sink, not to this terminal';
 };
 
 subtest 'notifications reach the Supply as well as the log hook' => {
@@ -248,7 +295,7 @@ subtest 'notifications reach the Supply as well as the log hook' => {
 	timed($both, 'two notifications on the Supply');
 
 	is ($lock.protect: { @seen.elems }), 2, 'both notifications were emitted';
-	is-deeply ($lock.protect: { @seen.map(*<method>).List }),
+	is-deeply ($lock.protect: { @seen.map(*<method>).eager.List }),
 		('notifications/message', 'notifications/message').List,
 		'as parsed notification messages';
 };
@@ -359,7 +406,7 @@ subtest 'a call that outlives its budget times out' => {
 	# The stream is already open by then -- the slow tool logs before it starts
 	# waiting -- so this is our own budget expiring on a live stream rather than
 	# Cro giving up on the response headers.
-	my $answer = $mcp.call-tool-async('slow', {}, timeout => 0.5);
+	my $answer = $mcp.call-tool-async('slow', { tag => 'timeout' }, timeout => 0.5);
 	timed($answer, 'the timed-out call to fail');
 
 	is $answer.status, Broken, 'the call fails rather than waiting the full request timeout';
@@ -370,9 +417,9 @@ subtest 'a call that outlives its budget times out' => {
 subtest 'cancelling an in-flight call hangs up on the server' => {
 	plan 4;
 
-	my $started = watch('slow started');
+	my $started = watch('slow started: cancel');
 	my $stop = Promise.new;
-	my $answer = $mcp.call-tool-async('slow', {}, cancelled => $stop);
+	my $answer = $mcp.call-tool-async('slow', { tag => 'cancel' }, cancelled => $stop);
 
 	# The server's own first log line is the signal that the handler is running:
 	# there is nothing to cancel before it.
@@ -396,12 +443,12 @@ subtest 'cancelling an in-flight call hangs up on the server' => {
 };
 
 subtest 'a server that has gone away is reported as gone, not as ancient' => {
-	plan 3;
+	plan 4;
 
 	# Cro's stop drains responses that are already in flight, so the honest
 	# place to observe a dead endpoint is the next request -- which is also the
 	# case that matters, because that is what a caller retrying will hit.
-	$http.stop;
+	quietly({ $http.stop });
 
 	my $answer = $mcp.call-tool-async('greet', { name => 'Zed' });
 	timed($answer, 'the request to a stopped server to fail');
@@ -411,6 +458,11 @@ subtest 'a server that has gone away is reported as gone, not as ancient' => {
 		'as ServerGone -- a dead wire is not evidence about the protocol era';
 	ok $answer.cause.message.contains($endpoint),
 		'and it names the endpoint that stopped answering';
+
+	is-deeply $server-stderr.lines.grep(*.contains('Streamable HTTP endpoint')).tail(2).List,
+		("[MCP/info] MCP Streamable HTTP endpoint listening on $endpoint",
+		 '[MCP/info] MCP Streamable HTTP endpoint stopped').List,
+		'the endpoint announced itself on the sink when it started and when it stopped';
 };
 
 done-testing;

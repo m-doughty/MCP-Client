@@ -1,5 +1,5 @@
 use Test;
-use lib 'lib', 't/lib';
+use lib 'lib';
 use MCP::Server;
 use MCP::Client;
 use MCP::Client::Exceptions;
@@ -47,12 +47,12 @@ my class ScriptedProvider {
 
 	#| The names of the calls in each batch this provider was handed, in order.
 	method batches(--> List:D) {
-		$!lock.protect: { @!batches.map(*.List).List };
+		$!lock.protect: { @!batches.map(*.List).eager.List };
 	}
 
 	#| Every call this provider saw, flattened, in order.
 	method seen(--> List:D) {
-		$!lock.protect: { @!batches.map(*.Slip).List };
+		$!lock.protect: { @!batches.map(*.Slip).eager.List };
 	}
 
 	method tools-for-llm(--> List) {

@@ -861,11 +861,40 @@ client's to second-guess. Segment-wise also means C</tmp/root2> is not
 inside C</tmp/root>, however much the strings agree.
 
 The answer to "is it inside?" therefore has three values. C<unknown> —
-a C<..> segment, a null byte, a backslash, an absolute path with no root
-to measure it against, a missing or non-string argument, arguments that
-are not JSON — fails closed in both directions: an C<allow> rule needs
-B<every> location it was given to be C<yes>, while a C<deny> or C<ask>
-rule fires on B<any> C<yes> or C<unknown>.
+a C<..> segment, a null byte, a backslash outside a Windows path, an
+absolute path with no root to measure it against, a missing or
+non-string argument, arguments that are not JSON — fails closed in both
+directions: an C<allow> rule needs B<every> location it was given to be
+C<yes>, while a C<deny> or C<ask> rule fires on B<any> C<yes> or
+C<unknown>.
+
+Windows paths are understood on every host, because the server's disk
+need not be the client's. A drive (C<C:\work>, C<C:/work>) or a UNC
+share (C<\\nas\share>) is a volume, and inside such a path both
+separators work, so roots and rules can be written the way Windows
+writes them. An argument naming its own volume is never joined onto a
+root. The spellings Windows resolves somewhere a lexical check cannot
+follow — drive-relative C<C:x>, current-drive C<\x>, C<\\?\> and
+C<\\.\> device paths, a segment with a trailing dot or space, an
+alternate data stream (C<x:stream>), a device name such as C<NUL> — are
+C<unknown>, and are refused in roots and rules with a message saying
+why.
+
+Two more spellings reach a place a string comparison cannot rule out,
+and both fail closed. A path on another volume is not inside an allow's
+directory, but a deny or an ask cannot be told it is elsewhere:
+C<\\localhost\C$\work> B<is> C<C:\work>, as are C<\\127.0.0.1\c$\work>
+and the machine's own name, and a share, a C<subst> or mapped drive or a
+mount point can alias any two volumes. And Windows still opens a file by
+the 8.3 short name it gave it, so C<C:\work\SECRET~1> may be
+C<C:\work\secret>: a segment that differs from a rule's only by being a
+short name is C<unknown> to every rule.
+
+Deny and ask rules compare paths case-insensitively, on every path,
+because the default filesystems of macOS and Windows are: C<PROTECTED\x>
+cannot slip past a deny on C<protected>. Allow rules compare exactly,
+so a case variant is never granted by one. L<MCP::Client::Policy::Rules>
+has the details.
 
 C<&on-ask> gets one seam and two kinds of question. A permission
 question carries the tool, the parsed arguments, a copy of the call, the
@@ -1370,7 +1399,7 @@ report.
 
 =begin code :lang<shell>
 prove6 -I. t                                   # against installed dependencies, as CI does
-prove6 -Ilib -It/lib -I../MCP-Server/lib t/    # against a sibling MCP-Server checkout
+prove6 -Ilib -I../MCP-Server/lib t/            # against a sibling MCP-Server checkout
 =end code
 
 Sixteen files, from the protocol units up: a scripted transport double
@@ -1393,9 +1422,10 @@ progress, against a server whose tools really do report it, and pins the
 other half of "when does a tool call happen": that a batch has finished
 running by the time C<execute-tool-calls> returns.
 
-The fixtures under C<t/lib> are reusable, and are meant to be: C<t/lib> on
-the include path gives you C<MCP::Client::Test::FakeTransport> (scripted
-answers, and notifications you can push at a client whenever you like),
+The fixtures ship in C<lib/> under the C<MCP::Client::Test> namespace, and
+are reusable — meant to be: installing the dist gives you
+C<MCP::Client::Test::FakeTransport> (scripted answers, and notifications
+you can push at a client whenever you like),
 C<MCP::Client::Test::InProcessTransport> (a live C<MCP::Server>, no wire),
 C<MCP::Client::Test::TestKit> (one tool of every shape) and
 C<MCP::Client::Test::ProgressKit> (tools that report progress, for testing
@@ -1404,7 +1434,7 @@ anything built on the C<on-progress> hook).
 The example is runnable too, and needs no network and no API key:
 
 =begin code :lang<shell>
-raku -Ilib -It/lib -I../MCP-Server/lib -I../LLM-Chat/lib -I../Template-Jinja2/lib \
+raku -Ilib -I../MCP-Server/lib -I../LLM-Chat/lib -I../Template-Jinja2/lib \
      examples/toolloop.raku
 =end code
 

@@ -1,5 +1,5 @@
 use Test;
-use lib 'lib', 't/lib';
+use lib 'lib';
 use MCP::Client::Policy::Rules;
 use MCP::Client::Policy::Commands;
 

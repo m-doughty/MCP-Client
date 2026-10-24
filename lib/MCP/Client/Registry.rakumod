@@ -234,8 +234,11 @@ method remove(Str:D $prefix) {
 #| Every registered provider in registration order, each as
 #| C<{ prefix, sep, provider }>.
 method providers(--> List:D) {
+	# `.eager`, deliberately: a `.map(...).List` is LAZY, and without it the
+	# rows would be read out of the table after the lock is released, while an
+	# `add` or a `remove` on another thread reshapes it.
 	$!lock.protect: {
-		@!entries.map({ %( prefix => $_<prefix>, sep => $_<sep>, provider => $_<provider> ) }).List;
+		@!entries.map({ %( prefix => $_<prefix>, sep => $_<sep>, provider => $_<provider> ) }).eager.List;
 	}
 }
 
@@ -346,9 +349,11 @@ method execute-tool-calls(@tool-calls --> List) {
 
 # A copy of the entry table taken under the lock, so a dispatch already under
 # way cannot be disturbed by an add or a remove on another thread -- the same
-# discipline the store uses for walks: mutate the table, never the walk.
+# discipline the store uses for walks: mutate the table, never the walk. Eager,
+# or the copy would be taken by whoever first read it, after the lock was gone.
+# The entry hashes themselves are shared: nothing writes one once it is pushed.
 method !snapshot(--> List:D) {
-	$!lock.protect: { @!entries.map(*.Hash).List };
+	$!lock.protect: { @!entries.map(*.Hash).eager.List };
 }
 
 # Whether an object implements the bridge pair. The whole of the provider

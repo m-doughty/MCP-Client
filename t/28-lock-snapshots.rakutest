@@ -1,0 +1,319 @@
+use Test;
+use lib 'lib';
+use MCP::Server;
+use MCP::Client;
+use MCP::Client::Leases::Table;
+use MCP::Client::Policy;
+use MCP::Client::Policy::Grants;
+use MCP::Client::Registry;
+use MCP::Client::Transport::HTTP;
+use MCP::Client::Test::FakeTransport;
+use MCP::Client::Test::InProcessTransport;
+use MCP::Client::Test::ProgressKit;
+use MCP::Client::Test::TestKit;
+
+# What a guarded reader hands back is a SNAPSHOT: built inside the lock, and
+# owing nothing to the guarded state once the lock is released.
+#
+# The trap this file pins is Raku's, not ours. `.List` on a Seq does not force
+# it -- the List fills itself in as it is read -- so a
+# `protect: { ….map({ … }).List }` returns before the map has run, and the map
+# body then reads the guarded table with the lock already released, while
+# other threads write it. A shared grant book read that way while another
+# agent's `always-` answer appended to it is a data race on a MoarVM array, and
+# can take the whole process down. `.Hash` on a Hash is the same trap in
+# another shape: it is the Hash itself, so a reader returning it hands out the
+# live table.
+#
+# A race cannot be tested by hoping to lose it, so every subtest here tests the
+# PROPERTY the race violates instead, deterministically: take the reader's
+# result, change the guarded state, and only then look at what was taken. A
+# lazy reader shows the new state; a snapshot does not.
+#
+# Fixed alongside these, and not observable this way, so not tested here:
+# Policy.grants without a store, Policy's batch snapshot of its rules, the
+# unknown-key and reason layers' catalogue snapshots and the HTTP transport's
+# per-call annotation lookup all copy straight into a variable of their own, so
+# nobody ever holds the lazy value; Policy.rules is only ever replaced
+# wholesale, which leaves a lazy reader the old rules; a pin's generations
+# never change; and the path-params table copies the caller's list before it
+# maps it.
+#
+#   prove6 -Ilib t/28-lock-snapshots.rakutest
+
+plan 8;
+
+# === Doubles ===
+
+# A provider that publishes a fixed set of tools and answers every call. The
+# `on-list` hook runs at the start of every listing, which is how a test makes
+# something happen while a listing is under way without racing anything.
+my class StubProvider {
+	has Str:D @.names = <read>;
+	has &.on-list;
+
+	method tools-for-llm(--> List) {
+		&!on-list() if &!on-list;
+		@!names.map(-> $name {
+			%(
+				type => 'function',
+				function => %(
+					name => $name,
+					description => "does $name",
+					parameters => %( type => 'object', properties => %() ),
+				),
+			);
+		}).eager.List;
+	}
+
+	method execute-tool-calls(@tool-calls --> List) {
+		@tool-calls.map(-> %call {
+			%( role => 'tool', tool_call_id => %call<id>, content => 'ok', is_error => False );
+		}).eager.List;
+	}
+}
+
+# A tool definition as a tools/list result carries one.
+sub tool(Str:D $name, %schema --> Hash:D) {
+	{ name => $name, description => "the $name tool", inputSchema => %schema };
+}
+
+# A tools/list result holding one tool with one x-mcp-header annotation.
+sub annotated-listing(Str:D $name, Str:D $property, Str:D $header --> Hash:D) {
+	{
+		tools => [
+			tool($name, {
+				type       => 'object',
+				properties => { $property => { type => 'string', 'x-mcp-header' => $header } },
+			}),
+		],
+	};
+}
+
+# === The grant book ===
+
+subtest 'Grants.list is a snapshot, and a grant is fixed when it is added' => {
+	plan 6;
+
+	my $grants = MCP::Client::Policy::Grants.new(
+		grants => [{ tool => 'fs_read', decision => 'allow' },],
+	);
+
+	# TAKEN NOW, and not looked at until the book has moved on.
+	my $list = $grants.list;
+	$grants.add([{ tool => 'fs_write', decision => 'deny' },]);
+
+	is $grants.elems, 2, 'the book has moved on';
+	is $list.elems, 1, 'the list taken earlier holds the one grant there was';
+	is $list[0]<tool>, 'fs_read', 'and it is that grant';
+
+	$list[0]<decision> = 'deny';
+	is $grants.list[0]<decision>, 'allow',
+		'writing a grant it handed out does not rewrite the book';
+
+	# A rule's argv narrower is a list, and validating it used to keep a lazy
+	# view onto the caller's own array: the rule changed whenever the caller's
+	# array did, until somebody first read it.
+	my @args = <push>;
+	$grants.add([{ tool => 'sh_run', decision => 'allow', command => 'git', args => @args },]);
+	@args[0] = 'reset';
+	@args.push: '--hard';
+
+	is-deeply $grants.list[*-1]<args>, ('push',),
+		'the args of a grant are what was added, not what the caller’s array became';
+	is-deeply $grants.list[*-1]<args>, ('push',), 'and they stay that way on a second read';
+};
+
+subtest 'Policy.grants over a shared book is a snapshot, and a rule is fixed when the policy is built' => {
+	plan 6;
+
+	my $store = MCP::Client::Policy::Grants.new;
+	my @args = <status>;
+	my $policy = MCP::Client::Policy.new(
+		provider     => StubProvider.new,
+		rules        => [{ tool => 'sh_run', decision => 'allow', command => 'git', args => @args },],
+		grants       => [{ tool => 'fs_read', decision => 'allow' },],
+		grants-store => $store,
+	);
+
+	my $grants = $policy.grants;
+	$store.add([{ tool => 'fs_write', decision => 'deny' },]);
+
+	is $policy.grants.elems, 2, 'the effective grants have moved on';
+	is $grants.elems, 1, 'the grants taken earlier hold the one there was';
+	is $grants[0]<tool>, 'fs_read', 'and it is the policy’s own';
+
+	# The same lazy view, through a policy's rules: one written with an argv
+	# narrower must not change because the array it was written from did.
+	@args[0] = 'push';
+	is-deeply $policy.rules[0]<args>, ('status',),
+		'the args of a rule are what the policy was built with';
+
+	my $rules = $policy.rules;
+	$rules[0]<decision> = 'deny';
+	is $policy.rules[0]<decision>, 'allow',
+		'writing a rule it handed out does not rewrite the policy';
+	is $policy.grants.elems, 2, 'and nothing above touched the grants';
+};
+
+# === The registry ===
+
+subtest 'Registry.providers is a snapshot, and a listing under way is not reshaped' => {
+	plan 5;
+
+	my $registry = MCP::Client::Registry.new;
+	my Bool $added = False;
+
+	# Registers a second provider from inside the first one's listing -- the
+	# same thread, so nothing is raced: the listing that is under way must
+	# carry on over the table as it was when it started.
+	my $first = StubProvider.new(
+		names   => <read>,
+		on-list => {
+			unless $added {
+				$added = True;
+				$registry.add(StubProvider.new(names => <late>), prefix => 'late');
+			}
+		},
+	);
+	$registry.add($first, prefix => 'fs');
+
+	my $providers = $registry.providers;
+	my @listed = $registry.tools-for-llm.map(*<function><name>);
+
+	ok $added, 'the second provider was registered while the listing was under way';
+	is $registry.elems, 2, 'the registry has moved on';
+	is-deeply @listed.List, ('fs_read',),
+		'the listing under way covered the providers there were when it started';
+	is $providers.elems, 1, 'the providers taken earlier hold the one there was';
+	is-deeply $registry.tools-for-llm.map(*<function><name>).List, ('fs_read', 'late_late'),
+		'and the next listing covers both';
+};
+
+# === The lease table ===
+
+subtest 'Leases::Table.status rows are built when it is asked' => {
+	plan 6;
+
+	my $table = MCP::Client::Leases::Table.new;
+	ok $table.acquire(holder => 'a', paths => ['/w/x'])<granted>, 'a holds /w/x';
+
+	my %before = $table.status;
+
+	# Pinning writes the lease's own record in place; a second acquire adds a
+	# lease beside it.
+	my %pin = $table.pin(holder => 'a', paths => ['/w/x']);
+	ok %pin<pinned>, 'the lease is pinned';
+	ok $table.acquire(holder => 'a', paths => ['/w/y'])<granted>, 'a holds /w/y as well';
+
+	is $table.status<leases>.elems, 2, 'the table has moved on';
+	is %before<leases>.elems, 1, 'the status taken earlier holds the one lease there was';
+	is %before<leases>[0]<pins>, 0,
+		'unpinned -- the row was built under the lock, not when it was read';
+};
+
+subtest 'Leases::Table.status waiter rows are built when it is asked' => {
+	plan 5;
+
+	my $table = MCP::Client::Leases::Table.new;
+	$table.acquire(holder => 'a', paths => ['/w/x']);
+	my %waiting = $table.wait-attempt(waiter-id => 'w1', holder => 'b', paths => ['/w/x']);
+	is %waiting<reason>, 'conflict', 'b is waiting on a';
+
+	my %before = $table.status;
+
+	# Releasing the blocker recomputes the waiter's blockers in place.
+	$table.release(holder => 'a');
+
+	is-deeply $table.status<waiters>[0]<blockers>, ().List,
+		'the table has moved on: nothing blocks the waiter now';
+	is %before<waiters>.elems, 1, 'the status taken earlier holds the one waiter';
+	is %before<waiters>[0]<holder>, 'b', 'and it is that waiter';
+	is-deeply %before<waiters>[0]<blockers>, ('a',),
+		'still blocked by a -- the row was built under the lock, not when it was read';
+};
+
+# === The HTTP transport ===
+
+subtest 'Transport::HTTP.tool-annotations is a copy' => {
+	plan 3;
+
+	# Nothing is ever sent: capture-tool-list is the seam a tools/list
+	# response passes through, and it is public.
+	my $transport = MCP::Client::Transport::HTTP.new(
+		url     => 'http://127.0.0.1:9/mcp',
+		on-warn => -> Str:D $ { },
+	);
+	LEAVE { $transport.close }
+
+	$transport.capture-tool-list(annotated-listing('execute_sql', 'region', 'Region'));
+	my $annotations = $transport.tool-annotations;
+	$transport.capture-tool-list(annotated-listing('lookup', 'zone', 'Zone'));
+
+	is-deeply $transport.tool-annotations, { lookup => { Zone => ('zone',) } },
+		'the transport has moved on to the second listing';
+	is-deeply $annotations, { execute_sql => { Region => ('region',) } },
+		'the annotations taken earlier are those of the first';
+
+	$annotations<forged> = { Injected => ('x',) };
+	nok $transport.tool-annotations<forged>:exists,
+		'writing what it handed out does not rewrite the transport';
+};
+
+# === The test kits ===
+
+subtest 'FakeTransport’s readers are snapshots' => {
+	plan 5;
+
+	my $wire = MCP::Client::Test::FakeTransport.new;
+	$wire.script('ping', { result => {} }, { result => {} });
+
+	await $wire.request({ jsonrpc => '2.0', id => 1, method => 'ping' });
+	$wire.notify({ jsonrpc => '2.0', method => 'notifications/initialized' });
+
+	my $methods = $wire.sent-methods;
+	my $ids = $wire.sent-ids;
+	my $pings = $wire.requests-for('ping');
+	my $notified = $wire.notified-methods;
+
+	await $wire.request({ jsonrpc => '2.0', id => 2, method => 'ping' });
+	$wire.notify({ jsonrpc => '2.0', method => 'notifications/cancelled' });
+
+	is $wire.sent-methods.elems, 2, 'the transport has moved on';
+	is-deeply $methods, ('ping',), 'sent-methods taken earlier holds the one request';
+	is-deeply $ids, (1,), 'sent-ids likewise';
+	is $pings.elems, 1, 'requests-for likewise';
+	is-deeply $notified, ('notifications/initialized',), 'notified-methods likewise';
+};
+
+subtest 'InProcessTransport’s readers and the kits’ counters are snapshots' => {
+	plan 6;
+
+	my $kit = MCP::Client::Test::TestKit.new(slow-ms => 10);
+	my $progress = MCP::Client::Test::ProgressKit.new;
+	my $server = MCP::Server.new(name => 'snapshots', version => '1.0.0');
+	$server.plug($kit);
+	$server.plug($progress);
+
+	my $wire = MCP::Client::Test::InProcessTransport.new(:$server);
+	my $client = MCP::Client.new(transport => $wire, on-warn => -> Str:D $ { });
+	LEAVE { $client.close }
+
+	$client.call-tool('echo', { text => 'one' });
+	$client.call-tool('silent', {});
+
+	my $counts = $kit.counts;
+	my $progress-counts = $progress.counts;
+	my $calls = $wire.requests-for('tools/call');
+	my $methods = $wire.sent-methods;
+
+	$client.call-tool('echo', { text => 'two' });
+	$client.call-tool('silent', {});
+
+	is $kit.count-of('echo'), 2, 'the kit has moved on';
+	is $counts<echo>, 1, 'TestKit counts taken earlier hold the one echo there was';
+	is $progress-counts<silent>, 1, 'ProgressKit counts likewise';
+	is $wire.requests-for('tools/call').elems, 4, 'the transport has moved on';
+	is $calls.elems, 2, 'requests-for taken earlier holds the two calls there were';
+	is $methods.grep('tools/call').elems, 2, 'sent-methods likewise';
+};

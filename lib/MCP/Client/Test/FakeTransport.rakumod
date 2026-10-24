@@ -159,22 +159,25 @@ method !check(@answers --> Nil) {
 
 #| The methods of every request sent, in order.
 method sent-methods(--> List:D) {
-	$!lock.protect: { @!requests.map({ $_<method> }).List };
+	# `.eager` here and in the three readers below: a `.map(...).List` is
+	# LAZY, and without it the answer would be read out of the log after the
+	# lock is released, while a request on another thread appends to it.
+	$!lock.protect: { @!requests.map({ $_<method> }).eager.List };
 }
 
 #| The methods of every notification sent, in order.
 method notified-methods(--> List:D) {
-	$!lock.protect: { @!notified.map({ $_<method> }).List };
+	$!lock.protect: { @!notified.map({ $_<method> }).eager.List };
 }
 
 #| Every request for one method, in order.
 method requests-for(Str:D $method --> List:D) {
-	$!lock.protect: { @!requests.grep({ $_<method> eq $method }).List };
+	$!lock.protect: { @!requests.grep({ $_<method> eq $method }).eager.List };
 }
 
 #| The JSON-RPC ids of every request sent, in order.
 method sent-ids(--> List:D) {
-	$!lock.protect: { @!requests.map({ $_<id> }).List };
+	$!lock.protect: { @!requests.map({ $_<id> }).eager.List };
 }
 
 #| Answers still queued but never used — a scripted expectation the client did

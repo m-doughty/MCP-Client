@@ -1,5 +1,5 @@
 use Test;
-use lib 'lib', 't/lib';
+use lib 'lib';
 use JSON::Fast;
 use MCP::Client::Exceptions;
 use MCP::Client::Policy;

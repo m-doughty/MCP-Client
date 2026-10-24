@@ -15,6 +15,17 @@ of C<resources/read> are both covered.
 Everything it registers is thread-safe: the tests drive it through transports
 that dispatch on their own threads, and several calls may be in flight at once.
 
+This — and its siblings C<MCP::Client::Test::FakeTransport>,
+C<MCP::Client::Test::InProcessTransport> and C<MCP::Client::Test::ProgressKit>
+— is test support, not library surface. It ships inside the dist's own
+namespace (rather than under C<t/lib>) deliberately, so that C<zef install>'s
+test phase precompiles it as part of C<lib/> staging before any test file
+runs. A C<t/lib> CompUnit repo starts cold on a fresh C<zef install>, and
+parallel test files pulling the fixtures' dependency chain into that cold
+store can race and fail the install outright; moving test support into
+C<lib/> under a C<::Test> namespace is the fleet-wide fix for that failure
+class.
+
 =head2 What is in it
 
 =item C<echo> — returns its C<text> argument. The happy path.
@@ -85,7 +96,9 @@ method count-of(Str:D $name --> Int:D) {
 
 #| Every counter, for a test that wants to assert on the lot.
 method counts(--> Hash:D) {
-	$!lock.protect: { %!counts.Hash }
+	# Copied inside the lock: `.Hash` on a Hash is that same Hash, so it would
+	# hand out the live counters for the next handler run to change.
+	$!lock.protect: { my %copy = %!counts; %copy }
 }
 
 method !bump(Str:D $name --> Nil) {

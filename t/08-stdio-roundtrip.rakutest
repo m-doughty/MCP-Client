@@ -1,5 +1,5 @@
 use Test;
-use lib 'lib', 't/lib';
+use lib 'lib';
 use MCP::Server::Protocol;
 use MCP::Client;
 use MCP::Client::Exceptions;
@@ -14,10 +14,10 @@ plan 5;
 # The fixture lives next door to this file, and is run with the same raku that
 # is running the tests -- no PATH lookup, no shell, no assumption about the
 # working directory beyond the one prove6 already makes.
-constant FIXTURE = $?FILE.IO.parent.add('lib/fixture-server.raku').absolute;
+constant FIXTURE = $?FILE.IO.parent.add('fixture-server.raku').absolute;
 
 # Pass the parent's -I paths through to the child. From a checkout that is
-# lib/, t/lib/ and ../MCP-Server/lib; under `prove6 -I. t` against installed
+# lib/ and ../MCP-Server/lib; under `prove6 -I. t` against installed
 # dependencies it is whatever `use lib` above resolved to, and MCP::Server comes
 # out of the installation repo the child inherits anyway.
 sub include-args(--> List) {
@@ -27,13 +27,29 @@ sub include-args(--> List) {
 		.List;
 }
 
+# What the children wrote to stderr. A passing run stays TAP-only, so it is
+# only echoed (see the end of the file) when something failed and it may say why.
+my Lock:D $stderr-lock = Lock.new;
+my @server-stderr;
+my Bool:D $passing = True;
+
+sub tested(Pair:D $pair --> Bool:D) {
+	my Bool:D $ok = subtest $pair;
+	$passing = False unless $ok;
+	$ok;
+}
+
+sub stderr-lines(--> List:D) {
+	$stderr-lock.protect: { @server-stderr.List };
+}
+
 sub spawn(Str :$era = 'both', *%opts) {
 	my @args = |include-args(), FIXTURE, "--era=$era";
 	my $wire = MCP::Client::Transport::Stdio.new(
 		command   => $*EXECUTABLE.absolute,
 		args      => @args,
 		on-log    => -> Str:D $message { diag "transport: $message" },
-		on-stderr => -> Str:D $line { diag "server stderr: $line" },
+		on-stderr => -> Str:D $line { $stderr-lock.protect: { @server-stderr.push($line) } },
 	);
 	my $client = MCP::Client.new(
 		transport => $wire,
@@ -63,7 +79,7 @@ sub wait-until(&condition, Real :$within = 30 --> Bool:D) {
 	}
 }
 
-subtest 'a spawned server, from probe to answer' => {
+tested 'a spawned server, from probe to answer' => {
 	plan 9;
 
 	my ($client, $wire) = spawn();
@@ -89,7 +105,7 @@ subtest 'a spawned server, from probe to answer' => {
 	$client.close;
 };
 
-subtest 'the legacy handshake, over the same pipe' => {
+tested 'the legacy handshake, over the same pipe' => {
 	plan 6;
 
 	# Configured for the legacy era only, the fixture still answers
@@ -109,7 +125,7 @@ subtest 'the legacy handshake, over the same pipe' => {
 	$client.close;
 };
 
-subtest 'two requests in flight at once' => {
+tested 'two requests in flight at once' => {
 	plan 5;
 
 	my ($client, $wire) = spawn();
@@ -134,7 +150,7 @@ subtest 'two requests in flight at once' => {
 	$client.close;
 };
 
-subtest 'notifications share the pipe with answers' => {
+tested 'notifications share the pipe with answers' => {
 	plan 7;
 
 	my @logged;
@@ -168,7 +184,7 @@ subtest 'notifications share the pipe with answers' => {
 	$client.close;
 };
 
-subtest 'a clean shutdown' => {
+tested 'a clean shutdown' => {
 	plan 6;
 
 	my ($client, $wire) = spawn();
@@ -185,3 +201,7 @@ subtest 'a clean shutdown' => {
 
 	lives-ok { $client.close }, 'and closing again is a no-op';
 };
+
+unless $passing {
+	diag "server stderr: $_" for stderr-lines();
+}

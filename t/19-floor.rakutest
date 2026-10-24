@@ -1,5 +1,5 @@
 use Test;
-use lib 'lib', 't/lib';
+use lib 'lib';
 use MCP::Client::Policy::Rules;
 use MCP::Client::Policy::Floor;
 use MCP::Client::Policy;
@@ -13,7 +13,7 @@ use MCP::Client::Policy;
 #
 #   prove6 -Ilib -I../MCP-Server/lib t/19-floor.rakutest
 
-plan 6;
+plan 7;
 
 constant HOME  = '/home/dev';
 constant SADNA = '/home/dev/.sadna';
@@ -162,4 +162,41 @@ subtest 'floor checks fail closed on the unreadable and the unknown' => {
 	# unverifiable-check fires -> ask (never a silent allow).
 	is decide(@with-allow, ['bash', '-c', 'rm -rf "$(cat targets)"']), 'ask',
 		'a recursive rm of a substitution result asks';
+};
+
+subtest 'a tool that names no command is not caught by the floor' => {
+	# The bug this pins, from a real session: `sh_poll`, `sh_output` and
+	# `sh_kill` name a job handle and can run nothing at all, yet every floor
+	# rule narrowed by `command` or `check` fired on them. The engine treated
+	# "this call has no command" the same as "this call's command is
+	# unreadable", and the latter fails closed. Because the floor's
+	# self-modification rule is a DENY, and deny outranks ask, the human was
+	# never even asked: a background job could be started and then never read.
+	#
+	# The distinction the engine now draws is between a tool that HAS no
+	# command parameter (nothing for the predicate to speak about) and
+	# arguments it could not READ (a command might be hiding). Only the second
+	# still fails closed, which the last two cases here hold it to.
+	for <sh_poll sh_output sh_kill> -> $tool {
+		my %verdict = evaluate(@floor, $tool, %( job => 'j1-abc' ), :%checks);
+		is %verdict<decision>, 'ask', "$tool is not denied by the floor";
+		is %verdict<reason>, 'no-match',
+			"$tool matches no floor rule at all, rather than failing closed";
+	}
+
+	# The allow-everything policy must be able to grant them, which it could
+	# not while a floor deny was firing.
+	is evaluate(@with-allow, 'sh_poll', %( job => 'j1-abc' ), :%checks)<decision>,
+		'allow', 'a policy that allows sh_* can now actually read its own job';
+
+	# And the safety property the change must not cost: a command the engine
+	# cannot read is still unevaluable, and unevaluable still fails closed.
+	my %unreadable = evaluate(@floor, 'sh_run', 'not-an-object', :%checks);
+	is %unreadable<decision>, 'deny', 'unreadable arguments still fail closed';
+	is %unreadable<reason>, 'unevaluable-path',
+		'and say so, rather than passing as "no command"';
+
+	# A real command still meets the floor exactly as before.
+	is decide(@floor, ['rm', '-rf', '/']), 'deny',
+		'the hard deny is untouched by the change';
 };

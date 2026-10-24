@@ -875,7 +875,8 @@ my sub judgeable(Str:D $path --> Bool:D) {
 # with a note when there is nobody to collide with.
 my sub unjudged(Str:D $name, Str:D $why, Bool:D $strict --> Hash:D) {
 	return %( refuse => "$name: $why, so the call was refused while other agents are live. "
-		~ "Name each path as a plain path with no '..' segments and no backslashes, lock it with "
+		~ "Name each path as a plain path with no '..' segments (a backslash only inside a full "
+		~ "Windows path such as C:\\work\\x), lock it with "
 		~ "{ACQUIRE}, and try again." )
 		if $strict;
 
@@ -976,8 +977,8 @@ method !do-acquire(@paths, $raw-ttl, $raw-wait, Str:D $id --> Hash:D) {
 				$id,
 				"{ACQUIRE}: nothing was locked. These are not paths the lease layer can lock: "
 					~ quoted(%got<unevaluable>.list) ~ ". A path is a plain non-empty string with "
-					~ "no '..' segment, no backslash and no null byte; write it relative to the "
-					~ 'workspace root, or in full.',
+					~ "no '..' segment and no null byte, and a backslash only inside a full Windows "
+					~ "path (C:\\work\\x); write it relative to the workspace root, or in full.",
 			);
 		}
 		when 'hold-and-wait' {

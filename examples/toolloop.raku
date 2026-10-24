@@ -9,7 +9,7 @@ toolloop.raku - one tool namespace over a local toolkit and a remote MCP server
 =head1 SYNOPSIS
 
 =begin code :lang<shell>
-raku -Ilib -It/lib -I../MCP-Server/lib -I../LLM-Chat/lib -I../Template-Jinja2/lib \
+raku -Ilib -I../MCP-Server/lib -I../LLM-Chat/lib -I../Template-Jinja2/lib \
      examples/toolloop.raku
 =end code
 
@@ -25,7 +25,7 @@ Three parts:
 =item B<A local toolkit> — an ordinary C<MCP::Server> with two tools and no
       transport at all. It never serialises anything; the registry calls its
       bridge methods directly.
-=item B<A remote server> — C<t/lib/fixture-server.raku>, spawned as a child
+=item B<A remote server> — C<t/fixture-server.raku>, spawned as a child
       process and spoken to over stdio by an C<MCP::Client>. Its tools come
       from C<MCP::Client::Test::TestKit>.
 =item B<A scripted model> — a C<LLM::Chat::Backend> that emits a fixed
@@ -98,7 +98,7 @@ sub local-server(--> MCP::Server:D) {
 # === The remote half: a real server in a real child process ==================
 
 # The fixture is found relative to this file, so the example runs from anywhere.
-constant FIXTURE = $?FILE.IO.parent.parent.add('t/lib/fixture-server.raku').absolute;
+constant FIXTURE = $?FILE.IO.parent.parent.add('t/fixture-server.raku').absolute;
 
 # The child needs the same -I paths this process was started with: it loads
 # MCP::Server and MCP::Client::Test::TestKit, which from a checkout are sibling

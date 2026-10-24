@@ -90,7 +90,10 @@ has Bool $!open = True;
 
 #| The requests for one method, in order.
 method requests-for(Str:D $method --> List:D) {
-	$!lock.protect: { @!requests.grep({ ($_<method> // '') eq $method }).List };
+	# `.eager` here and in sent-methods: a `.grep(...).List` is LAZY, and
+	# without it the answer would be read out of the log after the lock is
+	# released, while a request on another thread appends to it.
+	$!lock.protect: { @!requests.grep({ ($_<method> // '') eq $method }).eager.List };
 }
 
 #| How many requests the client sent for one method — the count that proves a
@@ -101,7 +104,7 @@ method count-for(Str:D $method --> Int:D) {
 
 #| The methods of every request sent, in order.
 method sent-methods(--> List:D) {
-	$!lock.protect: { @!requests.map({ $_<method> // '' }).List };
+	$!lock.protect: { @!requests.map({ $_<method> // '' }).eager.List };
 }
 
 method request(%msg, :&on-notification, Promise :$cancelled, :$timeout --> Promise) {

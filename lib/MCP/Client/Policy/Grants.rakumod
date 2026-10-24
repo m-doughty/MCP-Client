@@ -142,6 +142,7 @@ method add(@rules --> List:D) {
 	my @snapshot;
 	$!lock.protect: {
 		@!grants.append: @validated;
+		# Assigning to an array is eager, so the copies are made here.
 		@snapshot = @!grants.map({ plain-copy($_) });
 	};
 
@@ -152,7 +153,10 @@ method add(@rules --> List:D) {
 #| copies: what a policy decides against, what a session persists, and what a
 #| UI renders. Editing what comes back changes nothing.
 method list(--> List:D) {
-	$!lock.protect: { @!grants.map({ plain-copy($_) }).List };
+	# `.eager`, deliberately: a `.map(...).List` is LAZY, so without it the
+	# copies would be made after the lock is released -- reading the book
+	# while another agent's `add` appends to it.
+	$!lock.protect: { @!grants.map({ plain-copy($_) }).eager.List };
 }
 
 #| How many grants are in the book. The cheap question, for a status surface
@@ -164,9 +168,10 @@ method elems(--> Int:D) {
 # === Helpers ===
 
 # A deep copy of plain data, as MCP::Client::Policy makes one: a snapshot must
-# never be a window onto the book's own state.
+# never be a window onto the book's own state. Eager all the way down, so the
+# copy is finished while the caller still holds the lock.
 my sub plain-copy($value) {
 	return $value.Hash.map({ $_.key => plain-copy($_.value) }).Hash if $value ~~ Associative;
-	return $value.list.map({ plain-copy($_) }).List if $value ~~ Positional;
+	return $value.list.map({ plain-copy($_) }).eager.List if $value ~~ Positional;
 	$value;
 }

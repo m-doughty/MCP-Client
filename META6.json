@@ -7,7 +7,7 @@
   ],
   "depends": [
     "MCP::Server:ver<0.6.0+>:auth<zef:apogee>",
-    "JSON::Fast:ver<0.19+>:auth<cpan:TIMOTIMO>",
+    "JSON::Fast:ver<0.21.0+>:auth<zef:timo>",
     "Cro::HTTP:ver<0.8.11+>:auth<zef:cro>:api<0>",
     "MIME::Base64:ver<1.2.5+>:auth<zef:raku-community-modules>"
   ],
@@ -31,6 +31,10 @@
     "MCP::Client::Reasons": "lib/MCP/Client/Reasons.rakumod",
     "MCP::Client::Registry": "lib/MCP/Client/Registry.rakumod",
     "MCP::Client::SSE": "lib/MCP/Client/SSE.rakumod",
+    "MCP::Client::Test::FakeTransport": "lib/MCP/Client/Test/FakeTransport.rakumod",
+    "MCP::Client::Test::InProcessTransport": "lib/MCP/Client/Test/InProcessTransport.rakumod",
+    "MCP::Client::Test::ProgressKit": "lib/MCP/Client/Test/ProgressKit.rakumod",
+    "MCP::Client::Test::TestKit": "lib/MCP/Client/Test/TestKit.rakumod",
     "MCP::Client::Transport": "lib/MCP/Client/Transport.rakumod",
     "MCP::Client::Transport::HTTP": "lib/MCP/Client/Transport/HTTP.rakumod",
     "MCP::Client::Transport::Stdio": "lib/MCP/Client/Transport/Stdio.rakumod",
@@ -49,5 +53,5 @@
   ],
   "test-depends": [
   ],
-  "version": "0.5.0"
+  "version": "0.6.0"
 }

@@ -9,14 +9,14 @@ fixture-server.raku - a real MCP server on stdio, for the stdio transport tests
 =head1 SYNOPSIS
 
 =begin code :lang<shell>
-raku -Ilib -It/lib -I../MCP-Server/lib t/lib/fixture-server.raku --era=both
+raku -Ilib -I../MCP-Server/lib t/fixture-server.raku --era=both
 =end code
 
 =head1 DESCRIPTION
 
 C<t/08> and C<t/09> spawn this with C<$*EXECUTABLE>, passing through whatever
 C<-I> paths the test process itself is using, so it works both from a checkout
-(C<prove6 -Ilib -It/lib -I../MCP-Server/lib t/>) and against installed
+(C<prove6 -Ilib -I../MCP-Server/lib t/>) and against installed
 dependencies (C<prove6 -I. t>, which is what CI does).
 
 It serves C<MCP::Client::Test::TestKit> plus a handful of tools that only make
@@ -204,6 +204,6 @@ sub MAIN(Str :$era = 'both') {
 		}
 	}
 
-	my @unfinished = $tracker.protect: { @in-flight.grep({ .status ~~ Planned }).List };
+	my @unfinished = $tracker.protect: { @in-flight.grep({ .status ~~ Planned }).eager.List };
 	await Promise.anyof(Promise.allof(@unfinished), Promise.in(SHUTDOWN-GRACE)) if @unfinished;
 }

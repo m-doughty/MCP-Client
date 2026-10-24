@@ -1,5 +1,5 @@
 use Test;
-use lib 'lib', 't/lib';
+use lib 'lib';
 use JSON::Fast;
 use MCP::Client::Exceptions;
 use MCP::Client::Policy;
@@ -53,7 +53,7 @@ my class ScriptedProvider {
 
 	#| Every call this provider saw, flattened, in order.
 	method seen(--> List:D) {
-		$!lock.protect: { @!batches.map(*.Slip).List };
+		$!lock.protect: { @!batches.map(*.Slip).eager.List };
 	}
 
 	method tools-for-llm(--> List) { @!declared.List }

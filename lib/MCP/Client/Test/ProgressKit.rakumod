@@ -85,7 +85,9 @@ method count-of(Str:D $name --> Int:D) {
 
 #| Every counter, for a test that wants to assert on the lot.
 method counts(--> Hash:D) {
-	$!lock.protect: { %!counts.Hash }
+	# Copied inside the lock: `.Hash` on a Hash is that same Hash, so it would
+	# hand out the live counters for the next handler run to change.
+	$!lock.protect: { my %copy = %!counts; %copy }
 }
 
 method !bump(Str:D $name --> Nil) {

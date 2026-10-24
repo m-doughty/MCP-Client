@@ -190,13 +190,77 @@ The answer has three values, not two. C<unknown> is returned when the question
 cannot honestly be answered lexically:
 
 =item a C<..> segment anywhere (the only honest resolution is on the server);
-=item a null byte, or a backslash — on a Windows server C<\> is a separator and
-      on a POSIX one it is an ordinary character, and guessing wrong either
-      hides an escape or invents one. Write rules and roots with C</>, which
-      Windows accepts too;
+=item a null byte; or a backslash in a path with no Windows volume — on a
+      Windows server C<\> is a separator and on a POSIX one it is an ordinary
+      character, and guessing wrong either hides an escape or invents one;
+=item a Windows path the engine cannot place: drive-relative C<C:x>, a C<\x>
+      rooted on whichever drive is current, a C<\\?\> or C<\\.\> device path,
+      or a segment Windows would read as some other name — a trailing dot or
+      space (C<protected.> B<is> C<protected>), a C<:> (a data stream), a
+      device name such as C<NUL> or C<COM1>;
+=item a POSIX-rooted path (C</x>) measured against a Windows one: on Windows
+      C</x> is the root of whichever drive is current;
+=item a path on another Windows volume, for a deny or an ask; and, for any
+      rule, a segment of a Windows path that differs from the rule's only by
+      being an 8.3 short name (see L<#Windows paths>);
 =item an absolute path measured against a relative directory, or the reverse:
       no root was configured, so there is nothing to measure from;
 =item an argument that is missing, or is not a string at all.
+
+=head2 Windows paths
+
+A path that starts with a Windows volume is understood as one, whatever the
+host: a drive (C<C:\work>, C<C:/work>, the letter in either case) or a UNC
+share (C<\\server\share\work>). Inside such a path either separator works, so
+C<C:\work\src> and C<C:/work/src> are the same place. Roots and rules may be
+written the way Windows writes them:
+
+=begin code :lang<raku>
+roots => { fs => 'C:\Users\me\project' },
+rules => [ { tool => 'fs_*', decision => 'allow', under => 'C:\Users\me\project\src' } ],
+=end code
+
+A relative argument is measured from its root by joining the two, so C<src\x>
+under a C<C:\…> root is a Windows path and its backslash separates; under a
+POSIX root the same argument stays C<unknown>. The join is spelt with the
+root's own separator throughout (C<src/x> under C<C:\work> is
+C<C:\work\src\x>), so a path handed back -- a lease, a suggestion -- reads as
+the user would type it. An argument that names its own volume (C<D:\x>,
+C<\\other\share>) is never joined onto the root.
+
+B<Case.> Deny and ask rules compare segments case-insensitively, so
+C<PROTECTED\x> cannot slip past a deny on C<protected> on NTFS. Allow rules
+compare exactly, so a differently-cased path is never granted on a
+case-sensitive filesystem. Over-matching is the safe direction for the first,
+and the unsafe one for the second.
+
+B<Other volumes.> To an allow, a path on another volume is simply not inside
+the rule's directory. To a deny or an ask it is C<unknown>, so they fire:
+Windows has too many ways for one volume's name to reach another's files for
+a string comparison to rule it out — C<\\localhost\C$\work> is C<C:\work>, and
+so are C<\\127.0.0.1\c$\work> and the machine's own name; any share, a
+C<subst> or mapped drive and a volume mount point alias the same way.
+
+=begin code :lang<raku>
+my @rules =
+	{ tool => 'fs_*', decision => 'allow', under => 'C:\work' },
+	{ tool => 'fs_*', decision => 'deny',  under => 'C:\work\secret' },
+;
+evaluate(@rules, 'fs_read', { path => '\\\\localhost\C$\work\secret\x' })<decision>;  # deny
+evaluate(@rules, 'fs_read', { path => 'D:\x' })<decision>;                            # deny
+=end code
+
+B<8.3 short names.> Windows still answers to the short name it gave a long
+one: C<C:\work\SECRET~1\x> opens C<C:\work\secret\x>, and which long name a
+short one belongs to is written only on the server's disk. So a segment that
+differs from the rule's only by being a short name — a base of up to eight
+characters holding a C<~> and a letter or digit, and at most a three-letter
+extension — is C<unknown> to every rule: a deny on C<C:\work\secret> fires on
+it, and an allow on C<C:\work\public> does not. A short name below the rule's
+directory changes nothing (C<C:\work\PROGRA~1> is inside C<C:\work> whatever it
+stands for), and a name of any other shape (C<notes~2024.md>) is just a name.
+Roots and rules may themselves be written with short names — a temporary
+directory often is (C<C:\Users\RUNNER~1\AppData\Local\Temp>).
 
 =head2 What C<unknown> does
 
@@ -391,7 +455,10 @@ our sub validate-rule($rule, Str:D :$what = 'policy rule' --> Hash:D) is export 
 				~ 'each a non-empty string',
 		) unless $tokens ~~ Positional
 			&& !$tokens.list.grep({ !($_ ~~ Str:D) || !$_.chars });
-		%rule{$key} = $tokens.list.map(*.Str).List;
+		# Eager: a lazy map here would be a view onto the caller's own list,
+		# so the rule could change after it was validated, and the first
+		# thread to read it would be the one to fill it in.
+		%rule{$key} = $tokens.list.map(*.Str).eager.List;
 	}
 
 	if %given<check>:exists {
@@ -627,7 +694,9 @@ our sub validate-path-params($params --> Hash:D) is export {
 				~ 'a non-empty string',
 		) if $named.grep({ !($_ ~~ Str:D) || !$_.chars });
 
-		%out{$pattern} = $named.map(*.Str).List;
+		# Eager: the table is read by every concurrent decision without a
+		# lock, and a lazy List would be filled in by whichever got there first.
+		%out{$pattern} = $named.map(*.Str).eager.List;
 	}
 
 	%out;
@@ -700,17 +769,73 @@ our sub match-command($pattern, $basename, Bool :$fold --> Bool:D) is export {
 #| Whether C<$path> is inside C<$dir>: C<'yes'>, C<'no'>, or C<'unknown'> when
 #| the question cannot be answered by looking at the two strings. Purely
 #| lexical, segment by segment; a directory is inside itself.
-our sub path-under($dir, $path --> Str:D) is export {
+#|
+#| A POSIX-rooted path measured against a Windows one is C<unknown>: on
+#| Windows, C</x> is the root of whichever drive is current.
+#|
+#| C<:fold> is the fail-closed comparison, for the callers to whom
+#| over-matching is the safe direction: deny and ask rules, and lease
+#| collisions. It compares the segments case-insensitively, so C<PROTECTED/x>
+#| cannot slip past a deny on C<protected> on a case-insensitive filesystem; and
+#| it answers C<unknown>, never C<no>, for paths on two different Windows
+#| volumes, because C<\\localhost\C$\x>, a share, a C<subst> or mapped drive
+#| and a mount point all reach one volume's files by another's name. Without
+#| C<:fold> — an allow — a differently-cased path is not inside, so it is
+#| never granted on a case-sensitive filesystem, and two volumes are C<no>.
+#|
+#| On a Windows path a segment that differs from its counterpart only by
+#| being an 8.3 short name (C<SECRET~1> against C<secret>) is C<unknown>
+#| either way: Windows opens the long name the short one was given to, which
+#| only the server's disk knows. See C<windows-short-name>.
+our sub path-under($dir, $path, Bool :$fold --> Str:D) is export {
 	my %d = parse-path($dir);
 	my %p = parse-path($path);
 	return 'unknown' unless %d<ok> && %p<ok>;
 	return 'unknown' unless %d<absolute> eqv %p<absolute>;
+	if %d<volume> ne %p<volume> {
+		# A POSIX-rooted path against a Windows one is the current drive's,
+		# whichever that is. Two different Windows volumes are two places as
+		# far as an allow is concerned, but not provably so: an admin share
+		# (\\localhost\C$, \\127.0.0.1\c$, the machine's own name), any share,
+		# a subst or mapped drive and a volume mount point all reach one
+		# volume's files through another's name. So a deny, an ask or a lease
+		# collision -- the :fold callers, for which over-matching is the safe
+		# direction -- cannot be told 'no'.
+		return 'unknown' if $fold || !(%d<volume>.chars && %p<volume>.chars);
+		return 'no';
+	}
 
 	my @dir = %d<segments>.list;
 	my @in = %p<segments>.list;
 	return 'no' if @in.elems < @dir.elems;
 
-	@in.head(@dir.elems).List eqv @dir.List ?? 'yes' !! 'no';
+	# Segment by segment. On a Windows volume two different names are still
+	# not provably two places when either is an 8.3 short name: SECRET~1 is
+	# whichever long name in that directory Windows gave that short name to,
+	# and only the server's disk knows which. Such a pair is 'unknown' -- but
+	# a pair of names that definitely differ anywhere makes the answer 'no'.
+	my Bool $windows = ?%d<volume>.chars;
+	my Bool $unsure = False;
+	for @dir.kv -> $i, $want {
+		my $have = @in[$i];
+		next if $fold ?? $have.fc eq $want.fc !! $have eq $want;
+		return 'no' unless $windows && (windows-short-name($have) || windows-short-name($want));
+		$unsure = True;
+	}
+
+	$unsure ?? 'unknown' !! 'yes';
+}
+
+#| Whether a path segment could be an 8.3 short name — C<PROGRA~1>,
+#| C<SECRET~1.TXT>, a Samba server's mangled C<SECRE~A1> — which Windows
+#| resolves to whichever long name in that directory it was given to. The
+#| shape: a base of one to eight characters holding a C<~> followed by a letter
+#| or digit, and an optional extension of one to three. A name outside that
+#| shape cannot be a short name, so C<notes~2024.md> is just a name. Used by
+#| C<path-under> on Windows paths, and by the danger floor; not exported.
+our sub windows-short-name(Str:D $segment --> Bool:D) {
+	return False unless $segment ~~ / ^ $<base>=[<-[.]> ** 1..8] [ '.' <-[.]> ** 1..3 ]? $ /;
+	so ~$<base> ~~ / '~' <[A..Za..z0..9]> /;
 }
 
 #| Decide what to do about one call. Returns
@@ -739,6 +864,25 @@ our sub evaluate(
 	my @located = located-args($name, $args, %path-params, $root);
 	my @paths = @located.map({ $_<path> }).grep({ $_ ~~ Str:D }).List;
 	my @commands = effective-commands($name, $args, %command-params);
+	# What a command or check predicate does when there are no effective
+	# commands — and that is two situations, not one.
+	#
+	# A call that shows us its arguments, and whose arguments name neither the
+	# program slot nor the argv slot, gives such a predicate nothing to speak
+	# about: `sh_poll` names a job handle and can run nothing, so "deny sh_*
+	# where the command writes config" is not a question about it. That is
+	# 'no' — the rule does not match. See call-omits-command.
+	#
+	# Everything else stays 'unknown' and keeps failing closed — unreadable
+	# arguments, an empty argument object, and a call carrying either slot
+	# unreadably — because in each of those a command really might be hiding.
+	#
+	# Conflating the two made every danger-floor rule narrowed by command or
+	# check fire on sh_poll, sh_output and sh_kill. The floor's
+	# self-modification rule is a DENY, and deny outranks ask, so the human was
+	# never even asked: a background job could be started and then never read.
+	my @no-command = call-omits-command($name, $args, %command-params)
+		?? ('no',) !! ('unknown',);
 	my @urls = url-args($args);
 
 	my %won;                # decision => { rule, by-unknown }
@@ -761,8 +905,10 @@ our sub evaluate(
 
 			# No location arguments at all is not "nothing to object to": it is a
 			# predicate that could not be evaluated, and those go the safe way.
+			# Deny and ask compare case-insensitively, allow exactly: see
+			# path-under's :fold.
 			my @verdicts = @located
-				?? @located.map({ path-under($under, $_<path>) }).List
+				?? @located.map({ path-under($under, $_<path>, :fold(!$allow)) }).List
 				!! ('unknown',);
 			@dims.push: dimension-verdict($allow, @verdicts);
 		}
@@ -781,10 +927,10 @@ our sub evaluate(
 		if %rule<command>:exists {
 			# Every effective command must clear the predicate for an allow to
 			# fire; any one that matches or cannot be ruled out fires a deny/ask.
-			# A call that named no command at all is unevaluable, not exempt.
+			# With no effective commands at all, @no-command decides — see it.
 			my @verdicts = @commands
 				?? @commands.map({ command-verdict(%rule, $_) }).List
-				!! ('unknown',);
+				!! @no-command;
 			@dims.push: dimension-verdict($allow, @verdicts);
 		}
 
@@ -795,7 +941,7 @@ our sub evaluate(
 			# unknown check name is unevaluable, and unevaluable fails closed.
 			my @verdicts = @commands
 				?? @commands.map({ run-check(%checks, %rule<check>, $_) }).List
-				!! ('unknown',);
+				!! @no-command;
 			@dims.push: dimension-verdict($allow, @verdicts);
 		}
 
@@ -852,6 +998,8 @@ our sub suggest(Str:D $tool, @paths, $root, Str :$host --> Hash:D) is export {
 	my @parsed = @paths.map({ parse-path($_) }).grep({ $_<ok> });
 	return %scoped unless @parsed;
 	return %scoped unless @parsed.map({ $_<absolute> }).unique.elems == 1;
+	# One volume too: nothing contains both C:/x and D:/y.
+	return %scoped unless @parsed.map({ $_<volume> }).unique.elems == 1;
 
 	# The containing directory of each path, not the path itself: the answer to
 	# "may I read /srv/docs/x?" that a human means is nearly always "yes, that
@@ -864,7 +1012,7 @@ our sub suggest(Str:D $tool, @paths, $root, Str :$host --> Hash:D) is export {
 	my @common = common-prefix(@dirs);
 
 	my $absolute = @parsed[0]<absolute>;
-	my $dir = render-path($absolute, @common);
+	my $dir = render-path(@parsed[0]<volume>, $absolute, @common);
 	return %scoped unless $dir.chars;
 
 	# Never offer to grant more than the tool's own root: a call for /x.txt
@@ -882,39 +1030,116 @@ our sub suggest(Str:D $tool, @paths, $root, Str :$host --> Hash:D) is export {
 
 # === Paths ===
 
+# The names NTFS gives to devices: a segment naming one -- bare or with any
+# extension, so `nul.txt` too -- opens the device, not a file. COM and LPT
+# take any digit, the superscripts ¹ ² ³ included (Windows reads those as 1, 2
+# and 3).
+my constant WINDOWS-DEVICES = set flat <CON PRN AUX NUL CONIN$ CONOUT$>,
+	(|(0..9), '¹', '²', '³').map({ "COM$_", "LPT$_" });
+
+# A segment that NTFS would read as some other name, or not as a name at all:
+# a trailing dot or space (dropped, so `protected.` IS `protected`), a colon
+# (`x:stream` is a stream of `x`), a reserved device name, or a character
+# Windows refuses in a name. Lexically unanswerable, so a path holding one is
+# `unknown` -- and only on a Windows path: on POSIX every one of these is an
+# ordinary name.
+my sub windows-hazard(Str:D $segment --> Bool:D) {
+	return True if $segment.ends-with('.') || $segment.ends-with(' ');
+	return True if $segment ~~ / <[ : < > " | ? * ]> | <[ \x[00] .. \x[1F] ]> /;
+	$segment.split('.', 2).head.trim-trailing.uc (elem) WINDOWS-DEVICES;
+}
+
 # One path, taken apart lexically. `ok` is False whenever the string cannot be
 # reasoned about at all, with `reason` saying which way it was hopeless -- the
 # tri-state's `unknown` and validate-rule's error message both come from here,
 # so the two can never disagree about what a usable path is.
+#
+# A path with a Windows volume -- `C:\x` or `C:/x` (a drive, normalised to an
+# upper-case letter), or `\\host\share\x` (a UNC share, case-folded) -- is
+# recognised from the string alone and may use either separator; its
+# `volume` is part of what it names. Every other path is POSIX-shaped: `/`
+# separates and a backslash is an ordinary character, which on a Windows
+# server would be a separator, so it is refused rather than guessed at. A
+# relative argument measured from a Windows root becomes a Windows path when
+# absolutize joins the two, so `src\x` under `C:\work` is understood.
 my sub parse-path($value --> Hash:D) {
 	return %( ok => False, reason => 'not-a-string' ) unless $value ~~ Str:D;
 
 	my $raw = $value.Str;
 	return %( ok => False, reason => 'empty' ) unless $raw.chars;
 	return %( ok => False, reason => 'null-byte' ) if $raw.contains("\0");
-	return %( ok => False, reason => 'backslash' ) if $raw.contains('\\');
+
+	my Str $volume = '';
+	my Str $rest = $raw;
+	# \\?\ and \\.\ (or with either slash) skip Windows' own normalisation and
+	# reach devices and raw volumes; no lexical answer about them is honest.
+	if $raw ~~ / ^ <[\\/]> <[\\/]> <[?.]> [ <[\\/]> | $ ] / {
+		return %( ok => False, reason => 'device-path' );
+	}
+	elsif $raw ~~ / ^ '\\\\' $<host>=[<-[\\/]>+] <[\\/]> $<share>=[<-[\\/]>+] [ <[\\/]> $<tail>=[.*] ]? $ / {
+		$volume = '\\\\' ~ ~$<host>.fc ~ '\\' ~ ~$<share>.fc;
+		$rest = ~($<tail> // '');
+	}
+	elsif $raw ~~ / ^ $<drive>=[<[A..Za..z]>] ':' <[\\/]> $<tail>=[.*] $ / {
+		$volume = $<drive>.uc ~ ':';
+		$rest = ~$<tail>;
+	}
+	elsif $raw ~~ / ^ <[A..Za..z]> ':' / {
+		# `C:x` is relative to drive C's current directory, which only the
+		# server process knows.
+		return %( ok => False, reason => 'drive-relative' );
+	}
+	elsif $raw.starts-with('\\') {
+		# `\x` is the root of whichever drive is current; `\\host` with no
+		# share is not a location at all.
+		return %( ok => False, reason => 'rooted' );
+	}
+
+	my Bool $windows = ?$volume.chars;
+	return %( ok => False, reason => 'backslash' ) if !$windows && $raw.contains('\\');
 
 	# Empty segments (a doubled or trailing slash) and '.' carry no meaning;
 	# '..' carries too much of it to guess at.
-	my @segments = $raw.split('/').grep({ $_ ne '' && $_ ne '.' });
+	my @segments = $rest.split($windows ?? / <[\\/]> / !! '/').grep({ $_ ne '' && $_ ne '.' });
 	return %( ok => False, reason => 'traversal' ) if @segments.grep(* eq '..');
+	return %( ok => False, reason => 'windows-name' )
+		if $windows && @segments.first({ windows-hazard($_) }).defined;
 
-	%( ok => True, reason => '', absolute => $raw.starts-with('/'), segments => @segments.List );
+	%(
+		ok       => True,
+		reason   => '',
+		volume   => $volume,
+		absolute => $windows || $raw.starts-with('/'),
+		segments => @segments.List,
+	);
 }
 
-my sub render-path(Bool() $absolute, @segments --> Str:D) {
-	($absolute ?? '/' !! '') ~ @segments.join('/');
+# A path back in canonical form: `/` between segments, after the volume when
+# there is one (`C:/x`, `\\host\share/x`), so that it parses back to itself.
+my sub render-path(Str:D $volume, Bool() $absolute, @segments --> Str:D) {
+	$volume.chars
+		?? $volume ~ '/' ~ @segments.join('/')
+		!! ($absolute ?? '/' !! '') ~ @segments.join('/');
 }
 
 my sub path-complaint(Str:D $reason --> Str:D) {
 	given $reason {
-		when 'not-a-string' { 'a directory must be a string' }
-		when 'empty'        { 'a directory cannot be empty' }
-		when 'null-byte'    { 'a path may not contain a null byte' }
-		when 'backslash'    { "a path may not contain a backslash: write directories with '/', "
-			~ 'which Windows accepts too' }
-		when 'traversal'    { "a path may not contain a '..' segment, which only the server could resolve" }
-		default             { 'it is not a usable path' }
+		when 'not-a-string'   { 'a directory must be a string' }
+		when 'empty'          { 'a directory cannot be empty' }
+		when 'null-byte'      { 'a path may not contain a null byte' }
+		when 'backslash'      { "a path without a Windows volume may not contain a backslash: "
+			~ "write it with '/', or give the whole Windows path (C:\\..., \\\\server\\share\\...)" }
+		when 'traversal'      { "a path may not contain a '..' segment, which only the server could resolve" }
+		when 'drive-relative' { "'C:x' is relative to a drive's current directory, which only the "
+			~ "server knows: write C:\\x" }
+		when 'rooted'         { "a path starting with a single backslash is relative to the current "
+			~ "drive, which only the server knows: give the drive (C:\\x)" }
+		when 'device-path'    { "\\\\?\\ and \\\\.\\ paths reach devices and skip Windows' path "
+			~ 'normalisation: give the plain path' }
+		when 'windows-name'   { 'a Windows path segment may not end in a dot or a space, contain '
+			~ ':, <, >, ", |, ? or *, or be a device name (CON, NUL, COM1, ...): Windows would '
+			~ 'read it as some other name' }
+		default               { 'it is not a usable path' }
 	}
 }
 
@@ -992,11 +1217,31 @@ our sub located-args(Str:D $name, $args, %path-params, $root --> List:D) is expo
 #| containment test can refuse it, instead of being quietly normalised into an
 #| escape. A non-string value, and any value with no root to measure from, comes
 #| back as it went in (an undefined C<Str> in the first case).
+#|
+#| A value that names its own starting point is never joined onto the root:
+#| C</x>, and on Windows C<C:\x>, C<C:x>, C<\x> and C<\\host\share\x>. Joining
+#| one would bury a second volume inside the root's path -- C<D:/x> under
+#| C<C:/work> once came out as C<C:/work/D:/x>, which is under C<C:/work>.
 our sub absolutize($value, $root --> Str) is export {
 	return Str unless $value ~~ Str:D;
 	return $value.Str unless $root ~~ Str:D && $root.chars;
-	return $value.Str if $value.starts-with('/');
-	$root.ends-with('/') ?? $root ~ $value !! $root ~ '/' ~ $value;
+	return $value.Str if self-rooted($value.Str);
+	# Under a Windows root the result is spelt with the root's own
+	# separator throughout. Both separators mean the same there, so this
+	# changes no answer; it is what makes a lease or a prompt read as the
+	# path the user would type (C:\work\notes.md, not C:\work/notes.md).
+	my %r = parse-path($root);
+	if %r<ok> && %r<volume>.chars {
+		my Str $sep = $root.contains('\\') ?? '\\' !! '/';
+		my Str $rel = $value.trans(['/', '\\'] => [$sep, $sep]);
+		return $root.ends-with('/') || $root.ends-with('\\')
+			?? $root ~ $rel !! $root ~ $sep ~ $rel;
+	}
+	$root.ends-with('/') || $root.ends-with('\\') ?? $root ~ $value !! $root ~ '/' ~ $value;
+}
+
+my sub self-rooted(Str:D $value --> Bool:D) {
+	so $value.starts-with('/') || $value.starts-with('\\') || $value ~~ / ^ <[A..Za..z]> ':' /;
 }
 
 my sub common-prefix(@lists --> List:D) {
@@ -1092,6 +1337,32 @@ my sub command-params-for(Str:D $name, %command-params --> List:D) {
 # program cannot be identified), C<tokens> (the literal argv tail), C<sealed>
 # (whether C<tokens> is the whole tail) and C<redirect-targets>. An empty list
 # means the call named no command at all.
+# Whether this call is one a command or check predicate has no business
+# speaking about at all: its arguments are readable, it names something, and
+# what it names includes neither the program slot nor the argv slot. `sh_poll`
+# and its siblings name a job handle and can run nothing, so "deny sh_* where
+# the command writes config" is not a question about them.
+#
+# Three things deliberately answer False and stay unevaluable, because for each
+# of them a command really might be hiding:
+#
+#   * arguments that could not be read at all;
+#   * an EMPTY argument object — we have been shown nothing, which is not the
+#     same as being shown a call that runs nothing;
+#   * a call carrying either slot, even unreadably (a non-string `command`, or
+#     an `args` list with no `command`).
+#
+# The slot names are the ones command-params resolves for this tool, so a tool
+# that names its program unusually is described by declaring it there rather
+# than by being guessed at here.
+my sub call-omits-command(Str:D $name, $args, %command-params --> Bool) {
+	return False unless $args.defined && $args ~~ Associative;
+	my %arguments = $args.Hash;
+	return False unless %arguments.elems;
+	my ($cmd-param, $args-param) = command-params-for($name, %command-params);
+	!(%arguments{$cmd-param}:exists) && !(%arguments{$args-param}:exists);
+}
+
 my sub effective-commands(Str:D $name, $args, %command-params --> List:D) {
 	return ().List unless $args.defined && $args ~~ Associative;
 

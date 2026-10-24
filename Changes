@@ -2,6 +2,148 @@ Revision history for MCP::Client
 
 {{$NEXT}}
 
+0.6.0  2026-10-24T18:31:18+01:00
+    - BUGFIX: [2026-10-24] agents sharing one grant book could crash the
+      whole process with a MoarVM error. Several thread-safe readers
+      handed back a result that was only built after they had released
+      their lock: a `.map(...).List` in Raku is lazy, so the List left the
+      lock empty and filled itself in as it was read, while another
+      agent's `always-` answer appended to the book underneath it.
+      Grants.list, Policy.grants, Policy.rules, Registry.providers (and
+      the registry's own listing and dispatch, which an `add` or `remove`
+      mid-listing could reshape) and Leases::Table.status now build their
+      whole answer inside the lock. Transport::HTTP.tool-annotations and
+      the unknown-key and reason layers' catalogue snapshots handed out
+      the live table itself (`.Hash` on a Hash is that same Hash) and now
+      copy it under the lock. A rule's `args` and `args-any`, and each
+      list in `path-params`, are built in full when they are validated:
+      they were lazy, filled in by whichever concurrent decision read
+      them first, and a rule's `args` went on following the caller's own
+      array after it had been validated. The test kits' readers
+      (FakeTransport, InProcessTransport, and the TestKit and ProgressKit
+      counters) are snapshots too. t/28 checks that each of these results
+      is a snapshot that later changes don't reach.
+    - SECURITY: [2026-10-01] deny and ask rules fail closed on the Windows
+      names that reach a place by another name. As the Windows paths below
+      were first written (unreleased), a deny under C:\work\secret
+      answered `no`, and so did not fire, for C:\work\SECRET~1\x (the 8.3
+      short name Windows still opens), for \\localhost\C$\work\secret\x and
+      \\127.0.0.1\c$\work\secret\x (admin shares), and for every other
+      volume; under the auto preset's allow on the root, the short-name
+      spelling was then allowed and the file server opened the denied
+      file. `path-under :fold` now answers `unknown` for paths on two
+      different volumes -- an admin share on any host name, any share, a
+      subst or mapped drive and a volume mount point can each reach one
+      volume's files through another's name -- and on a Windows path a
+      segment that differs from its counterpart only by being an 8.3 short
+      name is `unknown` with or without :fold (`windows-short-name`: a
+      base of up to eight characters holding a `~` and a letter or digit,
+      at most a three-letter extension, so Samba's mangled names too). An
+      allow still answers `no` for another volume, and a short name below
+      an allow's directory is still inside it. Roots and rules may be
+      written with short names, as a Windows temporary directory often is
+      (C:\Users\RUNNER~1\AppData\Local\Temp). Lease collisions use the same
+      comparison, so a claim through an admin share, a short name or
+      another volume collides. COM0, LPT0 and COM¹-³/LPT¹-³ are device
+      names too. t/27 pins every alias.
+    - SECURITY: [2026-10-01] the danger floor catches the other Windows
+      spellings of its two hard denies. As the Windows floor below was
+      first written (unreleased), a write to the agent's own config and a
+      recursive delete of home answered `no` for \\?\C:\...,
+      \\.\C:\..., //?/C:/..., \\?\UNC\host\C$\..., \\localhost\C$\... (an
+      admin share, on any host name), C:\Users\me\SADNA~1\config.json and
+      rm -rf C:\Users\ME~1. The floor now reads a device-path prefix as the
+      drive or share it names (a Volume{GUID} or GLOBALROOT path as any
+      volume), an admin share as its drive and //host/share as a share,
+      and matches an 8.3 short name against every long name it could have
+      been given. On POSIX a backslash is a filename character, yet the
+      floor collapsed /home/me/.sadna/agents/x\..\..\..\..\evil.md out of
+      .sadna; a token holding a backslash is now read both ways, and caught
+      on either. `floor-checks` takes `home` as one path or a list of every
+      spelling of it (USERPROFILE, HOMEDRIVE+HOMEPATH and a Git Bash HOME
+      can each name a different directory on Windows) and protects all of
+      them; a Git Bash /c/... home is drive C as well. A home that is
+      neither a path nor a list of paths dies rather than going quietly
+      unprotected. t/27 pins every spelling.
+    - SECURITY: [2026-10-01] the danger floor works on Windows. Its hard
+      deny on the agent writing its own config, and on recursive deletes of
+      a filesystem root or of home, only understood `/` and `~` paths, so
+      on Windows -- where the sadna home is C:\Users\me\.sadna and every
+      path is spelled that way -- neither ever fired. The floor now
+      recognises drive (C:\x, C:/x) and UNC (\\host\share\x) paths with
+      either separator on every host, plus the other spellings that reach
+      the same place on Windows: Git Bash's /c/... for drive C, a
+      drive-less /x or \x (the current drive), a trailing dot or space NTFS
+      drops, and an alternate-data-stream suffix. It errs towards a match
+      because it only ever denies. t/27 pins it.
+    - BUGFIX: [2026-10-01] Windows paths in roots, rules and arguments.
+      `parse-path` recognises a Windows volume -- a drive, either letter
+      case, or a UNC share, case-folded -- and inside such a path both
+      separators work, so roots and rules can be written as Windows writes
+      them (a root of C:\work used to be refused at construction). A
+      relative argument joined onto a Windows root is a Windows path, so
+      `src\x` under C:\work is understood; under a POSIX root a backslash
+      stays `unknown`, as before. `absolutize` no longer joins an argument
+      that names its own volume onto the root: D:/x under a root of C:/work
+      came out as C:/work/D:/x, which `path-under` judged inside the root.
+      To an allow, two different volumes are never inside one another (to
+      a deny or an ask they are `unknown`: see above); a POSIX-rooted path
+      against a Windows one is `unknown`. Drive-relative `C:x`,
+      current-drive `\x`, `\\?\` and `\\.\` device paths, and Windows
+      segments NTFS would read as another name (trailing dot or space, `:`,
+      device names such as NUL) are `unknown` and are refused in roots and
+      rules with a message saying why; on a POSIX path all of those are
+      ordinary names, as before. `render-path` keeps the volume. A join
+      onto a Windows root is spelt with the root's own separator
+      throughout (`src/x` under C:\work is C:\work\src\x), so a lease or a
+      path handed back reads as the user would type it rather than
+      C:\work/src/x.
+    - CHANGE: [2026-10-01] deny and ask compare paths case-insensitively
+      (`path-under :fold`), so PROTECTED\x cannot slip past a deny on
+      `protected` on a case-insensitive filesystem; allow stays exact, as
+      it already did for commands. The lease table folds case for
+      collisions with another holder's lease, and stays exact for a
+      holder's own.
+    - Requires JSON::Fast 0.21.0 or later (zef:timo). 0.19 (cpan:TIMOTIMO)
+      fails its own tests under the RakuAST compiler frontend that Rakudo
+      2026.09 makes the default, so installing this distribution stopped
+      at that dependency.
+    - BUGFIX: [2026-09-19] a rule narrowed by C<command> or C<check> fired
+      on tools that carry no command at all. C<sh_poll>, C<sh_output> and
+      C<sh_kill> name a job handle and can run nothing, but the engine
+      read "this call has no command" as "this call's command is
+      unreadable", and the latter fails closed by design. The danger
+      floor's self-modification rule is a DENY and deny outranks ask, so
+      the human was never even asked: a background job could be started
+      and then never polled, read or killed. A call whose readable
+      arguments name neither the program slot nor the argv slot now
+      simply does not match such a rule. Unreadable arguments, an empty
+      argument object, and a call carrying either slot unreadably all
+      still fail closed, so nothing that could be hiding a command was
+      relaxed. Pinned by t/19.
+    - BUGFIX: [2026-09-19] a refusal named only the tool a rule was
+      about, so a floor rule narrowed by one command read back as
+      "deny sh_*" — a blanket ban on the whole family. The C<command>
+      and C<check> narrowers now appear in the text, because a refusal
+      nobody can account for is one nobody can fix.
+    - BUGFIX: [2026-09-19] the floor's writes-config check warned
+      "uninitialized value of type Str" into the host's output when the
+      floor was built without a sadna-home. It answers the same "no",
+      quietly.
+    - MAINT: [2026-08-27] moved the test fixtures from
+      C<t/lib/MCP/Client/Test/> into C<lib/MCP/Client/Test/> (same
+      module names — C<MCP::Client::Test::FakeTransport>,
+      C<::InProcessTransport>, C<::TestKit> and C<::ProgressKit> — now
+      in C<provides>), and the stdio fixture script from
+      C<t/lib/fixture-server.raku> to C<t/fixture-server.raku>. A
+      C<t/lib> directory is its own CompUnit repo that starts cold on
+      a fresh C<zef install>, and parallel test files pulling the
+      fixtures' dependency chain into that cold store can race and
+      fail the install outright. C<lib/> is staged and precompiled
+      before the test phase runs, so shipping test support inside the
+      dist's own namespace dissolves the race. This is the fleet-wide
+      convention going forward.
+
 0.5.0  2026-08-21T21:55:14+01:00
     - execute-tool-calls reads the annotations a server publishes in its
       tools/list catalog: a batch whose calls ALL name tools annotated

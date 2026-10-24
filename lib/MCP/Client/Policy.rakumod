@@ -475,7 +475,9 @@ submethod TWEAK(
 #| The rules this policy was built with, as a deep plain-data copy: safe to
 #| serialise, and safe to hand to a UI that edits what it is given.
 method rules(--> List:D) {
-	$!lock.protect: { @!rules.map({ plain-copy($_) }).List };
+	# `.eager`, deliberately: a `.map(...).List` is LAZY, and without it the
+	# copies would be made after the lock is released.
+	$!lock.protect: { @!rules.map({ plain-copy($_) }).eager.List };
 }
 
 #| Swap the whole rule set atomically — the seam a preset switch rides on. The
@@ -507,9 +509,13 @@ method replace-rules(@new-rules --> Nil) {
 #| twice here (harmless to decide against — a repeated rule decides the same
 #| call the same way — but noise in anything that persists this list).
 method grants(--> List:D) {
-	my @mine = $!lock.protect: { @!grants.map({ plain-copy($_) }) };
+	# `.eager` inside the lock: the protect block's value is otherwise an
+	# unrun Seq, and assigning it out here would make the copies with the lock
+	# already released, while a concurrent `always-` answer appends.
+	my @mine = $!lock.protect: { @!grants.map({ plain-copy($_) }).eager.List };
 	return @mine.List without $!grants-store;
-	(|@mine, |$!grants-store.list).List;
+	my @all = |@mine, |$!grants-store.list;
+	@all.List;
 }
 
 #| The tool-name-prefix to directory table, as a copy.
@@ -613,7 +619,8 @@ method tools-for-llm(--> List) {
 method execute-tool-calls(@tool-calls --> List) {
 	# Snapshot the rules once, under the lock, so the whole batch is decided
 	# against one coherent rule set even if a preset switch lands mid-batch.
-	my @rules = $!lock.protect: { @!rules.map({ plain-copy($_) }).List };
+	# `.eager`, so the copies are made under the lock and not by the assignment.
+	my @rules = $!lock.protect: { @!rules.map({ plain-copy($_) }).eager.List };
 	my @results;
 	my @forward;
 
@@ -1002,7 +1009,7 @@ method !remember($answer, %request, Str:D $decision --> Hash:D) {
 			# next decision. The effective list -- what .grants renders, and what
 			# on-grant is owed -- is this policy's own grants and then the book.
 			my @book = $!grants-store.add(@rules);
-			my @mine = $!lock.protect: { @!grants.map({ plain-copy($_) }) };
+			my @mine = $!lock.protect: { @!grants.map({ plain-copy($_) }).eager.List };
 			@snapshot = (|@mine, |@book);
 		}
 		else {
@@ -1137,6 +1144,12 @@ my sub rule-text(%rule --> Str:D) {
 	my $text = "{%rule<decision>} {%rule<tool>}";
 	$text ~= " under {%rule<under>}" if %rule<under>:exists;
 	$text ~= " on {%rule<host>}" if %rule<host>:exists;
+	# The command and check narrowers belong here too. Without them a floor
+	# rule reads back as a blanket ban on the whole tool family — 'deny sh_*'
+	# for a rule that is really about one command — and a refusal nobody can
+	# account for is one nobody can fix.
+	$text ~= " running {%rule<command>}" if %rule<command>:exists;
+	$text ~= " matching {%rule<check>}" if %rule<check>:exists;
 	$text;
 }
 
@@ -1169,10 +1182,11 @@ my sub hidden-by(@rules, $tool --> Bool:D) {
 # A deep copy of plain data: hashes and lists rebuilt, everything else passed
 # through. Snapshots handed to a caller (and payloads handed to a callback) are
 # theirs to keep and to edit, and must not be a window onto the policy's own
-# state -- or, worse, onto the call that is about to be forwarded.
+# state -- or, worse, onto the call that is about to be forwarded. Eager all the
+# way down: a copy taken under a lock has to be finished before it is released.
 my sub plain-copy($value) {
 	return $value.Hash.map({ $_.key => plain-copy($_.value) }).Hash if $value ~~ Associative;
-	return $value.list.map({ plain-copy($_) }).List if $value ~~ Positional;
+	return $value.list.map({ plain-copy($_) }).eager.List if $value ~~ Positional;
 	$value;
 }
 

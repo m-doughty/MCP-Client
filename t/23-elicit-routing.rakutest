@@ -1,5 +1,5 @@
 use Test;
-use lib 'lib', 't/lib';
+use lib 'lib';
 use MCP::Server;
 use MCP::Client;
 use MCP::Client::Policy;
@@ -22,7 +22,7 @@ use MCP::Client::Test::InProcessTransport;
 # claim comes to nothing: never made (3), made by a policy with nobody to ask
 # (4), and made by one whose human's dialog fell over (5).
 #
-#   prove6 -Ilib -It/lib -I../MCP-Server/lib t/23-elicit-routing.rakutest
+#   prove6 -Ilib -I../MCP-Server/lib t/23-elicit-routing.rakutest
 
 plan 5;
 

@@ -405,10 +405,13 @@ method !audit(@tool-calls --> Nil) {
 
 	return unless @tool-calls;
 
-	# Snapshot once, outside the lock: a listing landing mid-batch cannot audit
-	# half the calls against one catalogue and half against the next, and the
-	# JSON parsing below never happens while anything else is waiting.
-	my %declared = $!lock.protect: { %!properties.Hash };
+	# Snapshot once, then audit outside the lock: a listing landing mid-batch
+	# cannot audit half the calls against one catalogue and half against the
+	# next, and the JSON parsing below never happens while anything else is
+	# waiting. The copy itself is made inside the lock: `.Hash` on a Hash is
+	# that same Hash, so returning it would make this assignment a read of the
+	# live table.
+	my %declared = $!lock.protect: { my %copy = %!properties; %copy };
 	return unless %declared;
 
 	my @warnings;

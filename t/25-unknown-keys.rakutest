@@ -1,5 +1,5 @@
 use Test;
-use lib 'lib', 't/lib';
+use lib 'lib';
 use JSON::Fast;
 use MCP::Client::Exceptions;
 use MCP::Client::Policy;
@@ -51,18 +51,18 @@ my class ScriptedProvider {
 
 	#| Every call object this provider saw, flattened, in order.
 	method seen(--> List:D) {
-		$!lock.protect: { @!batches.map(*.Slip).List };
+		$!lock.protect: { @!batches.map(*.Slip).eager.List };
 	}
 
 	#| One entry per batch, holding the number of calls in it -- so an empty
 	#| batch is visible as a batch that happened.
 	method batch-sizes(--> List:D) {
-		$!lock.protect: { @!batches.map(*.elems).List };
+		$!lock.protect: { @!batches.map(*.elems).eager.List };
 	}
 
 	#| Every result object this provider handed back, flattened, in order.
 	method given(--> List:D) {
-		$!lock.protect: { @!given.map(*.Slip).List };
+		$!lock.protect: { @!given.map(*.Slip).eager.List };
 	}
 
 	method tools-for-llm(--> List) {

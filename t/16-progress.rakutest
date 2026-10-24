@@ -1,5 +1,5 @@
 use Test;
-use lib 'lib', 't/lib';
+use lib 'lib';
 use MCP::Server;
 use MCP::Server::Protocol;
 use MCP::Client;
@@ -63,7 +63,7 @@ sub progress-pair(Bool:D :$no-hook = False, :&on-progress, *%opts) {
 		|%client-opts,
 	);
 
-	my &seen = -> { $lock.protect: { @seen.map({ $_.Hash }).List } };
+	my &seen = -> { $lock.protect: { @seen.map({ my %payload = $_; %payload }).eager.List } };
 	my &warnings = -> { $lock.protect: { @warnings.List } };
 
 	($client, $wire, $kit, &seen, &warnings);

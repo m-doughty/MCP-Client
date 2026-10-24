@@ -1,0 +1,314 @@
+use Test;
+use lib 'lib';
+use MCP::Client::Leases::Table;
+use MCP::Client::Policy::Floor;
+use MCP::Client::Policy::Rules;
+
+# Windows paths, understood on every host. Before this a root like C:\work was
+# refused at construction ("a path may not contain a backslash"), and the
+# workaround the message suggested -- C:/work -- parsed as a RELATIVE path, so
+# an argument such as D:/x was joined onto it (C:/work/D:/x) and judged inside
+# the root. The danger floor knew only `/` and `~`, so on Windows its hard deny
+# on the agent writing its own config never fired.
+#
+# Nothing here depends on the host: these are lexical answers about strings.
+#
+#   prove6 -Ilib -I../MCP-Server/lib t/27-windows-paths.rakutest
+
+plan 17;
+
+subtest 'a Windows volume is recognised, with either separator' => {
+	plan 8;
+	is path-under('C:\work', 'C:\work\src\x'), 'yes', 'backslashes';
+	is path-under('C:/work', 'C:\work\src'), 'yes', 'mixed: / in the root, \ in the path';
+	is path-under('c:\work', 'C:/work/x'), 'yes', 'the drive letter in either case';
+	is path-under('C:\work', 'C:\workshop\x'), 'no', 'segment-wise, never string-prefix';
+	is path-under('C:\work', 'D:\work\x'), 'no', 'another drive is never inside';
+	is path-under('\\\\Server\\Share\\proj', '\\\\server\\share\\proj\\x'), 'yes',
+		'a UNC share, its host and share case-folded';
+	is path-under('\\\\server\\share', 'C:\x'), 'no', 'a share and a drive are different volumes';
+	is path-under('/srv', 'C:\x'), 'unknown',
+		'a POSIX-rooted path against a Windows one: /x is on whichever drive is current';
+};
+
+subtest 'Windows spellings the engine cannot place are unknown' => {
+	plan 8;
+	is path-under('C:\work', 'C:x'), 'unknown', 'drive-relative C:x';
+	is path-under('C:\work', '\work\x'), 'unknown', '\x, rooted on the current drive';
+	is path-under('C:\work', '\\\\?\C:\work\x'), 'unknown', 'a \\?\ device path';
+	is path-under('C:\work', '\\\\.\C:\work\x'), 'unknown', 'a \\.\ device path';
+	is path-under('C:\work', 'C:\work\protected.\x'), 'unknown', 'a trailing dot (NTFS drops it)';
+	is path-under('C:\work', 'C:\work\protected \x'), 'unknown', 'a trailing space';
+	is path-under('C:\work', 'C:\work\x:stream'), 'unknown', 'an alternate data stream';
+	is path-under('C:\work', 'C:\work\NUL.txt'), 'unknown', 'a device name, even with an extension';
+};
+
+subtest 'POSIX paths keep POSIX rules' => {
+	plan 4;
+	is path-under('/srv', '/srv/a\b'), 'unknown', 'a backslash outside a Windows path is still refused';
+	is path-under('/srv', '/srv/log-12:00'), 'yes', 'a colon is an ordinary character on POSIX';
+	is path-under('/srv', '/srv/notes.'), 'yes', 'so is a trailing dot';
+	is path-under('/srv', '/srv/CON'), 'yes', 'and CON is just a name';
+};
+
+subtest 'case: folded for deny and ask, exact for allow' => {
+	plan 3;
+	is path-under('C:\work\protected', 'C:\work\PROTECTED\x'), 'no', 'exact by default';
+	is path-under('C:\work\protected', 'C:\work\PROTECTED\x', :fold), 'yes', 'folded on request';
+	is path-under('/srv/Docs', '/srv/docs/x', :fold), 'yes', 'on any path';
+};
+
+subtest 'relative arguments are measured from a Windows root' => {
+	plan 9;
+	my $joined = absolutize('src\x', 'C:\work');
+	is path-under('C:\work', $joined), 'yes', 'src\x under C:\work';
+	is absolutize('src/x', 'C:\work'), 'C:\work\src\x',
+		"spelt with the root's own separator, throughout";
+	is absolutize('src\x', 'C:/work/'), 'C:/work/src/x', 'whichever separator that is';
+	is absolutize('notes.md', '\\\\nas\\share'), '\\\\nas\\share\\notes.md', 'a UNC root too';
+	is absolutize('D:/x', 'C:/work'), 'D:/x', 'a path on another drive is never joined';
+	is path-under('C:/work', absolutize('D:/x', 'C:/work')), 'no', 'and so is not under the root';
+	is absolutize('C:x', 'C:\work'), 'C:x', 'drive-relative is left alone';
+	is absolutize('\\\\host\\share\\x', 'C:\work'), '\\\\host\\share\\x', 'so is a UNC path';
+	is path-under('/srv/root', absolutize('src\x', '/srv/root')), 'unknown',
+		'under a POSIX root a backslash stays unknown';
+};
+
+subtest 'roots and rules may be written as Windows writes them' => {
+	plan 5;
+	lives-ok { validate-roots({ fs => 'C:\Users\me\project', lock => '\\\\nas\\share' }) },
+		'drive and UNC roots';
+	lives-ok { validate-rule({ tool => 'fs_*', decision => 'allow', under => 'C:\Users\me\project' }) },
+		'a Windows under';
+	throws-like { validate-roots({ fs => 'work\x' }) }, Exception,
+		message => / 'backslash' /, 'a relative path with a backslash is still refused';
+	throws-like { validate-roots({ fs => 'C:work' }) }, Exception,
+		message => / 'current directory' /, 'drive-relative is refused, saying why';
+	throws-like { validate-rule({ tool => 'fs_*', decision => 'deny', under => 'C:\x\NUL' }) }, Exception,
+		message => / 'device name' /, 'a device name is refused, saying why';
+};
+
+subtest 'evaluate, on a Windows root' => {
+	plan 6;
+	my %roots = fs => 'C:\work';
+	my @allow = { tool => 'fs_*', decision => 'allow', under => 'C:\work' },;
+	is evaluate(@allow, 'fs_write', %( path => 'src\x.txt' ), :%roots)<decision>, 'allow',
+		'a relative argument with backslashes, inside the root';
+	is evaluate(@allow, 'fs_write', %( path => 'D:\work\x.txt' ), :%roots)<decision>, 'ask',
+		'another drive is not inside it';
+
+	my @deny = |@allow, { tool => 'fs_*', decision => 'deny', under => 'protected' };
+	is evaluate(@deny, 'fs_write', %( path => 'PROTECTED\x' ), :%roots)<decision>, 'deny',
+		'a case variant cannot slip past a deny';
+	is evaluate(@deny, 'fs_write', %( path => 'protected.\x' ), :%roots)<decision>, 'deny',
+		'nor can a trailing dot: unknown, and a deny fires on unknown';
+
+	my @narrow = { tool => 'fs_*', decision => 'allow', under => 'C:\work\src' },;
+	is evaluate(@narrow, 'fs_write', %( path => 'C:\WORK\SRC\x' ), :%roots)<decision>, 'ask',
+		'an allow does not grant a case variant';
+
+	is evaluate(@allow, 'fs_read', %( path => 'C:\work\a\b.txt' ), :%roots)<suggestion><under>,
+		'C:/work/a', 'the suggestion is the containing directory, on its volume';
+};
+
+subtest 'the danger floor on Windows' => {
+	plan 13;
+	my $home = 'C:\Users\dev';
+	my $sadna = 'C:\Users\dev\.sadna';
+	my @rules = |danger-floor(home => $home, sadna-home => $sadna),
+		{ tool => 'sh_*', decision => 'allow' };
+	my %checks = floor-checks(home => $home, sadna-home => $sadna);
+	sub decide(*@argv) {
+		evaluate(@rules, 'sh_run', %( command => @argv[0], args => @argv[1 .. *].List ),
+			:%checks)<decision>;
+	}
+
+	is decide('tee', 'C:\Users\dev\.sadna\config.json'), 'deny', 'its own config, as Windows spells it';
+	is decide('tee', 'c:/users/DEV/.sadna/config.json'), 'deny', 'forward slashes and another case';
+	is decide('bash', '-c', 'echo x > /c/Users/dev/.sadna/config.json'), 'deny', 'Git Bash: /c is drive C';
+	is decide('tee', '\Users\dev\.sadna\config.json'), 'deny', 'drive-less: the current drive';
+	is decide('tee', 'C:\Users\dev\.sadna.\config.json'), 'deny', 'a trailing dot NTFS would drop';
+	is decide('tee', 'C:\Users\dev\.sadna\config.json:x'), 'deny', 'a stream of the config file';
+	is decide('tee', 'D:\Users\dev\.sadna\config.json'), 'allow', 'the same path on another drive is not it';
+	is decide('tee', 'C:\Users\dev\project\notes.txt'), 'allow', 'an ordinary write falls through';
+
+	is decide('rm', '-rf', 'C:\\'), 'deny', 'recursive rm of a drive root';
+	is decide('bash', '-c', 'rm -rf /c'), 'deny', 'and of the drive as Git Bash names it';
+	is decide('rm', '-rf', 'C:\Users\dev'), 'deny', 'and of home';
+	is decide('rm', '-rf', '\\\\nas\\share'), 'deny', 'and of a share root';
+	is decide('rm', '-rf', 'C:\Users\dev\project\build'), 'allow', 'an ordinary recursive rm falls through';
+};
+
+subtest 'lease collisions across case' => {
+	plan 2;
+	my $table = MCP::Client::Leases::Table.new;
+	ok $table.acquire(holder => 'w1', paths => ['C:/work/src'])<granted>, 'w1 locks C:/work/src';
+	nok $table.acquire(holder => 'w2', paths => ['c:\WORK\SRC\app.raku'])<granted>,
+		'w2 cannot lock the same file spelt another way';
+};
+
+# An adversarial review of the above (2026-10-01) found the same place reached
+# by names the lexical engine had ruled out. Every input below once answered
+# 'no' where it had to answer 'unknown' (Rules) or match (the floor).
+
+subtest 'path-under :fold never rules two Windows volumes apart' => {
+	plan 9;
+	my $deny = 'C:\work\secret';
+	is path-under($deny, '\\\\localhost\C$\work\secret\x', :fold), 'unknown',
+		'an admin share on localhost is drive C';
+	is path-under($deny, '\\\\127.0.0.1\c$\work\secret\x', :fold), 'unknown',
+		'so is one on 127.0.0.1';
+	is path-under($deny, '\\\\WORKSTATION\C$\work\secret\x', :fold), 'unknown',
+		"and on the machine's own name, which a string cannot tell from another's";
+	is path-under($deny, 'D:\x', :fold), 'unknown', 'a subst or mapped drive can be anywhere';
+	is path-under('\\\\nas\a', '\\\\nas\b\x', :fold), 'unknown', 'so can a share';
+	is path-under($deny, '\\\\localhost\C$\work\secret\x'), 'no',
+		'without :fold (an allow) another volume is still not inside';
+	is path-under('C:\work', 'D:\work\x'), 'no', 'nor is another drive';
+	is path-under('/srv/secret', '/srv/other/x', :fold), 'no', 'POSIX paths are untouched';
+	is path-under($deny, '/work/secret/x', :fold), 'unknown', 'and POSIX against Windows stays unknown';
+};
+
+subtest 'an 8.3 short name is not provably another name' => {
+	plan 13;
+	my $deny = 'C:\work\secret';
+	is path-under($deny, 'C:\work\SECRET~1\x', :fold), 'unknown', 'SECRET~1 may be secret';
+	is path-under($deny, 'C:\work\SECRET~1\x'), 'unknown', 'with or without :fold';
+	is path-under($deny, 'C:\work\secret\PROGRA~1'), 'yes', 'below the directory it changes nothing';
+	is path-under('C:\work', 'C:\work\PROGRA~1\x'), 'yes',
+		'a short name inside the root is inside the root, whatever it stands for';
+	is path-under($deny, 'C:\other\SECRET~1'), 'no',
+		'a segment that definitely differs still rules the path out';
+	is path-under($deny, 'C:\work\SECRE~A1\x', :fold), 'unknown', "a Samba server's mangled name too";
+	is path-under($deny, 'C:\work\notes~2024.md', :fold), 'no',
+		'a name too long to be a short name is just a name';
+	is path-under('C:\Users\RUNNER~1\proj', 'C:\Users\RUNNER~1\proj\x'), 'yes',
+		'a root written with a short name contains its own spelling';
+	is path-under('C:\Users\RUNNER~1\proj', 'C:\Users\runneradmin\proj\x'), 'unknown',
+		'and cannot rule out the long one';
+	lives-ok { validate-roots({ fs => 'C:\Users\RUNNER~1\AppData\Local\Temp\proj' }) },
+		'roots may be written with one: a Windows temporary directory often is';
+	is path-under('/srv/secret', '/srv/SECRET~1/x', :fold), 'no', 'on POSIX ~ is an ordinary character';
+	throws-like { validate-rule({ tool => 'fs_*', decision => 'deny', under => 'C:\x\COM0' }) }, Exception,
+		message => / 'device name' /, 'COM0 is a device name';
+	throws-like { validate-rule({ tool => 'fs_*', decision => 'deny', under => 'C:\x\LPT¹.txt' }) }, Exception,
+		message => / 'device name' /, 'and so is LPT¹, with any extension';
+};
+
+subtest 'windows-short-name: the shape' => {
+	my @yes = <PROGRA~1 SECRET~1.TXT SADNA~1 progra~1 SECRE~A1 SA1B2C~1 ~$DOCU~1.DOC A~1>;
+	my @no  = 'notes~2024.md', 'foo.txt.~1~', 'backup~', '~', 'report~1.html', 'ABCDEFGHI~1',
+		'a~.txt', 'secret', 'SECRET~1.';
+	plan @yes + @no;
+	ok  MCP::Client::Policy::Rules::windows-short-name($_), "'$_' could be a short name" for @yes;
+	nok MCP::Client::Policy::Rules::windows-short-name($_), "'$_' cannot be" for @no;
+};
+
+subtest 'evaluate: the auto preset over a Windows root, against the aliases' => {
+	plan 9;
+	my %roots = fs => 'C:\work';
+	# auto's fs_* allow under the root, and a user's deny on a directory in it.
+	my @rules =
+		{ tool => 'fs_*', decision => 'allow', under => 'C:\work' },
+		{ tool => 'fs_*', decision => 'deny',  under => 'C:\work\secret' };
+	my sub decide($path) { evaluate(@rules, 'fs_read', %( :$path ), :%roots)<decision> }
+
+	is decide('SECRET~1\x'), 'deny', 'the 8.3 spelling of the denied directory';
+	is decide('C:\work\SECRET~1\x'), 'deny', 'written in full';
+	is decide('\\\\localhost\C$\work\secret\x'), 'deny', 'an admin share on localhost';
+	is decide('\\\\127.0.0.1\c$\work\secret\x'), 'deny', 'an admin share on 127.0.0.1';
+	is decide('\\\\?\C:\work\secret\x'), 'deny', 'a \\?\ device path';
+	is decide('D:\x'), 'deny', 'another drive: a deny fires on what it cannot rule out';
+	is decide('PROGRA~1\x'), 'deny', 'a short name where the denied directory sits might be it';
+	is decide('src\PROGRA~1\x'), 'allow', 'one anywhere else cannot';
+	is decide('src\x'), 'allow', 'and an ordinary path is allowed as before';
+};
+
+subtest 'the danger floor: every spelling of the config and of home' => {
+	plan 22;
+	my $home = 'C:\Users\dev';
+	my $sadna = 'C:\Users\dev\.sadna';
+	my %checks = floor-checks(home => $home, sadna-home => $sadna);
+	sub cmd(*@argv) { %( program => @argv[0], tokens => @argv[1 .. *].List, sealed => True, redirect-targets => () ) }
+	sub wc(*@argv) { %checks<writes-config>(cmd(|@argv)) }
+	sub rm(*@argv) { %checks<rm-destroy-root>(cmd('rm', '-rf', |@argv)) }
+
+	is wc('tee', '\\\\?\C:\Users\dev\.sadna\config.json'), 'yes', '\\?\ before a drive';
+	is wc('tee', '\\\\.\C:\Users\dev\.sadna\config.json'), 'yes', '\\.\ before a drive';
+	is wc('tee', '//?/C:/Users/dev/.sadna/config.json'), 'yes', '//?/ with forward slashes';
+	is wc('tee', '\\\\?\UNC\localhost\C$\Users\dev\.sadna\config.json'), 'yes', '\\?\UNC\ to an admin share';
+	is wc('tee', '\\\\localhost\C$\Users\dev\.sadna\config.json'), 'yes', 'an admin share';
+	is wc('tee', '//127.0.0.1/c$/Users/dev/.sadna/config.json'), 'yes', 'with forward slashes, on any host';
+	is wc('tee', 'C:\Users\dev\SADNA~1\config.json'), 'yes', 'the 8.3 short name of .sadna';
+	is wc('tee', 'C:\Users\DEV~1\.sadna\config.json'), 'yes', 'and of the home above it';
+	is wc('tee', '\\\\?\GLOBALROOT\Device\HarddiskVolume3\Users\dev\.sadna\config.json'), 'yes',
+		'a GLOBALROOT path, whose volume could be any';
+	is wc('tee', '\\\\?\Volume{1b3c5d7e-0000-0000-0000-000000000000}\Users\dev\.sadna\x'), 'yes',
+		'a volume GUID path';
+	is wc('tee', 'C:\Users\dev\PROGRA~1\x'), 'no', 'a short name that could not be .sadna is not';
+	is wc('tee', 'D:\Users\dev\.sadna\config.json'), 'no', 'another drive is still another drive';
+
+	is rm('\\\\?\C:\Users\dev'), 'yes', 'rm -rf \\?\C:\Users\dev';
+	is rm('\\\\localhost\c$\Users\dev'), 'yes', 'rm -rf of home through an admin share';
+	is rm('//localhost/C$/Users/dev'), 'yes', 'with forward slashes';
+	is rm('\\\\localhost\c$'), 'yes', 'and of the drive the admin share is';
+	is rm('C:\Users\DEV~1'), 'yes', 'rm -rf of home by its short name';
+	is rm('\\\\?\Volume{1b3c5d7e-0000-0000-0000-000000000000}\\'), 'yes', 'of a volume by its GUID';
+	is rm('C:\Users\OTHER~1'), 'no', 'a short name that could not be home is not';
+	is rm('C:\Users\dev\build'), 'no', 'an ordinary recursive rm falls through';
+
+	my %long = floor-checks(home => 'C:\Users\developer', sadna-home => 'C:\Users\developer\.sadna');
+	is %long<rm-destroy-root>(cmd('rm', '-rf', 'C:\Users\DEVELO~1')), 'yes',
+		'a long home name by the short name Windows gave it';
+	is %long<rm-destroy-root>(cmd('rm', '-rf', 'C:\Users\DE12AB~1')), 'yes',
+		"and by the hashed form it falls back to after collisions";
+};
+
+subtest 'the danger floor: a backslash is a filename character on POSIX' => {
+	plan 4;
+	my %checks = floor-checks(home => '/home/me', sadna-home => '/home/me/.sadna');
+	sub cmd(*@argv) { %( program => @argv[0], tokens => @argv[1 .. *].List, sealed => True, redirect-targets => () ) }
+	is %checks<writes-config>(cmd('tee', '/home/me/.sadna/agents/x\..\..\..\..\evil.md')), 'yes',
+		'x\..\..\..\..\evil.md is one name inside .sadna/agents on POSIX';
+	is %checks<writes-config>(cmd('tee', '/home/me/notes/x\..\..\.sadna\config.json')), 'yes',
+		'and the Windows reading still catches what collapses into .sadna';
+	is %checks<writes-config>(cmd('tee', '//./home/me/.sadna/config.json')), 'yes',
+		'//./x is /x on POSIX, whatever it is to Windows';
+	is %checks<rm-destroy-root>(cmd('rm', '-rf', '/tmp/build')), 'no', 'and an ordinary path is still ordinary';
+};
+
+subtest 'the danger floor protects every spelling of home it is given' => {
+	plan 9;
+	sub cmd(*@argv) { %( program => @argv[0], tokens => @argv[1 .. *].List, sealed => True, redirect-targets => () ) }
+	my %checks = floor-checks(home => ['C:\Users\me', 'H:\\', '/c/Users/me'],
+		sadna-home => 'C:\Users\me\.sadna');
+	is %checks<rm-destroy-root>(cmd('rm', '-rf', 'C:\Users\me')), 'yes', 'the profile directory';
+	is %checks<rm-destroy-root>(cmd('rm', '-rf', 'H:\\')), 'yes', 'a domain-mapped home drive';
+	is %checks<rm-destroy-root>(cmd('rm', '-rf', '/c/Users/me')), 'yes', "Git Bash's spelling";
+	is %checks<writes-config>(cmd('tee', '~/.sadna/config.json')), 'yes', '~ expands against each';
+
+	my %bash = floor-checks(home => '/c/Users/me', sadna-home => '/c/Users/me/.sadna');
+	is %bash<rm-destroy-root>(cmd('rm', '-rf', 'C:\Users\me')), 'yes',
+		"a Git Bash home is drive C's too";
+	is %bash<writes-config>(cmd('tee', 'C:\Users\me\.sadna\config.json')), 'yes', 'and so is its config';
+
+	lives-ok { floor-checks(home => Str, sadna-home => Str) }, 'no home is allowed';
+	throws-like { floor-checks(home => 42, sadna-home => Str) }, Exception,
+		message => / 'a path or a list of paths' /, 'a home that is not a path dies';
+	throws-like { floor-checks(home => ['C:\Users\me', Str], sadna-home => Str) }, Exception,
+		message => / 'list holds an undefined' /, 'and so does a list holding one';
+};
+
+subtest 'lease collisions across volumes and short names' => {
+	plan 5;
+	my $table = MCP::Client::Leases::Table.new;
+	ok $table.acquire(holder => 'w1', paths => ['C:\work\src'])<granted>, 'w1 locks C:\work\src';
+	nok $table.acquire(holder => 'w2', paths => ['\\\\localhost\C$\work\src\app.raku'])<granted>,
+		'w2 cannot lock it through an admin share';
+	nok $table.acquire(holder => 'w2', paths => ['C:\work\SRC~1\app.raku'])<granted>,
+		'nor by an 8.3 short name';
+	nok $table.acquire(holder => 'w2', paths => ['D:\elsewhere'])<granted>,
+		'nor anywhere on another volume, which could be the same disk';
+	ok $table.acquire(holder => 'w2', paths => ['C:\work\docs'])<granted>,
+		'but a sibling directory on the same volume is free';
+};

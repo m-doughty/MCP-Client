@@ -1,5 +1,5 @@
 use Test;
-use lib 'lib', 't/lib';
+use lib 'lib';
 use MCP::Server::Protocol;
 use MCP::Client;
 use MCP::Client::Exceptions;
@@ -12,7 +12,7 @@ use MCP::Client::Transport::Stdio;
 
 plan 5;
 
-constant FIXTURE = $?FILE.IO.parent.add('lib/fixture-server.raku').absolute;
+constant FIXTURE = $?FILE.IO.parent.add('fixture-server.raku').absolute;
 
 sub include-args(--> List) {
 	$*REPO.repo-chain
@@ -21,13 +21,29 @@ sub include-args(--> List) {
 		.List;
 }
 
+# What the children wrote to stderr. A passing run stays TAP-only, so it is
+# only echoed (see the end of the file) when something failed and it may say why.
+my Lock:D $stderr-lock = Lock.new;
+my @server-stderr;
+my Bool:D $passing = True;
+
+sub tested(Pair:D $pair --> Bool:D) {
+	my Bool:D $ok = subtest $pair;
+	$passing = False unless $ok;
+	$ok;
+}
+
+sub stderr-lines(--> List:D) {
+	$stderr-lock.protect: { @server-stderr.List };
+}
+
 sub spawn(Str :$era = 'both', :%transport, *%opts) {
 	my @args = |include-args(), FIXTURE, "--era=$era";
 	my $wire = MCP::Client::Transport::Stdio.new(
 		command   => $*EXECUTABLE.absolute,
 		args      => @args,
 		on-log    => -> Str:D $message { diag "transport: $message" },
-		on-stderr => -> Str:D $line { diag "server stderr: $line" },
+		on-stderr => -> Str:D $line { $stderr-lock.protect: { @server-stderr.push($line) } },
 		|%transport,
 	);
 	my $client = MCP::Client.new(
@@ -73,8 +89,8 @@ sub wait-until(&condition, Real :$within = 20 --> Bool:D) {
 	}
 }
 
-subtest 'the child dies with work outstanding' => {
-	plan 8;
+tested 'the child dies with work outstanding' => {
+	plan 9;
 
 	my ($client, $wire) = spawn();
 	$client.era;
@@ -89,6 +105,8 @@ subtest 'the child dies with work outstanding' => {
 	ok $died.stderr-tail.contains('the boiler went'),
 		'and the tail of stderr, which is where servers write the reason';
 	ok $died.message.contains('the boiler went'), 'the message quotes it too';
+	ok wait-until({ stderr-lines().grep(*.contains('the boiler went')).so }),
+		'and the on-stderr subscriber was handed the line as it was written';
 
 	ok settled($orphan), 'everything else outstanding settled as well';
 	isa-ok $orphan.cause, X::MCP::Client::ServerGone,
@@ -104,7 +122,7 @@ subtest 'the child dies with work outstanding' => {
 	$client.close;
 };
 
-subtest 'a line of stdout that is not JSON-RPC' => {
+tested 'a line of stdout that is not JSON-RPC' => {
 	plan 4;
 
 	my @dropped;
@@ -127,7 +145,7 @@ subtest 'a line of stdout that is not JSON-RPC' => {
 	$client.close;
 };
 
-subtest 'a command that cannot be started' => {
+tested 'a command that cannot be started' => {
 	plan 4;
 
 	my $wire = MCP::Client::Transport::Stdio.new(
@@ -152,7 +170,7 @@ subtest 'a command that cannot be started' => {
 	$client.close;
 };
 
-subtest 'closing with a request in flight' => {
+tested 'closing with a request in flight' => {
 	plan 3;
 
 	my ($client, $wire) = spawn();
@@ -169,7 +187,7 @@ subtest 'closing with a request in flight' => {
 	nok $wire.alive, 'and the transport is down';
 };
 
-subtest 'a timeout leaves the connection standing' => {
+tested 'a timeout leaves the connection standing' => {
 	plan 5;
 
 	my @notes;
@@ -194,3 +212,7 @@ subtest 'a timeout leaves the connection standing' => {
 
 	$client.close;
 };
+
+unless $passing {
+	diag "server stderr: $_" for stderr-lines();
+}

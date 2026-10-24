@@ -600,7 +600,13 @@ Every predicate present on one rule is ANDed together, and every matching rule i
 
 Containment is **purely lexical**, segment by segment, and never touches the filesystem: the paths belong to the server's disk, and symlink truth is `MCP::Server::Tool::FileSystem`'s sandbox root to enforce, not this client's to second-guess. Segment-wise also means `/tmp/root2` is not inside `/tmp/root`, however much the strings agree.
 
-The answer to "is it inside?" therefore has three values. `unknown` — a `..` segment, a null byte, a backslash, an absolute path with no root to measure it against, a missing or non-string argument, arguments that are not JSON — fails closed in both directions: an `allow` rule needs **every** location it was given to be `yes`, while a `deny` or `ask` rule fires on **any** `yes` or `unknown`.
+The answer to "is it inside?" therefore has three values. `unknown` — a `..` segment, a null byte, a backslash outside a Windows path, an absolute path with no root to measure it against, a missing or non-string argument, arguments that are not JSON — fails closed in both directions: an `allow` rule needs **every** location it was given to be `yes`, while a `deny` or `ask` rule fires on **any** `yes` or `unknown`.
+
+Windows paths are understood on every host, because the server's disk need not be the client's. A drive (`C:\work`, `C:/work`) or a UNC share (`\\nas\share`) is a volume, and inside such a path both separators work, so roots and rules can be written the way Windows writes them. An argument naming its own volume is never joined onto a root. The spellings Windows resolves somewhere a lexical check cannot follow — drive-relative `C:x`, current-drive `\x`, `\\?\` and `\\.\` device paths, a segment with a trailing dot or space, an alternate data stream (`x:stream`), a device name such as `NUL` — are `unknown`, and are refused in roots and rules with a message saying why.
+
+Two more spellings reach a place a string comparison cannot rule out, and both fail closed. A path on another volume is not inside an allow's directory, but a deny or an ask cannot be told it is elsewhere: `\\localhost\C$\work` **is** `C:\work`, as are `\\127.0.0.1\c$\work` and the machine's own name, and a share, a `subst` or mapped drive or a mount point can alias any two volumes. And Windows still opens a file by the 8.3 short name it gave it, so `C:\work\SECRET~1` may be `C:\work\secret`: a segment that differs from a rule's only by being a short name is `unknown` to every rule.
+
+Deny and ask rules compare paths case-insensitively, on every path, because the default filesystems of macOS and Windows are: `PROTECTED\x` cannot slip past a deny on `protected`. Allow rules compare exactly, so a case variant is never granted by one. [MCP::Client::Policy::Rules](MCP::Client::Policy::Rules) has the details.
 
 `&on-ask` gets one seam and two kinds of question. A permission question carries the tool, the parsed arguments, a copy of the call, the rule that provoked it, the locations it names and a `suggestion` — the deepest directory containing everything the call touches — and is answered with `allow-once`, `deny-once`, `always-allow` or `always-deny`, the last two leaving a session grant behind. The other kind is the server's own elicitation, forwarded by `elicit-hook` and answered with a bare `ElicitResult`. Both go through one lock, because there is one human and they can answer one question at a time. That lock has no timeout — a human deliberating stalls every waiting batch, so a UI wanting a deadline imposes its own inside the callback — and it is non-reentrant: an `&on-ask` that dispatches another policy-mediated call from inside the prompt handler deadlocks on its own question. Treat the callback as a leaf.
 
@@ -883,19 +889,19 @@ Testing
 
 ```shell
 prove6 -I. t                                   # against installed dependencies, as CI does
-prove6 -Ilib -It/lib -I../MCP-Server/lib t/    # against a sibling MCP-Server checkout
+prove6 -Ilib -I../MCP-Server/lib t/            # against a sibling MCP-Server checkout
 ```
 
 Sixteen files, from the protocol units up: a scripted transport double for the era machine and the round-trip loop, an in-process transport that puts the client in front of a live `MCP::Server` with no wire between them, a real child process for the stdio transport (including one that kills itself mid-request), and a live HTTP server on a random port.
 
 Four of them are cross-checks rather than unit tests. `t/13` is a golden-parity test: the same toolkit behind a local `MCP::Server` and behind an `MCP::Client` must produce identical bridge output, which is what makes "interchangeable" a claim rather than a hope. `t/14` puts a policy over that same live server, including a real elicitation answered through `elicit-hook`, and re-runs `t/13`'s argument shapes through an allow-everything policy to pin the two argument parsers together. `t/15` runs the multi round-trip loop against an `MCP::Server` that really does elicit — the client half of the contract, checked against the server half rather than against a script. `t/16` does the same for progress, against a server whose tools really do report it, and pins the other half of "when does a tool call happen": that a batch has finished running by the time `execute-tool-calls` returns.
 
-The fixtures under `t/lib` are reusable, and are meant to be: `t/lib` on the include path gives you `MCP::Client::Test::FakeTransport` (scripted answers, and notifications you can push at a client whenever you like), `MCP::Client::Test::InProcessTransport` (a live `MCP::Server`, no wire), `MCP::Client::Test::TestKit` (one tool of every shape) and `MCP::Client::Test::ProgressKit` (tools that report progress, for testing anything built on the `on-progress` hook).
+The fixtures ship in `lib/` under the `MCP::Client::Test` namespace, and are reusable — meant to be: installing the dist gives you `MCP::Client::Test::FakeTransport` (scripted answers, and notifications you can push at a client whenever you like), `MCP::Client::Test::InProcessTransport` (a live `MCP::Server`, no wire), `MCP::Client::Test::TestKit` (one tool of every shape) and `MCP::Client::Test::ProgressKit` (tools that report progress, for testing anything built on the `on-progress` hook).
 
 The example is runnable too, and needs no network and no API key:
 
 ```shell
-raku -Ilib -It/lib -I../MCP-Server/lib -I../LLM-Chat/lib -I../Template-Jinja2/lib \
+raku -Ilib -I../MCP-Server/lib -I../LLM-Chat/lib -I../Template-Jinja2/lib \
      examples/toolloop.raku
 ```
 

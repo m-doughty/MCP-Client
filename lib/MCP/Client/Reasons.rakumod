@@ -333,7 +333,9 @@ method execute-tool-calls(@tool-calls --> List) {
 
 	# Snapshot once, so a catalogue refresh landing mid-batch cannot strip half
 	# the calls in it and leave the rest.
-	my %augmented = $!lock.protect: { %!augmented.Hash };
+	# Copied INSIDE the lock: `.Hash` on a Hash is that same Hash, so handing
+	# it out would make the copy below a read of the live table.
+	my %augmented = $!lock.protect: { my %copy = %!augmented; %copy };
 
 	my @forward = @tool-calls.map({ stripped($_, %augmented) }).List;
 

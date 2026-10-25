@@ -2,6 +2,19 @@ Revision history for MCP::Client
 
 {{$NEXT}}
 
+0.6.1  2026-10-25T13:28:41Z
+    - BUGFIX: [2026-10-25] a fresh `zef install` failed in t/08 and t/09
+      because the fixture server they start as a child process could not
+      see the dependencies zef had staged but not yet installed: it died
+      with "Could not find MCP::Server". zef tests a distribution from a
+      staging repository and installs nothing until every test has
+      passed, and the tests handed the child only the FileSystem module
+      repositories. They passed wherever MCP::Server was already
+      installed, so installing MCP::Client failed only on a machine that
+      did not have it yet. Both now hand the child the test's whole
+      module search path, every repository by its path-spec, the staging
+      repository included. The library itself was unaffected.
+
 0.6.0  2026-10-24T18:31:18+01:00
     - BUGFIX: [2026-10-24] agents sharing one grant book could crash the
       whole process with a MoarVM error. Several thread-safe readers

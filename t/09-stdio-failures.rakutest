@@ -14,10 +14,14 @@ plan 5;
 
 constant FIXTURE = $?FILE.IO.parent.add('fixture-server.raku').absolute;
 
+# The parent's whole module search path, for the child: every repository it
+# loads modules from, by path-spec. Under `zef install` that includes the
+# CompUnit::Repository::Staging repo holding MCP::Server and the other
+# dependencies zef has staged but not yet installed (see t/08).
 sub include-args(--> List) {
 	$*REPO.repo-chain
-		.grep(* ~~ CompUnit::Repository::FileSystem)
-		.map({ '-I' ~ .prefix.absolute })
+		.grep(CompUnit::Repository::Locally)
+		.map({ '-I' ~ .path-spec })
 		.List;
 }
 

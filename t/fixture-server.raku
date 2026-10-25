@@ -14,10 +14,13 @@ raku -Ilib -I../MCP-Server/lib t/fixture-server.raku --era=both
 
 =head1 DESCRIPTION
 
-C<t/08> and C<t/09> spawn this with C<$*EXECUTABLE>, passing through whatever
-C<-I> paths the test process itself is using, so it works both from a checkout
-(C<prove6 -Ilib -I../MCP-Server/lib t/>) and against installed
-dependencies (C<prove6 -I. t>, which is what CI does).
+C<t/08> and C<t/09> spawn this with C<$*EXECUTABLE>, passing through every
+module repository the test process itself is using, each as C<-I> with its
+path-spec. So it works from a checkout
+(C<prove6 -Ilib -I../MCP-Server/lib t/>), against installed dependencies
+(C<prove6 -I. t>, which is what CI does), and under C<zef install>, where
+MCP::Server and the other dependencies sit in a staging repository that has not
+been installed yet.
 
 It serves C<MCP::Client::Test::TestKit> plus a handful of tools that only make
 sense in a subprocess — a gate that proves two requests were in flight at once,

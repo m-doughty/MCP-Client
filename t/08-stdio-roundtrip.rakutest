@@ -16,14 +16,18 @@ plan 5;
 # working directory beyond the one prove6 already makes.
 constant FIXTURE = $?FILE.IO.parent.add('fixture-server.raku').absolute;
 
-# Pass the parent's -I paths through to the child. From a checkout that is
-# lib/ and ../MCP-Server/lib; under `prove6 -I. t` against installed
-# dependencies it is whatever `use lib` above resolved to, and MCP::Server comes
-# out of the installation repo the child inherits anyway.
+# Pass the parent's whole module search path through to the child: every
+# repository it loads modules from, by path-spec. From a checkout that is lib/
+# and ../MCP-Server/lib; under `zef install` it includes the
+# CompUnit::Repository::Staging repo holding MCP::Server and the other
+# dependencies zef has staged but not yet installed, which a child handed only
+# the FileSystem repos could not see. The default home/site/vendor/core repos
+# are passed too, harmlessly: a child given them by -I builds the same chain it
+# would anyway.
 sub include-args(--> List) {
 	$*REPO.repo-chain
-		.grep(* ~~ CompUnit::Repository::FileSystem)
-		.map({ '-I' ~ .prefix.absolute })
+		.grep(CompUnit::Repository::Locally)
+		.map({ '-I' ~ .path-spec })
 		.List;
 }
 

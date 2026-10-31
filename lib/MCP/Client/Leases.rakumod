@@ -130,6 +130,10 @@ mutates under one lock. A changed target is refused before any side effect;
 success advances the cache and failure invalidates it. A target never observed
 by this agent is expected to be absent, so a blind overwrite fails closed.
 
+Within a revision result, an unknown or missing token clears that path's
+cached observation. This also applies when the action succeeded. A later
+successful read, stat or list restores it. Reacquiring a lease does not.
+
 Before forwarding a mutation, the exact covering lease generation is pinned.
 Expiry and explicit release become pending until the provider returns, so the
 same path cannot be granted to another agent while the original write is still
@@ -820,6 +824,7 @@ method !with-expectations(%item) {
 # `structured_content`; wire MCP calls used `structuredContent` before the
 # bridge. Failed conditional mutations invalidate our prior observation so a
 # retry must re-read rather than adopting a token from an error response.
+# A successful result can also report an unknown revision for one location.
 method !learn-result(%item, $answer, $failure --> Nil) {
 	my $name = %item<name> // '';
 	my $function = %item<arguments>;
@@ -851,8 +856,13 @@ method !learn-result(%item, $answer, $failure --> Nil) {
 		for @located -> %location {
 			next unless %location<path> ~~ Str:D;
 			my $revision = %revisions{%location<param>};
-			next unless $revision ~~ Associative && $revision<token> ~~ Str:D;
-			%!observations{%location<path>} = $revision<token>;
+			if $revision ~~ Associative && $revision<token> ~~ Str:D
+				&& !($revision<state> ~~ Str:D && $revision<state> eq 'unknown') {
+				%!observations{%location<path>} = $revision<token>;
+			}
+			else {
+				%!observations{%location<path>}:delete;
+			}
 		}
 	};
 }

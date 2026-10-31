@@ -1107,6 +1107,12 @@ write may still be landing when the answer is already in; a wedged holder's
 claim simply expires; or the whole table is emptied at shutdown with
 C<$table.release-all>.
 
+With FileSystem revision results, the layer remembers tokens per path.
+An unknown revision or missing token clears that path's older observation,
+even when the tool action succeeded. A successful read, stat or list can
+restore it. Until then, the next mutation expects the target to be absent.
+This does not release its lease or refresh the revision automatically.
+
 None of this reaches outside the process. A lease is advisory, does not
 survive the process, and nothing but this table honours it — the filesystem
 truth stays with the server's own sandbox, and C<fs_edit>'s exact-match

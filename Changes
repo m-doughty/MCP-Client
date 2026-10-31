@@ -2,6 +2,12 @@ Revision history for MCP::Client
 
 {{$NEXT}}
 
+0.6.2  2026-10-31T18:11:14Z
+    - BUGFIX: [2026-10-31] Leases clears a cached observation when a
+      successful revision result reports an unknown or missing token.
+      Valid sibling revisions are retained, and the action stays successful.
+      A later observation can restore the token; lease ownership is unchanged.
+
 0.6.1  2026-10-25T13:28:41Z
     - BUGFIX: [2026-10-25] a fresh `zef install` failed in t/08 and t/09
       because the fixture server they start as a child process could not

@@ -24,7 +24,7 @@ use MCP::Client::Policy::Rules;
 #
 #   prove6 -Ilib t/20-leases.rakutest
 
-plan 25;
+plan 27;
 
 constant ROOT = '/srv/work';
 constant ROOTS = { fs => ROOT, patch => ROOT, lock => ROOT };
@@ -103,6 +103,20 @@ my class HalfProvider {
 	method tools-for-llm(--> List) { () }
 }
 
+my class RevisionReplies {
+	has @.answers;
+	has @.seen;
+	method tools-for-llm { () }
+	method execute-tool-calls(@calls) {
+		@!seen.append: @calls;
+		@calls.map(-> $call {
+			my %answer = @!answers.shift.Hash;
+			%( role => 'tool', tool_call_id => $call<id>,
+				content => 'provider succeeded', is_error => False, |%answer );
+		}).List;
+	}
+}
+
 # === Helpers ===
 
 sub name-of($call) {
@@ -117,6 +131,12 @@ sub id-of($call) {
 
 sub call(Str:D $id, Str:D $name, $arguments = %()) {
 	%( id => $id, function => %( name => $name, arguments => $arguments ) );
+}
+
+sub revision-answer(%revisions --> Hash:D) {
+	%( structured_content => %(
+		revisionScheme => 'sha256-v1', revisions => %revisions,
+	) );
 }
 
 sub table(*%opts --> MCP::Client::Leases::Table:D) {
@@ -1110,6 +1130,102 @@ subtest 'filesystem observations drive hidden revision expectations' => {
 	is $table.status<pins>.elems, 0, 'every synchronous provider call returned its pin';
 	is $table.status<leases>.elems, 1, 'and the covering lease remains live';
 	is $provider.seen.elems, 5, 'read and each mutation reached the provider once';
+};
+
+subtest 'successful observations discard unusable revision entries' => {
+	my @cases =
+		'unknown' => %( path => %( state => 'unknown' ) ),
+		'unknown with a token' => %( path => %( state => 'unknown', token => 'discard-me' ) ),
+		'missing entry' => %(),
+		'non-object entry' => %( path => 'unavailable' ),
+		'missing token' => %( path => %( state => 'file' ) ),
+		'undefined token' => %( path => %( state => 'file', token => Nil ) ),
+		'non-string token' => %( path => %( state => 'file', token => 42 ) ),
+	;
+	plan @cases.elems;
+
+	for @cases -> $case {
+		subtest $case.key => {
+			plan 5;
+			my $provider = RevisionReplies.new(answers => [
+				revision-answer(%( path => %( state => 'file', token => 'old-doc' ) )),
+				revision-answer(%( path => %( state => 'file', token => 'old-other' ) )),
+				revision-answer($case.value),
+				%().item, %().item,
+				revision-answer(%( path => %( state => 'file', token => 'fresh-doc' ) )),
+				%().item,
+			]);
+			my $table = table();
+			my $leases = leases-over($provider, :$table, concurrent => { 2 });
+			$table.acquire(holder => 'w1', paths => [ROOT]);
+
+			$leases.execute-tool-calls([call('seed-doc', 'fs_read', %( path => 'doc' )),]);
+			$leases.execute-tool-calls([call('seed-other', 'fs_read', %( path => 'other' )),]);
+			my $observed = $leases.execute-tool-calls([
+				call('unavailable', 'fs_stat', %( path => 'doc' )),
+			])[0];
+			nok $observed<is_error>, 'the successful observation stays successful';
+			is $observed<content>, 'provider succeeded', 'revision metadata does not alter its text';
+
+			$leases.execute-tool-calls([call('write-doc', 'fs_write', %( path => 'doc', content => 'next' )),]);
+			is $provider.seen[3]<function><arguments><_expected-revisions><path>,
+				'sha256-v1:absent', 'the old observation is no longer injected';
+			$leases.execute-tool-calls([call('write-other', 'fs_write', %( path => 'other', content => 'next' )),]);
+			is $provider.seen[4]<function><arguments><_expected-revisions><path>,
+				'old-other', 'an unrelated cached observation is retained';
+
+			$leases.execute-tool-calls([call('refresh', 'fs_read', %( path => 'doc' )),]);
+			$leases.execute-tool-calls([call('write-fresh', 'fs_write', %( path => 'doc', content => 'next' )),]);
+			is $provider.seen[6]<function><arguments><_expected-revisions><path>,
+				'fresh-doc', 'a successful later observation restores the token';
+		};
+	}
+};
+
+subtest 'a successful mutation learns valid siblings and forgets unknown revisions' => {
+	plan 9;
+	my $provider = RevisionReplies.new(answers => [
+		revision-answer(%( path => %( state => 'file', token => 'old-from' ) )),
+		revision-answer(%( path => %( state => 'file', token => 'old-to' ) )),
+		revision-answer(%( path => %( state => 'file', token => 'old-other' ) )),
+		revision-answer(%(
+			from => %( state => 'unknown' ),
+			to => %( state => 'file', token => 'new-to' ),
+		)),
+		%().item, %().item, %().item,
+		revision-answer(%( path => %( state => 'file', token => 'fresh-from' ) )),
+		%().item,
+	]);
+	my $table = table();
+	my $leases = leases-over($provider, :$table, concurrent => { 2 });
+	$table.acquire(holder => 'w1', paths => [ROOT]);
+
+	for <from to other> -> $path {
+		$leases.execute-tool-calls([call('seed-' ~ $path, 'fs_read', %( :$path )),]);
+	}
+	my $moved = $leases.execute-tool-calls([
+		call('move', 'fs_move', %( from => 'from', to => 'to' )),
+	])[0];
+	nok $moved<is_error>, 'the successful mutation stays successful';
+	is $moved<content>, 'provider succeeded', 'the successful action text is retained';
+	is-deeply $provider.seen[3]<function><arguments><_expected-revisions>,
+		%( from => 'old-from', to => 'old-to' ), 'the mutation still carries both preconditions';
+
+	for <from to other> -> $path {
+		$leases.execute-tool-calls([call('write-' ~ $path, 'fs_write', %( :$path, content => 'next' )),]);
+	}
+	is $provider.seen[4]<function><arguments><_expected-revisions><path>,
+		'sha256-v1:absent', 'the unknown location no longer carries its stale token';
+	is $provider.seen[5]<function><arguments><_expected-revisions><path>,
+		'new-to', 'the valid sibling revision advances';
+	is $provider.seen[6]<function><arguments><_expected-revisions><path>,
+		'old-other', 'an unrelated cached path is untouched';
+	$leases.execute-tool-calls([call('refresh', 'fs_read', %( path => 'from' )),]);
+	$leases.execute-tool-calls([call('write-fresh', 'fs_write', %( path => 'from', content => 'next' )),]);
+	is $provider.seen[8]<function><arguments><_expected-revisions><path>,
+		'fresh-from', 'a later observation restores the unknown location';
+	is $table.status<pins>.elems, 0, 'every mutation returned its provider pin';
+	is $table.status<leases>.elems, 1, 'the covering lease was not released or reacquired';
 };
 
 subtest 'the composer pins a lease for the whole provider call' => {

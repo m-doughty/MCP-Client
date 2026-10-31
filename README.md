@@ -701,6 +701,8 @@ Enforcement follows the tools that change things — `fs_write`, `fs_edit`, `fs_
 
 A lease lasts `default-ttl` seconds (300 on the table, unless a composer or a `lock_acquire` call says otherwise), and a holder re-acquiring a path it already holds refreshes that clock rather than stacking a second lease — the way a long edit keeps its claim alive without a second kind of call. Leases come back four ways: the model calls `lock_release`; the engine releases them off the agent's run being `drained` — `$run.drained.then({ $table.release-holder($agent-id) })` — never off `result`, since a detached write may still be landing when the answer is already in; a wedged holder's claim simply expires; or the whole table is emptied at shutdown with `$table.release-all`.
 
+With FileSystem revision results, the layer remembers tokens per path. An unknown revision or missing token clears that path's older observation, even when the tool action succeeded. A successful read, stat or list can restore it. Until then, the next mutation expects the target to be absent. This does not release its lease or refresh the revision automatically.
+
 None of this reaches outside the process. A lease is advisory, does not survive the process, and nothing but this table honours it — the filesystem truth stays with the server's own sandbox, and `fs_edit`'s exact-match `old-string` is still what protects the single-call race a lease is not meant to cover.
 
 ### Why a call was made: the Reasons layer
